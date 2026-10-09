@@ -3955,6 +3955,25 @@ impl Daemon {
                     if check_cancel_requested() {
                         tracing::info!("Recording cancelled");
 
+                        // A streaming session owns a backend task, a typing
+                        // session to rewind, and a preview file; the batch
+                        // teardown below knows none of them and used to
+                        // leave the backend draining into a dropped session
+                        // and the preview showing the cancelled words.
+                        // Same teardown as the cancel hotkey.
+                        if state.is_streaming() {
+                            self.end_external_session(true).await;
+                            self.cancel_streaming_to_idle(
+                                &mut state,
+                                &mut audio_capture,
+                                &mut streaming_handle,
+                                &mut streaming_session,
+                                &mut streaming_chain,
+                                "Recording discarded",
+                            ).await;
+                            continue;
+                        }
+
                         // Stop recording and discard audio
                         if let Some(mut capture) = audio_capture.take() {
                             let _ = capture.stop().await;
