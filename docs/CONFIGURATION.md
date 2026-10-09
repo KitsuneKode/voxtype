@@ -2441,7 +2441,7 @@ streaming_preview_file = "auto"
 **Default:** unset (off)
 **Required:** No
 
-A file that mirrors the in-progress transcript of a streaming session: everything finalized so far plus the current partial words. It is rewritten atomically (write a sibling `.tmp`, then rename) at most 20 times a second, and emptied when the session starts and ends. Status bars and OSDs can watch it to show live words.
+A file that mirrors the in-progress transcript of a streaming session: everything finalized so far plus the current partial words. It is rewritten atomically (write a sibling `.tmp`, then rename) at most 20 times a second, and emptied when the session starts and when it ends. With `streaming_commit = "on_stop"` it keeps showing the transcript while it is post-processed and delivered, and is emptied after, so an OSD does not collapse and re-expand at the stop. Status bars and OSDs can watch it to show live words.
 
 Set to `"auto"` for `$XDG_RUNTIME_DIR/voxtype/live_text`, or to an absolute path. `"off"`, `"none"`, or `"disabled"` turn it off.
 
