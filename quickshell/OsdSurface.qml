@@ -13,7 +13,9 @@
 //
 // Visibility follows `daemonState` unless `osdSuppressed` is set:
 // hidden when suppressed or idle/empty, shown
-// otherwise. The component is layered as a WlrLayer.Overlay surface so
+// otherwise. A custom style package may keep the surface up a moment past
+// idle by setting its own `lingering` property, so it can play an exit or
+// confirmation instead of vanishing mid-frame. The component is layered as a WlrLayer.Overlay surface so
 // it floats above all other windows without taking input focus.
 
 import QtQuick
@@ -44,7 +46,10 @@ PanelWindow {
     /// visual recipe layers, and optional custom QML package entry.
     property var style: null
 
-    visible: !osdSuppressed && daemonState !== "idle" && daemonState !== ""
+    readonly property bool _customLingering: customActive && customLoader.item !== null
+                                             && customLoader.item.lingering === true
+    visible: !osdSuppressed
+             && ((daemonState !== "idle" && daemonState !== "") || _customLingering)
     anchors {
         top: true
         bottom: true
