@@ -274,6 +274,18 @@ fn cleanup_cancel_file() {
 
 /// Read and consume the output mode override file
 /// Returns the override mode if the file exists and is valid, None otherwise
+/// Trailing silence fed to a streaming backend after a drained stop, so the
+/// last word gets the right-context audio a cache-aware model decides with
+/// (0.32s for Parakeet's default) instead of a truncated final chunk.
+const STREAM_TAIL_PAD_SECS: f32 = 0.4;
+
+/// Sender into the active streaming session plus how many captured samples
+/// the audio pump has already advanced past.
+struct StreamingFeed {
+    tx: tokio::sync::mpsc::Sender<Vec<f32>>,
+    pumped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
 /// Output mode override result, which may include a file path for file mode
 #[derive(Debug, PartialEq)]
 enum OutputOverride {
@@ -884,6 +896,11 @@ pub struct Daemon {
     /// (`[output] streaming_preview_file`). `None` when not configured or
     /// no session is running.
     streaming_preview: Option<PreviewFile>,
+    /// The daemon's own handle on the active streaming session's audio
+    /// input. Lets a stop hand the backend the tail of the recording it never
+    /// saw (see `stop_streaming_capture`). Dropped on every stop, cancel and
+    /// shutdown path so the backend still sees end-of-stream.
+    streaming_feed: Option<StreamingFeed>,
     /// OSD child supervisor task. Holds the JoinHandle so dropping it (on
     /// daemon shutdown) kill_on_drop's the spawned voxtype-osd process.
     osd_supervisor_task: Option<tokio::task::JoinHandle<()>>,
@@ -1035,6 +1052,7 @@ impl Daemon {
             is_external_trigger: false,
             streaming_drain_pump: None,
             streaming_preview: None,
+            streaming_feed: None,
             osd_supervisor_task: None,
             model_manager: None,
             model_load_task: None,
@@ -1217,6 +1235,7 @@ impl Daemon {
                             chunk_rx,
                             hub.frame_sink(),
                             None,
+                            None,
                             speech_tracker,
                         ))
                     } else {
@@ -1323,7 +1342,7 @@ impl Daemon {
             return false;
         }
 
-        let (capture, samples_rx) = match self.start_streaming_capture(track_silence).await {
+        let (capture, samples_rx, feed) = match self.start_streaming_capture(track_silence).await {
             Ok(v) => v,
             Err(()) => return false,
         };
@@ -1362,6 +1381,7 @@ impl Daemon {
 
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
+        self.streaming_feed = Some(feed);
         *streaming_session = Some(StreamingSession::new());
         *streaming_chain = Some(output::create_output_chain(&self.config.output));
         *state = State::Streaming {
@@ -1461,7 +1481,7 @@ impl Daemon {
             } else {
                 tracing::info!("Stopping streaming session; closing capture and disowning session");
             }
-            self.stop_streaming_capture(audio_capture).await;
+            self.stop_streaming_capture(audio_capture, silent).await;
             if !silent {
                 // Drop the typing surface synchronously so any
                 // Final/Partial events the backend emits while
@@ -1562,6 +1582,7 @@ impl Daemon {
         if let Some(handle) = self.level_emitter_task.take() {
             handle.abort();
         }
+        self.streaming_feed = None;
     }
 
     /// Abort the OSD draining pump (if running) so the visualizer can
@@ -1576,13 +1597,51 @@ impl Daemon {
     /// start the OSD silence pump so the visualizer stays alive during
     /// drain, and stop the mic. Leaves `streaming_session`/`_chain` for
     /// the caller to disown (or keep, to receive trailing finals).
-    async fn stop_streaming_capture(&mut self, audio_capture: &mut Option<Box<dyn AudioCapture>>) {
+    ///
+    /// `drain` is for sessions that type nothing while running (file output,
+    /// `streaming_commit = "on_stop"`), whose whole transcript is delivered
+    /// at the end. Cutting the pump there clipped the last word: the
+    /// resampler's delay line and the capture buffer still held the end of
+    /// the speech, and the model's final chunk ran without the right context
+    /// it decides words with. So a drained stop sends the backend everything
+    /// captured that the pump had not yet forwarded, then a short silence,
+    /// then closes the stream. Live sessions keep the hard cut: there a
+    /// stray trailing token would be typed into whatever has focus.
+    async fn stop_streaming_capture(
+        &mut self,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        drain: bool,
+    ) {
+        let feed = if drain {
+            self.streaming_feed.take()
+        } else {
+            None
+        };
         self.cut_streaming_audio();
         self.start_streaming_drain_pump();
-        if let Some(mut c) = audio_capture.take() {
-            let _ = c.stop().await;
-        }
+        let captured = match audio_capture.take() {
+            Some(mut c) => c.stop().await.unwrap_or_default(),
+            None => Vec::new(),
+        };
         self.restore_recording_media();
+
+        if let Some(feed) = feed {
+            let from = feed
+                .pumped
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .min(captured.len());
+            let pad = (self.config.audio.sample_rate as f32 * STREAM_TAIL_PAD_SECS) as usize;
+            let mut tail = Vec::with_capacity(captured.len() - from + pad);
+            tail.extend_from_slice(&captured[from..]);
+            tail.resize(tail.len() + pad, 0.0);
+            tracing::debug!(
+                "Draining streaming tail: {} captured samples + {} silence",
+                captured.len() - from,
+                pad
+            );
+            // A closed channel just means the backend already ended.
+            let _ = feed.tx.send(tail).await;
+        }
     }
 
     async fn end_streaming(
@@ -1597,6 +1656,7 @@ impl Daemon {
             let _ = c.stop().await;
         }
         self.restore_recording_media();
+        self.streaming_feed = None;
         if let Some(h) = streaming_handle.take() {
             // Don't error on join failure; the task may have already
             // completed. We drop events implicitly here.
@@ -1831,14 +1891,25 @@ impl Daemon {
     async fn start_streaming_capture(
         &mut self,
         track_silence: bool,
-    ) -> std::result::Result<(Box<dyn AudioCapture>, tokio::sync::mpsc::Receiver<Vec<f32>>), ()>
-    {
+    ) -> std::result::Result<
+        (
+            Box<dyn AudioCapture>,
+            tokio::sync::mpsc::Receiver<Vec<f32>>,
+            StreamingFeed,
+        ),
+        (),
+    > {
         match audio::create_capture(&self.config.audio) {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
                     // Bounded; backed-up streaming backend drops chunks
                     // rather than back-pressuring the capture.
                     let (streaming_tx, streaming_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(64);
+                    let pumped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let feed = StreamingFeed {
+                        tx: streaming_tx.clone(),
+                        pumped: pumped.clone(),
+                    };
 
                     if let Some(handle) = self.level_emitter_task.take() {
                         handle.abort();
@@ -1851,6 +1922,7 @@ impl Daemon {
                             chunk_rx,
                             hub.frame_sink(),
                             Some(streaming_tx),
+                            Some(pumped),
                             speech_tracker,
                         )
                     } else {
@@ -1868,6 +1940,7 @@ impl Daemon {
                                         tracker.observe(frame.peak_dbfs).await;
                                     }
                                 }
+                                pumped.fetch_add(chunk.len(), std::sync::atomic::Ordering::Relaxed);
                                 if let Err(e) = streaming_tx.try_send(chunk) {
                                     // Backend slow or gone; drop and keep going.
                                     tracing::trace!("streaming sample tap try_send failed: {}", e);
@@ -1876,7 +1949,7 @@ impl Daemon {
                         })
                     };
                     self.level_emitter_task = Some(handle);
-                    Ok((capture, streaming_rx))
+                    Ok((capture, streaming_rx, feed))
                 }
                 Err(e) => {
                     tracing::error!("Failed to start audio: {}", e);
@@ -3635,8 +3708,9 @@ impl Daemon {
                         (HotkeyEvent::Released, ActivationMode::PushToTalk) => {
                             tracing::debug!("Received HotkeyEvent::Released (push-to-talk), state.is_recording() = {}", state.is_recording());
                             if state.is_streaming() {
-                                self.stop_streaming_capture(&mut audio_capture).await;
-                                if state.is_silent_streaming() {
+                                let silent = state.is_silent_streaming();
+                                self.stop_streaming_capture(&mut audio_capture, silent).await;
+                                if silent {
                                     // Nothing was typed; the flushed tail is
                                     // part of what end_streaming delivers.
                                     tracing::debug!("Streaming push-to-talk released; closing audio capture and draining");
@@ -3841,7 +3915,8 @@ impl Daemon {
                                 }
                             } else if state.is_streaming() {
                                 tracing::info!("Toggle stop while streaming; closing capture");
-                                self.stop_streaming_capture(&mut audio_capture).await;
+                                let silent = state.is_silent_streaming();
+                                self.stop_streaming_capture(&mut audio_capture, silent).await;
                             } else if let State::Recording { model_override: current_model_override, .. } = &state {
                                 let model_override = current_model_override.clone();
 
@@ -4184,7 +4259,8 @@ impl Daemon {
                                 "Recording timeout ({:.0}s limit) while streaming; closing capture",
                                 max_duration.as_secs_f32()
                             );
-                            self.stop_streaming_capture(&mut audio_capture).await;
+                            let silent = state.is_silent_streaming();
+                            self.stop_streaming_capture(&mut audio_capture, silent).await;
                             continue;
                         }
 

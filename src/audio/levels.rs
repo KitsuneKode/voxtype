@@ -54,6 +54,7 @@
 use crate::config::Config;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
@@ -612,7 +613,7 @@ pub fn spawn_emitter(
     chunk_rx: mpsc::Receiver<Vec<f32>>,
     sink: FrameSink,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_emitter_with_streaming_tap(chunk_rx, sink, None, None)
+    spawn_emitter_with_streaming_tap(chunk_rx, sink, None, None, None)
 }
 
 /// Like [`spawn_emitter`] but also forwards every chunk to an optional
@@ -629,6 +630,7 @@ pub fn spawn_emitter_with_streaming_tap(
     mut chunk_rx: mpsc::Receiver<Vec<f32>>,
     sink: FrameSink,
     streaming_tx: Option<mpsc::Sender<Vec<f32>>>,
+    pumped: Option<Arc<AtomicUsize>>,
     speech_tracker: Option<SpeechTracker>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -648,6 +650,12 @@ pub fn spawn_emitter_with_streaming_tap(
             }
 
             if let Some(ref tx) = streaming_tx {
+                // Counted whether or not the send succeeds: it marks how far
+                // into the capture the stream has advanced, so the daemon can
+                // hand the backend exactly the tail it never saw at stop.
+                if let Some(ref n) = pumped {
+                    n.fetch_add(chunk.len(), Ordering::Relaxed);
+                }
                 if let Err(e) = tx.try_send(chunk) {
                     tracing::trace!("streaming sample tap try_send failed: {}", e);
                 }
