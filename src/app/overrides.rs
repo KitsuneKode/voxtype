@@ -67,6 +67,18 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(delay) = cli.restore_clipboard_delay_ms {
         config.output.restore_clipboard_delay_ms = delay;
     }
+    if let Some(ref mode) = cli.streaming_commit {
+        match mode.parse::<config::StreamingCommit>() {
+            Ok(m) => config.output.streaming_commit = m,
+            Err(e) => {
+                eprintln!("Error: --streaming-commit: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(ref path) = cli.streaming_preview_file {
+        config.output.streaming_preview_file = Some(path.clone());
+    }
     if let (Some(model), Some(voxtype::Commands::Transcribe { .. })) = (&cli.model, &cli.command) {
         // `transcribe` runs this one file with the named model, so the name
         // picks its engine exactly as a per-recording override does in the

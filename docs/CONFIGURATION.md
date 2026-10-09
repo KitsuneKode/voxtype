@@ -2411,6 +2411,45 @@ file_path = "~/transcriptions/log.txt"
 file_mode = "append"  # Build a running log of transcriptions
 ```
 
+### streaming_commit
+
+**Type:** String
+**Default:** `"live"`
+**Required:** No
+
+When a streaming session (`[parakeet] streaming`, `[whisper] streaming`, `[openvino] streaming`, `[soniox] streaming`) delivers its text.
+
+**Values:**
+- `live` - Type finalized segments at the cursor while you speak (default, unchanged behavior).
+- `on_stop` - Type nothing during the session. When the recording stops, the whole transcript goes through the same path as a batch transcription, exactly once: replacements and spoken punctuation, smart auto-submit, the profile's or default `post_process` command, the output mode (including `--file` and `--clipboard`), the modifier-release wait, and `pre_output_command`/`post_output_command`.
+
+`on_stop` is for users who want streaming's low end-of-speech latency and a live preview (see `streaming_preview_file`) without text appearing in the focused window mid-sentence, or who rely on `post_process`, which live streaming skips. Because nothing is typed while the key is held, `on_stop` also keeps push-to-talk activation: the daemon does not auto-promote it to toggle as it does for live streaming.
+
+**Example:**
+```toml
+[output]
+streaming_commit = "on_stop"
+streaming_preview_file = "auto"
+```
+
+**CLI override:** `voxtype --streaming-commit on_stop daemon`
+**Environment variable:** `VOXTYPE_STREAMING_COMMIT=on_stop`
+
+### streaming_preview_file
+
+**Type:** String
+**Default:** unset (off)
+**Required:** No
+
+A file that mirrors the in-progress transcript of a streaming session: everything finalized so far plus the current partial words. It is rewritten atomically (write a sibling `.tmp`, then rename) at most 20 times a second, and emptied when the session starts and ends. Status bars and OSDs can watch it to show live words.
+
+Set to `"auto"` for `$XDG_RUNTIME_DIR/voxtype/live_text`, or to an absolute path. `"off"`, `"none"`, or `"disabled"` turn it off.
+
+The preview shows raw engine text. Replacements, spoken punctuation, and `post_process` apply to the delivered text, not the preview.
+
+**CLI override:** `voxtype --streaming-preview-file auto daemon`
+**Environment variable:** `VOXTYPE_STREAMING_PREVIEW_FILE=auto`
+
 ---
 
 ## [output.notification]

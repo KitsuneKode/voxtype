@@ -153,6 +153,16 @@ impl StreamingSession {
         &self.finalized_text
     }
 
+    /// Everything heard so far: finalized text plus the still-open partial
+    /// tail, without the leading word-boundary space the first delta carries.
+    /// This is what the streaming preview file shows.
+    pub fn live_text(&self) -> String {
+        let mut text = String::with_capacity(self.finalized_text.len() + self.partial.len());
+        text.push_str(&self.finalized_text);
+        text.push_str(&self.partial);
+        text.trim_start().to_string()
+    }
+
     /// Number of Unicode scalar values typed to the output. Used by the
     /// daemon to populate `State::Streaming.typed_chars`.
     pub fn typed_chars(&self) -> usize {
@@ -205,8 +215,9 @@ impl StreamingSession {
         // intentionally bypassed during streaming. Per-segment cleanup
         // would run only against the final tail (not the cumulative
         // transcript visible at the cursor) and produce inconsistent
-        // output. Users who rely on post_process should disable
-        // streaming for now.
+        // output. Users who rely on post_process should set
+        // `[output] streaming_commit = "on_stop"`, which runs it once over
+        // the whole transcript when the recording stops.
         let opts = OutputOptions {
             pre_output_command,
             post_output_command,
@@ -694,6 +705,38 @@ mod tests {
         session.observe_partial_delta(" wor");
         session.replace_and_commit_silent(999, "world");
         assert_eq!(session.finalized_text(), "helloworld");
+    }
+
+    /// Parakeet's unified streamer emits deltas with a leading word
+    /// boundary. A silent (file-output or on_stop) session must rebuild the
+    /// exact transcript from them, including a repeated word that arrives as
+    /// two identical consecutive deltas, and a flushed Final tail whose
+    /// leading space is the boundary with what came before.
+    #[test]
+    fn silent_session_rebuilds_transcript_from_deltas() {
+        let mut session = StreamingSession::new();
+        for delta in [" Hello", " no", " no", " way"] {
+            session.observe_partial_delta(delta);
+        }
+        assert_eq!(session.live_text(), "Hello no no way");
+        session.commit_segment_silent(" today.");
+        session.finalize_pending_partial();
+        assert_eq!(session.finalized_text().trim(), "Hello no no way today.");
+        assert_eq!(session.typed_chars(), 0, "silent sessions never type");
+    }
+
+    #[test]
+    fn live_text_tracks_partial_and_replace_sequence() {
+        let mut session = StreamingSession::new();
+        assert_eq!(session.live_text(), "");
+        session.observe_partial_delta(" Open blue");
+        assert_eq!(session.live_text(), "Open blue");
+        session.observe_partial_delta(" button.");
+        assert_eq!(session.live_text(), "Open blue button.");
+        session.replace_and_commit_silent(8, " bubbles.");
+        assert_eq!(session.live_text(), "Open blue bubbles.");
+        session.observe_partial_delta(" Then");
+        assert_eq!(session.live_text(), "Open blue bubbles. Then");
     }
 
     #[tokio::test]

@@ -83,6 +83,11 @@ pub enum State {
         /// daemon writes the accumulated text to this path once the
         /// backend reports `Ended`.
         file_output_path: Option<PathBuf>,
+        /// `[output] streaming_commit = "on_stop"`: nothing is typed while
+        /// the session runs. Segments accumulate like a file-output session,
+        /// and when the backend reports `Ended` the whole transcript goes
+        /// through the batch output path once.
+        defer_commit: bool,
     },
 }
 
@@ -116,6 +121,23 @@ impl State {
     /// Check if in streaming state specifically
     pub fn is_streaming(&self) -> bool {
         matches!(self, State::Streaming { .. })
+    }
+
+    /// Check if this is a streaming session that types nothing while it runs:
+    /// file output, or `streaming_commit = "on_stop"`. Its text accumulates
+    /// in the session and is delivered once the backend reports `Ended`, so
+    /// a stop must let the backend drain instead of disowning the session.
+    pub fn is_silent_streaming(&self) -> bool {
+        matches!(
+            self,
+            State::Streaming {
+                file_output_path: Some(_),
+                ..
+            } | State::Streaming {
+                defer_commit: true,
+                ..
+            }
+        )
     }
 
     /// Get recording duration if currently recording (normal, eager, or streaming)
@@ -283,12 +305,30 @@ mod tests {
             finalized_text: String::new(),
             typed_chars: 0,
             file_output_path: None,
+            defer_commit: false,
         };
         assert!(state.is_recording());
         assert!(state.is_streaming());
         assert!(!state.is_idle());
         assert!(!state.is_eager_recording());
         assert!(state.recording_duration().is_some());
+    }
+
+    #[test]
+    fn test_silent_streaming_covers_file_output_and_deferred_commit() {
+        let streaming = |file: Option<PathBuf>, defer_commit: bool| State::Streaming {
+            started_at: Instant::now(),
+            model_override: None,
+            partial_buffer: String::new(),
+            finalized_text: String::new(),
+            typed_chars: 0,
+            file_output_path: file,
+            defer_commit,
+        };
+        assert!(!streaming(None, false).is_silent_streaming());
+        assert!(streaming(None, true).is_silent_streaming());
+        assert!(streaming(Some(PathBuf::from("/tmp/t.txt")), false).is_silent_streaming());
+        assert!(!State::Idle.is_silent_streaming());
     }
 
     #[test]
@@ -300,6 +340,7 @@ mod tests {
             finalized_text: "hello".into(),
             typed_chars: 5,
             file_output_path: None,
+            defer_commit: false,
         };
         let display = format!("{}", state);
         assert!(display.starts_with("Streaming"));
