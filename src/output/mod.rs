@@ -33,6 +33,7 @@ pub mod paste;
 #[cfg(target_os = "macos")]
 pub mod pbcopy;
 pub mod post_process;
+pub mod preview;
 pub mod session;
 pub mod streaming;
 pub mod wtype;

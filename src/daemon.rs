@@ -5,7 +5,7 @@
 
 use crate::audio::feedback::{AudioFeedback, SoundEvent};
 use crate::audio::{self, AudioCapture};
-use crate::config::{ActivationMode, Config, FileMode, OutputMode};
+use crate::config::{ActivationMode, Config, FileMode, OutputMode, StreamingCommit};
 use crate::eager::{self, EagerConfig};
 use crate::error::Result;
 #[cfg(target_os = "linux")]
@@ -19,6 +19,7 @@ use crate::model_manager::ModelManager;
 use crate::notification::{self, Lifetime};
 use crate::output;
 use crate::output::post_process::PostProcessor;
+use crate::output::preview::PreviewFile;
 use crate::output::streaming::StreamingSession;
 use crate::output::TextOutput;
 use crate::state::{ChunkResult, State};
@@ -449,6 +450,23 @@ fn read_output_mode_override() -> Option<OutputOverride> {
         tracing::warn!("Failed to remove output mode override file: {}", e);
     }
 
+    parse_output_mode_override(&content)
+}
+
+/// Read the output mode override without consuming it.
+///
+/// A streaming session decides at start whether it targets a file, but the
+/// sentinel has to outlive that decision: `record stop --wait` reads it to
+/// find the transcript it should wait on, and an `on_stop` session hands its
+/// transcript to `handle_transcription_result`, which does the consuming read.
+fn peek_output_mode_override() -> Option<OutputOverride> {
+    let override_file = Config::runtime_dir().join("output_mode_override");
+    let content = std::fs::read_to_string(&override_file).ok()?;
+    parse_output_mode_override(&content)
+}
+
+/// Parse the body of the output mode override file.
+fn parse_output_mode_override(content: &str) -> Option<OutputOverride> {
     let trimmed = content.trim();
 
     // Check for file mode with path: "file:/path/to/file.txt"
@@ -1062,6 +1080,10 @@ pub struct Daemon {
     /// streaming session is draining server-side after the mic stopped.
     /// Aborted in `end_streaming`.
     streaming_drain_pump: Option<tokio::task::JoinHandle<()>>,
+    /// Live transcript mirror for the active streaming session
+    /// (`[output] streaming_preview_file`). `None` when not configured or
+    /// no session is running.
+    streaming_preview: Option<PreviewFile>,
     /// OSD child supervisor task. Holds the JoinHandle so dropping it (on
     /// daemon shutdown) kill_on_drop's the spawned voxtype-osd process.
     osd_supervisor_task: Option<tokio::task::JoinHandle<()>>,
@@ -1219,6 +1241,7 @@ impl Daemon {
             silence_tracker: None,
             is_external_trigger: false,
             streaming_drain_pump: None,
+            streaming_preview: None,
             osd_supervisor_task: None,
             model_manager: None,
             model_load_task: None,
@@ -1583,8 +1606,19 @@ impl Daemon {
         // see the Partial/Final/Replace arms in the event pump, gated on
         // `file_output_path`. The chain is still built normally; it's
         // simply unused for a file-output session.
-        let output_override = read_output_mode_override();
+        //
+        // Peeked, not consumed: `record stop --wait` reads the sentinel to
+        // find the transcript path, and an on_stop session's final output
+        // goes through handle_transcription_result, which consumes it.
+        // end_streaming / cancel_streaming_to_idle clean it up otherwise.
+        let output_override = peek_output_mode_override();
         let file_output_path = self.resolve_file_output_path(&output_override, None);
+        let defer_commit = self.config.output.streaming_commit == StreamingCommit::OnStop;
+        self.streaming_preview = self
+            .config
+            .output
+            .resolve_streaming_preview_file()
+            .map(PreviewFile::new);
 
         *audio_capture = Some(capture);
         *streaming_handle = Some(handle);
@@ -1597,6 +1631,7 @@ impl Daemon {
             finalized_text: String::new(),
             typed_chars: 0,
             file_output_path,
+            defer_commit,
         };
         self.update_state("streaming");
         self.play_feedback(SoundEvent::RecordingStart);
@@ -1676,21 +1711,18 @@ impl Daemon {
             // doesn't apply; disowning here would just silently drop
             // whatever the backend was still draining, and end_streaming
             // would then write an empty file. Let it drain normally so
-            // end_streaming can write the real text.
-            let file_output = matches!(
-                &*state,
-                State::Streaming {
-                    file_output_path: Some(_),
-                    ..
-                }
-            );
-            if file_output {
-                tracing::info!("Stopping streaming session (file output); closing capture");
+            // end_streaming can write the real text. Deferred-commit
+            // sessions (`streaming_commit = "on_stop"`) are the same:
+            // nothing was typed yet, and the backend's flushed tail is part
+            // of the transcript end_streaming delivers.
+            let silent = state.is_silent_streaming();
+            if silent {
+                tracing::info!("Stopping streaming session; closing capture and draining");
             } else {
                 tracing::info!("Stopping streaming session; closing capture and disowning session");
             }
             self.stop_streaming_capture(audio_capture).await;
-            if !file_output {
+            if !silent {
                 // Drop the typing surface synchronously so any
                 // Final/Partial events the backend emits while
                 // draining its internal buffer reach the event-pump
@@ -1831,6 +1863,49 @@ impl Daemon {
             let _ = h.task.await;
         }
         self.stop_streaming_drain_pump();
+        if let Some(mut preview) = self.streaming_preview.take() {
+            preview.clear();
+        }
+
+        // Deferred commit (`streaming_commit = "on_stop"`): nothing was
+        // typed during the session. Hand the whole transcript to the batch
+        // result handler so it gets exactly what a batch transcription
+        // gets — text processing, smart auto-submit, the profile's or
+        // default post_process (once, over the full text), the output mode
+        // override including --file and its completion sidecar, the
+        // modifier-release wait, and pre/post output hooks.
+        let defer_commit = matches!(
+            &state,
+            State::Streaming {
+                defer_commit: true,
+                ..
+            }
+        );
+        if defer_commit {
+            // Same stranded-partial hazard as the file branch below.
+            if let Some(s) = streaming_session.as_mut() {
+                s.finalize_pending_partial();
+            }
+            // Deltas carry their leading word-boundary space; batch
+            // transcribers return trimmed text, so match that.
+            let text = streaming_session
+                .as_ref()
+                .map(|s| s.finalized_text().trim().to_string())
+                .unwrap_or_default();
+            *streaming_session = None;
+            *streaming_chain = None;
+
+            if text.is_empty() {
+                tracing::debug!("Streaming session produced no text");
+                self.publish_empty_outcome();
+                self.reset_to_idle(state).await;
+                return;
+            }
+            *state = State::Transcribing { audio: Vec::new() };
+            self.update_state("transcribing");
+            self.handle_transcription_result(state, Ok(Ok(text))).await;
+            return;
+        }
 
         // File-output sessions (`--file=path`) never typed anything as
         // they went — see the event pump's `file_output` branch — so the
@@ -1875,12 +1950,34 @@ impl Daemon {
                         FileMode::Append => "appended",
                     };
                     tracing::info!("{} streamed transcription to {:?}", mode_str, output_path);
+                    // The completion signal `record stop --wait` blocks on.
+                    // Without it the waiter fell through to its
+                    // idle-without-sidecar backstop and reported `empty`
+                    // for a transcript that had been written.
+                    let outcome = if final_text.trim().is_empty() {
+                        TranscriptOutcome::empty()
+                    } else {
+                        TranscriptOutcome::ok(final_text.chars().count())
+                    };
+                    write_result_sidecar(&output_path, &outcome);
                     self.play_feedback(SoundEvent::TranscriptionComplete);
                 }
-                FileDelivery::FellBack(_) => self.play_feedback(SoundEvent::TranscriptionComplete),
-                FileDelivery::Lost(_) => self.play_feedback(SoundEvent::Error),
+                FileDelivery::FellBack(err) => {
+                    write_result_sidecar(
+                        &output_path,
+                        &TranscriptOutcome::error(&format!(
+                            "{err}; copied to the clipboard instead"
+                        )),
+                    );
+                    self.play_feedback(SoundEvent::TranscriptionComplete);
+                }
+                FileDelivery::Lost(err) => {
+                    write_result_sidecar(&output_path, &TranscriptOutcome::error(&err));
+                    self.play_feedback(SoundEvent::Error);
+                }
             }
 
+            discard_recording_overrides();
             *state = State::Idle;
             self.update_state("idle");
             return;
@@ -1888,6 +1985,9 @@ impl Daemon {
 
         *streaming_session = None;
         *streaming_chain = None;
+        // Live sessions never reach handle_transcription_result, which is
+        // where batch recordings consume these per-recording sentinels.
+        discard_recording_overrides();
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
@@ -2052,6 +2152,9 @@ impl Daemon {
             }
         }
         self.stop_streaming_drain_pump();
+        if let Some(mut preview) = self.streaming_preview.take() {
+            preview.clear();
+        }
         *streaming_session = None;
         *streaming_chain = None;
 
@@ -3782,8 +3885,11 @@ impl Daemon {
         // key state tracker, so the physical key release never fires bindrd and
         // the daemon gets stuck in streaming. Force toggle activation when
         // streaming is enabled. The user's config file is left untouched; this
-        // override only applies to the running daemon.
+        // override only applies to the running daemon. `streaming_commit =
+        // "on_stop"` types nothing until the key is released, so it keeps
+        // push-to-talk.
         if self.config.streaming_active()
+            && self.config.output.streaming_commit == StreamingCommit::Live
             && self.config.hotkey.mode == crate::config::ActivationMode::PushToTalk
         {
             tracing::warn!(
@@ -4061,6 +4167,10 @@ impl Daemon {
         transcribing_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
+            let preview_deadline = self
+                .streaming_preview
+                .as_ref()
+                .and_then(PreviewFile::flush_deadline);
             tokio::select! {
                 // Handle hotkey events (only if hotkey listener is enabled)
                 Some(hotkey_event) = async {
@@ -4157,14 +4267,20 @@ impl Daemon {
                         (HotkeyEvent::Released, ActivationMode::PushToTalk) => {
                             tracing::debug!("Received HotkeyEvent::Released (push-to-talk), state.is_recording() = {}", state.is_recording());
                             if state.is_streaming() {
-                                tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
                                 self.stop_streaming_capture(&mut audio_capture).await;
-                                // Drop session/chain so the backend's
-                                // post-stop flush emission is dropped at
-                                // the event pump instead of typed.
-                                // Matches the SIGUSR2 stop path.
-                                streaming_session = None;
-                                streaming_chain = None;
+                                if state.is_silent_streaming() {
+                                    // Nothing was typed; the flushed tail is
+                                    // part of what end_streaming delivers.
+                                    tracing::debug!("Streaming push-to-talk released; closing audio capture and draining");
+                                } else {
+                                    // Drop session/chain so the backend's
+                                    // post-stop flush emission is dropped at
+                                    // the event pump instead of typed.
+                                    // Matches the SIGUSR2 stop path.
+                                    tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
+                                    streaming_session = None;
+                                    streaming_chain = None;
+                                }
                             } else if let State::Recording { model_override, .. } = &state {
                                 let model_override = model_override.clone();
 
@@ -4792,10 +4908,15 @@ impl Daemon {
                     // instead of typing through `chain` — there's no
                     // cursor/focused window to type into, and doing so
                     // anyway is exactly the leak this branch exists to
-                    // avoid (see the SIGUSR2 handler below).
-                    let file_output = matches!(
-                        &state,
-                        State::Streaming { file_output_path: Some(_), .. }
+                    // avoid (see the SIGUSR2 handler below). Deferred-commit
+                    // sessions (`streaming_commit = "on_stop"`) accumulate
+                    // the same way and deliver once in end_streaming.
+                    let file_output = state.is_silent_streaming();
+                    let is_text_event = matches!(
+                        event,
+                        Some(StreamingEvent::Partial { .. })
+                            | Some(StreamingEvent::Final { .. })
+                            | Some(StreamingEvent::Replace { .. })
                     );
                     match event {
                         Some(StreamingEvent::Partial { text, .. }) => {
@@ -4894,6 +5015,26 @@ impl Daemon {
                                 &mut streaming_chain,
                             ).await;
                         }
+                    }
+                    if is_text_event {
+                        if let (Some(preview), Some(s)) =
+                            (self.streaming_preview.as_mut(), streaming_session.as_ref())
+                        {
+                            preview.update(&s.live_text());
+                        }
+                    }
+                }
+
+                // Write a throttled streaming preview update once its
+                // interval has passed, so the newest words always land.
+                _ = async {
+                    match preview_deadline {
+                        Some(at) => tokio::time::sleep_until(at.into()).await,
+                        None => std::future::pending().await,
+                    }
+                }, if preview_deadline.is_some() => {
+                    if let Some(preview) = self.streaming_preview.as_mut() {
+                        preview.flush();
                     }
                 }
 
@@ -5290,6 +5431,7 @@ mod tests {
                 finalized_text: String::new(),
                 typed_chars: 0,
                 file_output_path: None,
+                defer_commit: false,
             },
             State::Transcribing { audio: Vec::new() },
         ];

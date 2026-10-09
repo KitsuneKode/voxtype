@@ -246,6 +246,15 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     if let Ok(val) = std::env::var("VOXTYPE_RESTORE_CLIPBOARD") {
         config.output.restore_clipboard = parse_bool_env(&val);
     }
+    if let Ok(val) = std::env::var("VOXTYPE_STREAMING_COMMIT") {
+        match val.parse() {
+            Ok(mode) => config.output.streaming_commit = mode,
+            Err(e) => tracing::warn!("Ignoring VOXTYPE_STREAMING_COMMIT: {}", e),
+        }
+    }
+    if let Ok(val) = std::env::var("VOXTYPE_STREAMING_PREVIEW_FILE") {
+        config.output.streaming_preview_file = Some(val);
+    }
     if let Ok(val) = std::env::var("VOXTYPE_RESTORE_CLIPBOARD_DELAY_MS") {
         if let Ok(ms) = val.parse::<u32>() {
             config.output.restore_clipboard_delay_ms = ms;
