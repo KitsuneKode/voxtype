@@ -3480,6 +3480,8 @@ state_file = "/tmp/voxtype-state"
 state_file = "disabled"
 ```
 
+**Delivery marker:** the state returns to `idle` however a recording ends (delivered, cancelled, empty, or failed). To tell a delivery apart, the daemon also rewrites `$XDG_RUNTIME_DIR/voxtype/output_done` after text is successfully output, with one line: `<epoch_ms> <characters>`. An OSD can watch it to show a confirmation only when text actually landed.
+
 **Usage with `voxtype status`:**
 
 Once enabled, you can monitor the state:
