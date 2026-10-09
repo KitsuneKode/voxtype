@@ -139,6 +139,27 @@ fn write_state_file(path: &PathBuf, state: &str) {
     }
 }
 
+/// Record that a transcript reached its output: `<epoch_ms> <chars>` in
+/// `$XDG_RUNTIME_DIR/voxtype/output_done`, replaced atomically.
+///
+/// The state file returns to `idle` on every ending — delivered, cancelled,
+/// empty, failed — so an OSD can't tell from it whether to confirm. This is
+/// written only after output succeeded, just before the state goes idle.
+fn write_output_done(chars: usize) {
+    let path = Config::runtime_dir().join("output_done");
+    let staged = temp_sibling(&path);
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Err(e) = std::fs::write(&staged, format!("{} {}\n", epoch_ms, chars))
+        .and_then(|()| std::fs::rename(&staged, &path))
+    {
+        tracing::debug!("Failed to write output marker {:?}: {}", path, e);
+        let _ = std::fs::remove_file(&staged);
+    }
+}
+
 /// Remove state file on shutdown
 /// Path of the marker that tells OSD frontends to stay hidden for the
 /// recording in flight. Written when a recording starts with `--no-osd`,
@@ -2004,6 +2025,11 @@ impl Daemon {
         // Live sessions never reach handle_transcription_result, which is
         // where batch recordings consume these per-recording sentinels.
         discard_recording_overrides();
+        if let State::Streaming { typed_chars, .. } = &*state {
+            if *typed_chars > 0 {
+                write_output_done(*typed_chars);
+            }
+        }
 
         self.play_feedback(SoundEvent::TranscriptionComplete);
 
@@ -3771,6 +3797,7 @@ impl Daemon {
                     {
                         tracing::error!("Output failed: {}", e);
                     } else {
+                        write_output_done(final_text.chars().count());
                         self.play_feedback(SoundEvent::TranscriptionComplete);
 
                         if self.config.output.notification.on_transcription {
