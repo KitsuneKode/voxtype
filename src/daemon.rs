@@ -1582,8 +1582,11 @@ impl Daemon {
             let _ = h.task.await;
         }
         self.stop_streaming_drain_pump();
-        if let Some(mut preview) = self.streaming_preview.take() {
-            preview.clear();
+        // Final text the backend flushed after the last throttled write.
+        let mut preview = self.streaming_preview.take();
+        if let (Some(p), Some(s)) = (preview.as_mut(), streaming_session.as_ref()) {
+            p.update(&s.live_text());
+            p.flush();
         }
 
         // Deferred commit (`streaming_commit = "on_stop"`): nothing was
@@ -1616,14 +1619,27 @@ impl Daemon {
 
             if text.is_empty() {
                 tracing::debug!("Streaming session produced no text");
+                if let Some(mut p) = preview {
+                    p.clear();
+                }
                 self.publish_empty_outcome();
                 self.reset_to_idle(state).await;
                 return;
             }
+            // The preview keeps showing the transcript while it is being
+            // post-processed and delivered, and is emptied only after. An
+            // OSD watching it would otherwise collapse to an empty pill at
+            // the stop and re-expand when the text came back.
             *state = State::Transcribing { audio: Vec::new() };
             self.update_state("transcribing");
             self.handle_transcription_result(state, Ok(Ok(text))).await;
+            if let Some(mut p) = preview {
+                p.clear();
+            }
             return;
+        }
+        if let Some(mut p) = preview {
+            p.clear();
         }
 
         // File-output sessions (`--file=path`) never typed anything as
