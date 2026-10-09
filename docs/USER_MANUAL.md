@@ -935,6 +935,14 @@ so a held PTT key never fires its release event. The daemon auto-promotes
 push-to-talk to toggle at startup when streaming is enabled and logs a
 warning.
 
+To keep the text out of the focused window until you stop, set
+`[output] streaming_commit = "on_stop"`. The session types nothing while
+you speak; when you stop, the full transcript goes through post-processing
+and your normal output mode once, like a batch transcription. Add
+`streaming_preview_file = "auto"` to watch the words arrive in
+`$XDG_RUNTIME_DIR/voxtype/live_text` (for a bar or OSD). With `on_stop`,
+push-to-talk keeps working because nothing is typed while the key is held.
+
 See [PARAKEET.md](PARAKEET.md) for detailed setup instructions.
 
 ### Moonshine

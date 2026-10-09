@@ -41,7 +41,7 @@ pub use meeting::{
 pub use notification::NotificationConfig;
 pub use output::{
     default_language_to_layout, AppliedLanguageXkbHint, FileMode, OutputConfig, OutputDriver,
-    OutputMode,
+    OutputMode, StreamingCommit,
 };
 pub use profile::{PostProcessConfig, Profile};
 pub use root::Config;

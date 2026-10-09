@@ -938,6 +938,24 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "String added to the end of every transcription, e.g. a trailing space.",
     ),
     spec(
+        "output.streaming_commit",
+        "output",
+        "streaming_commit",
+        closed(&["live", "on_stop"]),
+        "Output",
+        "Streaming delivery",
+        "live types text while you speak. on_stop types nothing until you stop, then delivers the whole transcript once through post-processing and the normal output path.",
+    ),
+    spec(
+        "output.streaming_preview_file",
+        "output",
+        "streaming_preview_file",
+        KeyType::String,
+        "Output",
+        "Streaming preview file",
+        "File that mirrors the live transcript during a streaming session, for bars and OSDs. \"auto\" uses the runtime directory's live_text.",
+    ),
+    spec(
         "output.post_process.command",
         "output.post_process",
         "command",
@@ -1789,6 +1807,8 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.shift_enter_newlines" => json!(cfg.output.shift_enter_newlines),
         "output.pre_type_delay_ms" => json!(cfg.output.pre_type_delay_ms),
         "output.append_text" => opt_str(cfg.output.append_text.as_ref()),
+        "output.streaming_commit" => serde_json::to_value(cfg.output.streaming_commit).ok()?,
+        "output.streaming_preview_file" => opt_str(cfg.output.streaming_preview_file.as_ref()),
         "output.post_process.command" => match &cfg.output.post_process {
             Some(p) => json!(p.command),
             None => Json::Null,

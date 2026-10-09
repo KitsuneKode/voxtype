@@ -289,6 +289,33 @@ pub struct Cli {
     )]
     pub restore_clipboard_delay_ms: Option<u32>,
 
+    /// When streaming sessions deliver text: live or on_stop
+    #[arg(
+        long,
+        value_name = "MODE",
+        help_heading = "Output",
+        long_help = "When a streaming session delivers its text.\n\
+        live (default): type finalized segments at the cursor while you speak.\n\
+        on_stop: type nothing mid-session; when the recording stops, send the\n\
+        whole transcript through the batch output path once (text processing,\n\
+        post_process, profiles, output mode, hooks).\n\
+        Pair with --streaming-preview-file to watch the words as they arrive.\n\
+        Example: voxtype --streaming-commit on_stop daemon"
+    )]
+    pub streaming_commit: Option<String>,
+
+    /// Mirror the live streaming transcript into this file ("auto" = runtime dir)
+    #[arg(
+        long,
+        value_name = "PATH",
+        help_heading = "Output",
+        long_help = "Mirror the in-progress transcript of a streaming session into a file,\n\
+        rewritten atomically as words arrive and emptied when the session ends.\n\
+        Use \"auto\" for $XDG_RUNTIME_DIR/voxtype/live_text.\n\
+        Example: voxtype --streaming-preview-file auto daemon"
+    )]
+    pub streaming_preview_file: Option<String>,
+
     /// Output driver order (comma-separated)
     #[arg(
         long,
@@ -575,6 +602,24 @@ mod tests {
     fn test_engine_flag_whisper() {
         let cli = Cli::parse_from(["voxtype", "--engine", "whisper"]);
         assert_eq!(cli.engine, Some("whisper".to_string()));
+    }
+
+    #[test]
+    fn test_streaming_output_flags() {
+        let cli = Cli::parse_from([
+            "voxtype",
+            "--streaming-commit",
+            "on_stop",
+            "--streaming-preview-file",
+            "auto",
+            "daemon",
+        ]);
+        assert_eq!(cli.streaming_commit.as_deref(), Some("on_stop"));
+        assert_eq!(cli.streaming_preview_file.as_deref(), Some("auto"));
+
+        let cli = Cli::parse_from(["voxtype", "daemon"]);
+        assert_eq!(cli.streaming_commit, None);
+        assert_eq!(cli.streaming_preview_file, None);
     }
 
     #[test]

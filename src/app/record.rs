@@ -198,7 +198,11 @@ pub(crate) fn send_record_command(
             RecordAction::Stop { json, timeout, .. } => (*json, *timeout),
             _ => (false, 120),
         };
-        let outcome = await_transcription(&transcript, Duration::from_secs(timeout));
+        let outcome = await_transcription(
+            &transcript,
+            config.resolve_state_file().as_deref(),
+            Duration::from_secs(timeout),
+        );
         report_outcome(&outcome, as_json);
         std::process::exit(outcome.exit_code());
     }
@@ -256,13 +260,19 @@ impl WaitOutcome {
 /// seeing the sidecar means the transcript is complete. A state file that
 /// returns to idle without one is the backstop: that means the recording ended
 /// down a path that produced no transcript.
-fn await_transcription(transcript: &Path, timeout: Duration) -> WaitOutcome {
+fn await_transcription(
+    transcript: &Path,
+    state_file: Option<&Path>,
+    timeout: Duration,
+) -> WaitOutcome {
     const POLL: Duration = Duration::from_millis(50);
     // How long to keep looking for a sidecar after the daemon reports idle.
     const SETTLE: Duration = Duration::from_millis(750);
 
     let sidecar = result_sidecar_path(transcript);
-    let state_file = config::Config::runtime_dir().join("state");
+    // The state file the daemon actually writes (`state_file` may be a
+    // custom path); without one there is no idle backstop, only the sidecar
+    // and the timeout.
     let deadline = Instant::now() + timeout;
     let mut idle_since: Option<Instant> = None;
 
@@ -272,7 +282,8 @@ fn await_transcription(transcript: &Path, timeout: Duration) -> WaitOutcome {
             return finish(transcript, &body);
         }
 
-        let state = std::fs::read_to_string(&state_file)
+        let state = state_file
+            .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         if state == "idle" {

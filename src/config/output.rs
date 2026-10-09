@@ -176,6 +176,36 @@ pub struct OutputConfig {
     /// indefinitely blocking transcription delivery.
     #[serde(default = "default_modifier_release_timeout_ms")]
     pub modifier_release_timeout_ms: u64,
+
+    /// When a streaming session delivers its text: "live" (default) types
+    /// finalized segments at the cursor as you speak; "on_stop" types
+    /// nothing mid-session and, when the recording stops, sends the whole
+    /// transcript through the same path as batch transcription (text
+    /// processing, post_process, profiles, output mode, hooks) exactly once.
+    #[serde(default)]
+    pub streaming_commit: StreamingCommit,
+
+    /// File that mirrors the in-progress transcript of a streaming session,
+    /// rewritten atomically as words arrive and emptied when the session
+    /// ends. For status bars and OSDs that want to show live words.
+    /// "auto" = $XDG_RUNTIME_DIR/voxtype/live_text. Default: unset (off).
+    #[serde(default)]
+    pub streaming_preview_file: Option<String>,
+}
+
+impl OutputConfig {
+    /// Resolve `streaming_preview_file` to a path, or `None` when it is unset
+    /// or disabled. Same spellings as the top-level `state_file`.
+    pub fn resolve_streaming_preview_file(&self) -> Option<PathBuf> {
+        self.streaming_preview_file
+            .as_deref()
+            .map(str::trim)
+            .and_then(|path| match path.to_lowercase().as_str() {
+                "" | "disabled" | "none" | "off" | "false" => None,
+                "auto" => Some(crate::config::Config::runtime_dir().join("live_text")),
+                _ => Some(PathBuf::from(path)),
+            })
+    }
 }
 
 impl Default for OutputConfig {
@@ -209,6 +239,8 @@ impl Default for OutputConfig {
             restore_clipboard_delay_ms: default_restore_clipboard_delay(),
             wait_for_modifier_release: true,
             modifier_release_timeout_ms: default_modifier_release_timeout_ms(),
+            streaming_commit: StreamingCommit::default(),
+            streaming_preview_file: None,
         }
     }
 }
@@ -396,6 +428,33 @@ impl std::str::FromStr for OutputDriver {
     }
 }
 
+/// When a streaming session delivers its text (`[output] streaming_commit`).
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamingCommit {
+    /// Type finalized segments at the cursor as they arrive (default).
+    #[default]
+    Live,
+    /// Type nothing mid-session; deliver the whole transcript once, through
+    /// the batch output path, when the recording stops.
+    OnStop,
+}
+
+impl std::str::FromStr for StreamingCommit {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().replace('-', "_").as_str() {
+            "live" => Ok(Self::Live),
+            "on_stop" => Ok(Self::OnStop),
+            other => Err(format!(
+                "invalid streaming commit mode '{}': expected 'live' or 'on_stop'",
+                other
+            )),
+        }
+    }
+}
+
 /// File write mode when using file output
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
@@ -411,6 +470,54 @@ pub enum FileMode {
 mod tests {
     use super::*;
     use crate::config::Config;
+
+    #[test]
+    fn streaming_commit_defaults_to_live_and_parses_on_stop() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.output.streaming_commit, StreamingCommit::Live);
+        assert_eq!(config.output.resolve_streaming_preview_file(), None);
+
+        let config: Config = toml::from_str(
+            r#"
+            [output]
+            streaming_commit = "on_stop"
+            streaming_preview_file = "auto"
+        "#,
+        )
+        .unwrap();
+        assert_eq!(config.output.streaming_commit, StreamingCommit::OnStop);
+        assert_eq!(
+            config.output.resolve_streaming_preview_file(),
+            Some(crate::config::Config::runtime_dir().join("live_text"))
+        );
+    }
+
+    #[test]
+    fn streaming_commit_from_str_accepts_both_spellings() {
+        assert_eq!("live".parse(), Ok(StreamingCommit::Live));
+        assert_eq!("on_stop".parse(), Ok(StreamingCommit::OnStop));
+        assert_eq!("On-Stop".parse(), Ok(StreamingCommit::OnStop));
+        assert!("later".parse::<StreamingCommit>().is_err());
+    }
+
+    #[test]
+    fn streaming_preview_file_off_spellings_disable_it() {
+        for off in ["off", "none", "disabled", "false", ""] {
+            let output = OutputConfig {
+                streaming_preview_file: Some(off.to_string()),
+                ..OutputConfig::default()
+            };
+            assert_eq!(output.resolve_streaming_preview_file(), None, "{off}");
+        }
+        let output = OutputConfig {
+            streaming_preview_file: Some("/tmp/x/live".to_string()),
+            ..OutputConfig::default()
+        };
+        assert_eq!(
+            output.resolve_streaming_preview_file(),
+            Some(PathBuf::from("/tmp/x/live"))
+        );
+    }
 
     #[test]
     fn test_parse_auto_submit() {
