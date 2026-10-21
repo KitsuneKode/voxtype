@@ -50,6 +50,27 @@ PanelWindow {
                                              && customLoader.item.lingering === true
     visible: !osdSuppressed
              && ((daemonState !== "idle" && daemonState !== "") || _customLingering)
+
+    // Show on the monitor holding the focused window, where the dictated
+    // text lands. Uses the foreign-toplevel protocol rather than a
+    // compositor IPC so Hyprland, Sway, and River all get it. The screen
+    // only follows focus while hidden: moving a visible layer surface
+    // recreates it, and a pill that jumps monitors mid-dictation reads as
+    // a glitch. With no focused window (empty workspace) the last screen
+    // is kept, and before any focus is seen Quickshell's default is used.
+    readonly property var _focusedScreen: {
+        const t = ToplevelManager.activeToplevel;
+        return t && t.screens.length > 0 ? t.screens[0] : null;
+    }
+    property var _shownScreen: null
+    function _followFocus() {
+        if (!visible && _focusedScreen) _shownScreen = _focusedScreen;
+    }
+    on_FocusedScreenChanged: _followFocus()
+    onVisibleChanged: _followFocus()
+    Component.onCompleted: _followFocus()
+    screen: _shownScreen
+
     anchors {
         top: true
         bottom: true
