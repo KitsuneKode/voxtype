@@ -135,14 +135,19 @@ impl MeetingDaemon {
             Arc::from(transcribe::create_transcriber(&meeting_app_config)?);
         let engine_name = format!("{:?}", meeting_app_config.engine).to_lowercase();
 
-        let post_processor = app_config.output.post_process.as_ref().map(|cfg| {
-            tracing::info!(
-                "Meeting post-processing enabled: command={:?}, timeout={}ms",
-                cfg.command,
-                cfg.timeout_ms
-            );
-            PostProcessor::new(cfg)
-        });
+        let post_processor = app_config
+            .output
+            .post_process
+            .as_ref()
+            .filter(|_| app_config.output.post_process_enabled)
+            .map(|cfg| {
+                tracing::info!(
+                    "Meeting post-processing enabled: command={:?}, timeout={}ms",
+                    cfg.command,
+                    cfg.timeout_ms
+                );
+                PostProcessor::new(cfg)
+            });
 
         // Create diarizer if configured
         let diarizer = config.diarization.as_ref().and_then(|diar_config| {

@@ -284,6 +284,12 @@ type_delay_ms = 0
 # timeout_ms = 30000  # 30 second timeout (generous for LLM)
 # trim = true         # Strip leading/trailing whitespace from output (default: true)
 # fallback_on_empty = true  # Use original text if command returns empty (default: true)
+#
+# Master switch for post-processing, including profile commands. Set to false
+# to output transcriptions as is without removing the command. Per recording:
+# `voxtype record start --no-post-process` / `--post-process`, and
+# `voxtype record stop --no-post-process` to skip a run already in progress.
+# post_process_enabled = true   # goes under [output], not [output.post_process]
 
 [output.notification]
 # Show notification when recording starts (hotkey pressed)

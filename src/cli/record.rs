@@ -72,6 +72,15 @@ pub enum RecordAction {
         /// Disable smart auto-submit for this recording
         #[arg(long, conflicts_with = "smart_auto_submit")]
         no_smart_auto_submit: bool,
+        /// Run post-processing for this recording, even if
+        /// output.post_process_enabled is off
+        #[arg(long, conflicts_with = "no_post_process")]
+        post_process: bool,
+
+        /// Skip post-processing for this recording and output the
+        /// transcription as is (text replacements still apply)
+        #[arg(long, conflicts_with = "post_process")]
+        no_post_process: bool,
     },
     /// Stop recording and transcribe (send SIGUSR2 to daemon)
     Stop {
@@ -110,6 +119,13 @@ pub enum RecordAction {
         /// so a caller that passed --file to `record start` need not repeat it.
         #[arg(long, value_name = "FILE", requires = "wait")]
         wait_file: Option<String>,
+        /// Skip post-processing and output the transcription as is
+        ///
+        /// Also works after the recording has stopped: while the
+        /// post-process command is still running, this abandons it and
+        /// outputs the unprocessed transcription right away.
+        #[arg(long)]
+        no_post_process: bool,
     },
     /// Toggle recording state
     Toggle {
@@ -170,6 +186,15 @@ pub enum RecordAction {
         /// Disable smart auto-submit for this recording (overrides config)
         #[arg(long, conflicts_with = "smart_auto_submit")]
         no_smart_auto_submit: bool,
+        /// Run post-processing for this recording, even if
+        /// output.post_process_enabled is off
+        #[arg(long, conflicts_with = "no_post_process")]
+        post_process: bool,
+
+        /// Skip post-processing for this recording and output the
+        /// transcription as is (text replacements still apply)
+        #[arg(long, conflicts_with = "post_process")]
+        no_post_process: bool,
     },
     /// Cancel current recording or transcription (discard without output)
     Cancel,
@@ -325,6 +350,27 @@ impl RecordAction {
                 ..
             } => override_from_flags(*smart_auto_submit, *no_smart_auto_submit),
             RecordAction::Stop { .. } | RecordAction::Cancel => None,
+        }
+    }
+    /// Get the post-processing override from --post-process / --no-post-process
+    /// Returns Some(true) to force it on, Some(false) to skip it, None if unset.
+    /// On stop only --no-post-process exists, to skip a run in progress.
+    pub fn post_process_override(&self) -> Option<bool> {
+        match self {
+            RecordAction::Start {
+                post_process,
+                no_post_process,
+                ..
+            }
+            | RecordAction::Toggle {
+                post_process,
+                no_post_process,
+                ..
+            } => override_from_flags(*post_process, *no_post_process),
+            RecordAction::Stop {
+                no_post_process, ..
+            } => no_post_process.then_some(false),
+            RecordAction::Cancel => None,
         }
     }
 }
@@ -935,6 +981,54 @@ mod tests {
             }
             _ => panic!("Expected Record command"),
         }
+    }
+
+    #[test]
+    fn test_record_post_process_override() {
+        let cases: &[(&[&str], Option<bool>)] = &[
+            (&["voxtype", "record", "start"], None),
+            (
+                &["voxtype", "record", "start", "--post-process"],
+                Some(true),
+            ),
+            (
+                &["voxtype", "record", "start", "--no-post-process"],
+                Some(false),
+            ),
+            (
+                &["voxtype", "record", "toggle", "--no-post-process"],
+                Some(false),
+            ),
+            (&["voxtype", "record", "stop"], None),
+            (
+                &["voxtype", "record", "stop", "--no-post-process"],
+                Some(false),
+            ),
+            (&["voxtype", "record", "cancel"], None),
+        ];
+        for (args, expected) in cases {
+            match Cli::parse_from(*args).command {
+                Some(Commands::Record { action }) => {
+                    assert_eq!(action.post_process_override(), *expected, "{:?}", args);
+                }
+                _ => panic!("Expected Record command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_record_post_process_flags_conflict() {
+        let result = Cli::try_parse_from([
+            "voxtype",
+            "record",
+            "start",
+            "--post-process",
+            "--no-post-process",
+        ]);
+        assert!(result.is_err());
+        // Stop has no way to force post-processing on: the decision to run
+        // it is made by the time a stop could matter.
+        assert!(Cli::try_parse_from(["voxtype", "record", "stop", "--post-process"]).is_err());
     }
 
     #[test]

@@ -362,7 +362,9 @@ voxtype record start --file=out.txt # Write transcription to a file
 voxtype record start --file         # Write to file_path from config
 voxtype record stop                 # Stop recording and transcribe (sends SIGUSR2 to daemon)
 voxtype record toggle               # Toggle recording state
-voxtype record cancel               # Cancel recording or transcription in progress
+voxtype record cancel               # Cancel recording, transcription, or post-processing
+voxtype record start --no-post-process  # Skip post-processing for this recording
+voxtype record stop --no-post-process   # Skip it, even while it is already running
 ```
 
 **Model override:** Use `--model` to specify which model to use for this recording:
@@ -783,7 +785,9 @@ If you use a multi-key combination (e.g., `SUPER+CTRL+X`) and release keys slowl
 
 ## Canceling Transcription
 
-You can cancel recording or transcription at any time. When canceled, no text is output.
+You can cancel recording, transcription, or post-processing at any time. When canceled, no text is output, and a running post-process command is killed.
+
+To keep the words but skip a slow post-process command, use `voxtype record stop --no-post-process` instead: it kills the command and types the unprocessed transcription. See [Skipping Post-Processing](#skipping-post-processing).
 
 ### With Compositor Keybindings
 
@@ -2062,6 +2066,27 @@ Post-processing is designed to be fault-tolerant:
 - **Empty output**: Falls back to original text
 
 This ensures voice-to-text always produces output, even when the LLM is slow or unavailable.
+
+### Skipping Post-Processing
+
+Post-processing can be turned off for one recording or for all of them, without removing the command:
+
+```bash
+voxtype record start --no-post-process   # this recording outputs the raw transcription
+voxtype record start --post-process      # run it even when post_process_enabled = false
+voxtype record stop --no-post-process    # stop waiting on a running command; output raw text now
+```
+
+The last one is the escape hatch for a slow or unreachable LLM: bind it to a key, and pressing it while voxtype is post-processing kills the command and types what you said as is. `voxtype record cancel` at the same point discards the transcription instead.
+
+To turn post-processing off everywhere, including profiles:
+
+```toml
+[output]
+post_process_enabled = false
+```
+
+Or set `VOXTYPE_POST_PROCESS=false`. Like other config changes, this takes effect when the daemon restarts.
 
 ### Debugging
 

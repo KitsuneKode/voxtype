@@ -88,6 +88,13 @@ pub struct OutputConfig {
     #[serde(default)]
     pub post_process: Option<PostProcessConfig>,
 
+    /// Master switch for post-processing (default: true)
+    /// When false, neither [output.post_process] nor a profile's
+    /// post_process_command runs; the transcription is output as is.
+    /// `voxtype record start --post-process` still opts a single recording in.
+    #[serde(default = "default_true")]
+    pub post_process_enabled: bool,
+
     /// Keystroke to simulate for paste mode (e.g., "ctrl+v", "shift+insert", "ctrl+shift+v")
     /// Defaults to "ctrl+v" if not specified
     #[serde(default)]
@@ -226,6 +233,7 @@ impl Default for OutputConfig {
             pre_output_command: None,
             post_output_command: None,
             post_process: None,
+            post_process_enabled: true,
             paste_keys: None,
             dotool_xkb_layout: None,
             dotool_xkb_variant: None,
