@@ -94,7 +94,9 @@ bind = SUPER, M, exec, mkdir -p $XDG_RUNTIME_DIR/voxtype && touch $XDG_RUNTIME_D
   packaged QML.
 - **Surfaces**: each widget is a `PanelWindow` on the `WlrLayer.Overlay`
   layer with no keyboard focus, matching the GTK4 frontend's surface
-  semantics.
+  semantics. The OSD opens on the monitor holding the focused window
+  (via the foreign-toplevel protocol, so Hyprland, Sway, and River all
+  work) and stays put until it hides.
 - **No new daemon IPC**: the picker and meeting controls read existing
   files (`config.toml`, `meeting_state`) and shell out to existing CLI
   commands (`voxtype config set`, `voxtype meeting <action>`,
