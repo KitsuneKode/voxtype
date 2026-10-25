@@ -90,7 +90,10 @@ impl PostProcessor {
         cmd.args(["-c", &self.command])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // Own process group, so the guard below can kill what `sh -c`
+            // started (a curl to an LLM API, say) and not just the shell.
+            .process_group(0);
 
         // Always clear to prevent inheriting stale context from parent environment
         cmd.env_remove("VOXTYPE_CONTEXT");
@@ -101,6 +104,7 @@ impl PostProcessor {
         let mut child = cmd
             .spawn()
             .map_err(|e| PostProcessError::SpawnFailed(e.to_string()))?;
+        let mut group = ProcessGroupGuard(child.id());
 
         // Write text to stdin
         if let Some(mut stdin) = child.stdin.take() {
@@ -117,6 +121,7 @@ impl PostProcessor {
             .await
             .map_err(|_| PostProcessError::Timeout(self.timeout.as_secs()))?
             .map_err(|e| PostProcessError::WaitFailed(e.to_string()))?;
+        group.disarm();
 
         // Check exit status
         if !output.status.success() {
@@ -136,6 +141,31 @@ impl PostProcessor {
         } else {
             // Only strip trailing newlines (artifact of shell output), preserve other whitespace
             Ok(processed.trim_end_matches('\n').to_string())
+        }
+    }
+}
+
+/// Kills a command's process group when dropped while still armed.
+///
+/// Covers both ways the command can be abandoned: the timeout firing, and
+/// the daemon dropping the whole future because the user cancelled or asked
+/// for the raw transcript. Without it the command ran on unobserved.
+struct ProcessGroupGuard(Option<u32>);
+
+impl ProcessGroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            // The shell is not reaped until wait completes, so its pid (the
+            // group id) cannot have been reused while the guard is armed.
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
         }
     }
 }
@@ -221,6 +251,100 @@ mod tests {
         let processor = PostProcessor::new(&config);
         let result = processor.process("original text").await;
         assert_eq!(result, "original text"); // Falls back to original
+    }
+
+    /// Pid a test command recorded, waiting for the command to get there.
+    #[cfg(target_os = "linux")]
+    async fn wait_for_pid(file: &std::path::Path) -> i32 {
+        for _ in 0..100 {
+            if let Some(pid) = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("command never wrote its pid to {:?}", file);
+    }
+
+    /// A zombie still answers kill(pid, 0), so read the state from /proc.
+    #[cfg(target_os = "linux")]
+    fn is_running(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{}/stat", pid))
+            .ok()
+            .and_then(|stat| {
+                let state = stat.rsplit(')').next()?.split_whitespace().next()?;
+                Some(state != "Z" && state != "X")
+            })
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_stops(pid: i32) {
+        for _ in 0..100 {
+            if !is_running(pid) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        panic!("process {} the command started outlived it", pid);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_timeout_kills_what_the_command_started() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let command = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let processor = PostProcessor::new(&make_config(&command, 300));
+        assert_eq!(processor.process("original text").await, "original text");
+        assert_stops(wait_for_pid(&pid_file).await).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_abandoning_a_run_kills_what_the_command_started() {
+        // The daemon drops the run on `record cancel` and on
+        // `record stop --no-post-process`; an LLM call the script started
+        // must not keep going.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let command = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let processor = PostProcessor::new(&make_config(&command, 30_000));
+        let pid = {
+            let run = processor.process("original text");
+            tokio::pin!(run);
+            tokio::select! {
+                _ = &mut run => panic!("command should still be running"),
+                pid = wait_for_pid(&pid_file) => pid,
+            }
+        };
+        assert_stops(pid).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_completed_run_leaves_background_processes_alone() {
+        // Scripts fork long-lived helpers on success, e.g. a wl-copy
+        // clipboard owner; finishing normally must not take them down.
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let command = format!(
+            "sleep 30 </dev/null >/dev/null 2>&1 & echo $! > '{}'; echo done",
+            pid_file.display()
+        );
+        let processor = PostProcessor::new(&make_config(&command, 5000));
+        assert_eq!(processor.process("original text").await, "done");
+        let pid = wait_for_pid(&pid_file).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let survived = is_running(pid);
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        assert!(
+            survived,
+            "background process was killed after a successful run"
+        );
     }
 
     #[tokio::test]

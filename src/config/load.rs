@@ -260,6 +260,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
             config.output.restore_clipboard_delay_ms = ms;
         }
     }
+    if let Ok(val) = std::env::var("VOXTYPE_POST_PROCESS") {
+        config.output.post_process_enabled = parse_bool_env(&val);
+    }
     if let Ok(val) = std::env::var("VOXTYPE_SMART_AUTO_SUBMIT") {
         config.text.smart_auto_submit = parse_bool_env(&val);
     }

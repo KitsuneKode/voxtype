@@ -2789,6 +2789,31 @@ command = "ollama run llama3.2:1b 'Clean up:'"
 timeout_ms = 45000  # 45 second timeout for LLM
 ```
 
+### Turning Post-Processing Off
+
+`post_process_enabled` under `[output]` is a master switch that covers both
+`[output.post_process]` and every profile's `post_process_command`, so you can
+turn cleanup off without deleting the commands.
+
+**Type:** Boolean
+**Default:** `true`
+**Environment variable:** `VOXTYPE_POST_PROCESS`
+
+```toml
+[output]
+post_process_enabled = false
+```
+
+Per recording, `voxtype record start --no-post-process` skips the command and
+`--post-process` runs it even when the switch is off. `voxtype record stop
+--no-post-process` also works after the recording has ended: while the command
+is still running it is killed and the unprocessed transcription is output
+right away. `voxtype record cancel` during post-processing kills the command
+and outputs nothing.
+
+Text replacements and spoken punctuation are not post-processing; they always
+apply.
+
 ### Context from Previous Dictation
 
 When post-processing is enabled, voxtype passes the previous dictation's text via the `VOXTYPE_CONTEXT` environment variable (if the previous dictation was within 60 seconds). This helps LLM-based cleanup scripts maintain continuity across rapid-fire dictations.
