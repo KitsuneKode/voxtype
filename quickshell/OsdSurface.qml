@@ -22,6 +22,7 @@ import QtQuick
 import QtQuick.Effects
 import Quickshell
 import Quickshell.Wayland
+import Quickshell.Hyprland
 import "voxtype-shared" as VT
 
 PanelWindow {
@@ -51,14 +52,19 @@ PanelWindow {
     visible: !osdSuppressed
              && ((daemonState !== "idle" && daemonState !== "") || _customLingering)
 
-    // Show on the monitor holding the focused window, where the dictated
-    // text lands. Uses the foreign-toplevel protocol rather than a
-    // compositor IPC so Hyprland, Sway, and River all get it. The screen
-    // only follows focus while hidden: moving a visible layer surface
-    // recreates it, and a pill that jumps monitors mid-dictation reads as
-    // a glitch. With no focused window (empty workspace) the last screen
-    // is kept, and before any focus is seen Quickshell's default is used.
+    // Show on the focused monitor, where the dictated text lands. On
+    // Hyprland that comes from its IPC: the foreign-toplevel protocol's
+    // per-window output events go stale in a long-running instance (once
+    // an output is re-created, most toplevels report no screen), which
+    // pinned the OSD to one monitor. Elsewhere (Sway, River) the active
+    // toplevel's screen is used; with no focused window there, the last
+    // screen is kept. The screen only follows focus while hidden: moving a
+    // visible layer surface recreates it, and an OSD that jumps monitors
+    // mid-dictation reads as a glitch. Before any focus is seen
+    // Quickshell's default is used.
     readonly property var _focusedScreen: {
+        const m = Hyprland.focusedMonitor;
+        if (m) return Quickshell.screens.find(s => s.name === m.name) ?? null;
         const t = ToplevelManager.activeToplevel;
         return t && t.screens.length > 0 ? t.screens[0] : null;
     }
