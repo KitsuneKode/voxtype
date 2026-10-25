@@ -1090,6 +1090,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Keep text when output is empty",
         "Output the original transcription when the command prints nothing. Turn off to let the command drop a transcription.",
     ),
+    spec(
+        "output.post_process_enabled",
+        "output",
+        "post_process_enabled",
+        KeyType::Bool,
+        "Output",
+        "Post-processing",
+        "Run the post-process command (default or profile) on each transcription. Off outputs the transcription as is; `record start --post-process` still opts a single recording in.",
+    ),
     // -- Text ---------------------------------------------------------------
     spec(
         "text.spoken_punctuation",
@@ -2580,6 +2589,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.append_text" => opt_str(cfg.output.append_text.as_ref()),
         "output.streaming_commit" => serde_json::to_value(cfg.output.streaming_commit).ok()?,
         "output.streaming_preview_file" => opt_str(cfg.output.streaming_preview_file.as_ref()),
+        "output.post_process_enabled" => json!(cfg.output.post_process_enabled),
         "output.post_process.command" => match &cfg.output.post_process {
             Some(p) => json!(p.command),
             None => Json::Null,

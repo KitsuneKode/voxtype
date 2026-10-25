@@ -335,6 +335,36 @@ fn cancel_applies_to(state: &State) -> bool {
     state.is_recording() || matches!(state, State::Transcribing { .. })
 }
 
+/// How a post-process command run ended while the daemon waited on it.
+enum PostProcessWait {
+    Done(String),
+    /// `record stop --no-post-process` arrived: deliver the unprocessed text.
+    Skipped,
+    /// `record cancel` arrived: deliver nothing.
+    Cancelled,
+}
+
+/// Await a post-process run while still honouring `record cancel` and
+/// `record stop --no-post-process`. The daemon's event loop is parked on
+/// this await, so these requests are polled here; returning early drops the
+/// run, which kills the command's process group.
+async fn wait_for_post_process(run: impl std::future::Future<Output = String>) -> PostProcessWait {
+    tokio::pin!(run);
+    loop {
+        tokio::select! {
+            text = &mut run => return PostProcessWait::Done(text),
+            _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                if check_cancel_requested() {
+                    return PostProcessWait::Cancelled;
+                }
+                if read_bool_override("post_process") == Some(false) {
+                    return PostProcessWait::Skipped;
+                }
+            }
+        }
+    }
+}
+
 /// Clean up any stale cancel file on startup
 fn cleanup_cancel_file() {
     let cancel_file = Config::runtime_dir().join("cancel");
@@ -546,13 +576,14 @@ fn discard_recording_overrides() {
 }
 
 /// Every override file a single recording can carry, in the runtime dir.
-const RECORDING_OVERRIDE_FILES: [&str; 6] = [
+const RECORDING_OVERRIDE_FILES: [&str; 7] = [
     "output_mode_override",
     "model_override",
     "profile_override",
     "auto_submit_override",
     "shift_enter_override",
     "smart_auto_submit_override",
+    "post_process_override",
 ];
 
 fn discard_recording_overrides_in(runtime_dir: &std::path::Path) {
@@ -3621,75 +3652,74 @@ impl Daemon {
                             None
                         }
                     });
-                    // Apply post-processing command (profile overrides default)
-                    let final_text = if let Some(profile) = active_profile {
-                        if let Some(ref cmd) = profile.post_process_command {
-                            let timeout_ms = profile.post_process_timeout_ms.unwrap_or(30000);
-                            let profile_config = crate::config::PostProcessConfig {
+                    // Apply post-processing command (profile overrides default).
+                    // `--post-process` / `--no-post-process` on the record
+                    // command decides for this recording; otherwise the
+                    // config switch does.
+                    let post_process_enabled = read_bool_override("post_process")
+                        .unwrap_or(self.config.output.post_process_enabled);
+                    let profile_processor = active_profile
+                        .and_then(|p| p.post_process_command.as_ref().map(|cmd| (p, cmd)))
+                        .map(|(profile, cmd)| {
+                            PostProcessor::new(&crate::config::PostProcessConfig {
                                 command: cmd.clone(),
-                                timeout_ms,
+                                timeout_ms: profile.post_process_timeout_ms.unwrap_or(30000),
                                 trim: true,
                                 fallback_on_empty: true,
-                            };
-                            let profile_processor = PostProcessor::new(&profile_config);
+                            })
+                        });
+                    let processor = if post_process_enabled {
+                        profile_processor.as_ref().or(self.post_processor.as_ref())
+                    } else {
+                        tracing::info!("Post-processing disabled for this recording");
+                        None
+                    };
+                    let final_text = match processor {
+                        None => processed_text,
+                        Some(processor) => {
                             tracing::info!(
-                                "Post-processing with profile: {:?}, has_context: {}",
-                                profile_override.as_ref().unwrap(),
+                                "Post-processing (profile: {:?}), has_context: {}",
+                                profile_processor.as_ref().and(profile_override.as_ref()),
                                 recent_context.is_some()
                             );
-                            tracing::debug!("Post-processing context: {:?}", recent_context);
-                            let result = profile_processor
-                                .process_with_context(&processed_text, recent_context.as_deref())
-                                .await;
-                            tracing::info!("Post-processed: changed: {}", result != processed_text);
-                            tracing::debug!("Post-processed result: {:?}", result);
-                            result
-                        } else {
-                            // Profile exists but has no post_process_command, use default
-                            if let Some(ref post_processor) = self.post_processor {
-                                tracing::info!(
-                                    "Post-processing, has_context: {}",
-                                    recent_context.is_some()
-                                );
-                                tracing::debug!(
-                                    "Post-processing input: {:?}, context: {:?}",
-                                    processed_text,
-                                    recent_context
-                                );
-                                let result = post_processor
-                                    .process_with_context(
-                                        &processed_text,
-                                        recent_context.as_deref(),
+                            tracing::debug!(
+                                "Post-processing input: {:?}, context: {:?}",
+                                processed_text,
+                                recent_context
+                            );
+                            let run = processor
+                                .process_with_context(&processed_text, recent_context.as_deref());
+                            match wait_for_post_process(run).await {
+                                PostProcessWait::Done(result) => {
+                                    tracing::info!(
+                                        "Post-processed: changed: {}",
+                                        result != processed_text
+                                    );
+                                    tracing::debug!("Post-processed result: {:?}", result);
+                                    result
+                                }
+                                PostProcessWait::Skipped => {
+                                    tracing::info!(
+                                        "Post-processing skipped, delivering the transcript as is"
+                                    );
+                                    processed_text
+                                }
+                                PostProcessWait::Cancelled => {
+                                    tracing::info!("Post-processing cancelled");
+                                    self.publish_empty_outcome();
+                                    self.play_feedback(SoundEvent::Cancelled);
+                                    self.reset_to_idle(state).await;
+                                    end_recording_notification(
+                                        "Cancelled",
+                                        "Transcription discarded",
+                                        &self.config.output.notification,
+                                        self.config.engine,
                                     )
                                     .await;
-                                tracing::info!(
-                                    "Post-processed: changed: {}",
-                                    result != processed_text
-                                );
-                                tracing::debug!("Post-processed result: {:?}", result);
-                                result
-                            } else {
-                                processed_text
+                                    return;
+                                }
                             }
                         }
-                    } else if let Some(ref post_processor) = self.post_processor {
-                        tracing::info!(
-                            "Post-processing, has_context: {}",
-                            recent_context.is_some()
-                        );
-                        tracing::debug!(
-                            "Post-processing input: {:?}, context: {:?}",
-                            processed_text,
-                            recent_context
-                        );
-                        let result = post_processor
-                            .process_with_context(&processed_text, recent_context.as_deref())
-                            .await;
-                        tracing::info!("Post-processed: changed: {}", result != processed_text);
-                        tracing::debug!("Post-processed result: {:?}", result);
-                        result
-                    } else {
-                        processed_text
                     };
 
                     // Track last dictation for context in subsequent post-processing
