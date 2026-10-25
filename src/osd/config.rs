@@ -324,6 +324,14 @@ pub struct OsdConfig {
     /// applied when `position` is `bottom-center` or `top-center` —
     /// corner anchors keep using `margin_px`.
     pub top_margin: f32,
+    /// Horizontal nudge in pixels, applied after `position` and
+    /// `margin_px` place the OSD: positive moves it right, negative left.
+    /// Honoured by the Quickshell frontend.
+    pub offset_x: i32,
+    /// Vertical nudge in pixels, applied after `position` and `margin_px`
+    /// place the OSD: positive moves it down, negative up. Honoured by the
+    /// Quickshell frontend.
+    pub offset_y: i32,
     /// Background opacity, 0.0..=1.0.
     pub opacity: f32,
     /// Visible waveform window in seconds (3.0 per BRIEF).
@@ -364,6 +372,8 @@ impl Default for OsdConfig {
             position: OsdPosition::BottomCenter,
             margin_px: 24,
             top_margin: 0.85,
+            offset_x: 0,
+            offset_y: 0,
             opacity: 0.95,
             waveform_window_secs: 3.0,
             peak_decay_db_per_sec: 6.0,
@@ -391,6 +401,7 @@ mod tests {
         assert_eq!(c.height_px, 48);
         assert_eq!(c.position, OsdPosition::BottomCenter);
         assert_eq!(c.margin_px, 24);
+        assert_eq!((c.offset_x, c.offset_y), (0, 0));
         assert!((c.opacity - 0.95).abs() < 1e-6);
         assert!((c.waveform_window_secs - 3.0).abs() < 1e-6);
         assert!((c.peak_decay_db_per_sec - 6.0).abs() < 1e-6);

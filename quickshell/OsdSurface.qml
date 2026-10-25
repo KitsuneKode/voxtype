@@ -160,6 +160,13 @@ PanelWindow {
         return Math.max(0, value);
     }
 
+    function _styleOffset(key) {
+        const value = style && style.config && style.config[key] !== undefined
+            ? Number(style.config[key])
+            : 0;
+        return isFinite(value) ? value : 0;
+    }
+
     function _styleTopMargin() {
         const value = style && style.config && style.config.top_margin !== undefined
             ? Number(style.config.top_margin)
@@ -231,7 +238,19 @@ PanelWindow {
         return VT.Theme.cornerRadius;
     }
 
+    // position/margin_px/top_margin anchor the card; offset_x/offset_y then
+    // nudge it (+x right, +y down), clamped so it stays on-screen.
     function _cardX() {
+        const room = panel.width - _cardWidth();
+        return Math.max(0, Math.min(room, _anchoredX() + _styleOffset("offset_x")));
+    }
+
+    function _cardY() {
+        const room = panel.height - _cardHeight();
+        return Math.max(0, Math.min(room, _anchoredY() + _styleOffset("offset_y")));
+    }
+
+    function _anchoredX() {
         const position = _stylePosition();
         const margin = _styleMarginPx();
         if (position.indexOf("left") >= 0) return margin;
@@ -239,7 +258,7 @@ PanelWindow {
         return Math.max(margin, (panel.width - _cardWidth()) / 2);
     }
 
-    function _cardY() {
+    function _anchoredY() {
         const position = _stylePosition();
         const margin = _styleMarginPx();
         if ((position === "top-left") || (position === "top-right")) return margin;

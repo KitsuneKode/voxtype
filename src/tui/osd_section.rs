@@ -38,6 +38,8 @@ pub struct OsdState {
     pub height_px: i64,
     pub margin_px: i64,
     pub top_margin: f64,
+    pub offset_x: i64,
+    pub offset_y: i64,
     pub opacity: f64,
     pub waveform_window_secs: f64,
     pub peak_decay_db_per_sec: f64,
@@ -72,6 +74,8 @@ pub enum Field {
     HeightPx,
     MarginPx,
     TopMargin,
+    OffsetX,
+    OffsetY,
     Opacity,
     WaveformWindowSecs,
     PeakDecayDbPerSec,
@@ -91,6 +95,8 @@ impl Field {
         Field::HeightPx,
         Field::MarginPx,
         Field::TopMargin,
+        Field::OffsetX,
+        Field::OffsetY,
         Field::Opacity,
         Field::WaveformWindowSecs,
         Field::PeakDecayDbPerSec,
@@ -121,6 +127,7 @@ const MARGIN_CHOICES: &[i64] = &[0, 8, 16, 24, 32, 48, 64];
 // Mirrors swayosd's `--top-margin` semantics. Default 0.85 matches the
 // position users already see for volume/brightness panels.
 const TOP_MARGIN_CHOICES: &[f64] = &[0.50, 0.60, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95];
+const OFFSET_CHOICES: &[i64] = &[-64, -32, -16, -8, 0, 8, 16, 32, 64];
 const OPACITY_CHOICES: &[f64] = &[0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95, 1.0];
 const WAVEFORM_SECS_CHOICES: &[f64] = &[1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0];
 const PEAK_DECAY_CHOICES: &[f64] = &[1.0, 2.0, 4.0, 6.0, 8.0, 12.0, 20.0];
@@ -152,6 +159,8 @@ impl OsdState {
             height_px: ed.get_int(TABLE, "height_px").unwrap_or(48),
             margin_px: ed.get_int(TABLE, "margin_px").unwrap_or(24),
             top_margin: ed.get_float(TABLE, "top_margin").unwrap_or(0.85),
+            offset_x: ed.get_int(TABLE, "offset_x").unwrap_or(0),
+            offset_y: ed.get_int(TABLE, "offset_y").unwrap_or(0),
             opacity: ed.get_float(TABLE, "opacity").unwrap_or(0.95),
             waveform_window_secs: ed.get_float(TABLE, "waveform_window_secs").unwrap_or(3.0),
             peak_decay_db_per_sec: ed.get_float(TABLE, "peak_decay_db_per_sec").unwrap_or(6.0),
@@ -191,6 +200,8 @@ impl OsdState {
         ed.set_int(TABLE, "height_px", self.height_px);
         ed.set_int(TABLE, "margin_px", self.margin_px);
         ed.set_float(TABLE, "top_margin", self.top_margin);
+        ed.set_int(TABLE, "offset_x", self.offset_x);
+        ed.set_int(TABLE, "offset_y", self.offset_y);
         ed.set_float(TABLE, "opacity", self.opacity);
         ed.set_float(TABLE, "waveform_window_secs", self.waveform_window_secs);
         ed.set_float(TABLE, "peak_decay_db_per_sec", self.peak_decay_db_per_sec);
@@ -251,6 +262,8 @@ impl OsdState {
             Field::TopMargin => {
                 self.top_margin = cycle_float(TOP_MARGIN_CHOICES, self.top_margin, delta)
             }
+            Field::OffsetX => self.offset_x = cycle_int(OFFSET_CHOICES, self.offset_x, delta),
+            Field::OffsetY => self.offset_y = cycle_int(OFFSET_CHOICES, self.offset_y, delta),
             Field::Opacity => self.opacity = cycle_float(OPACITY_CHOICES, self.opacity, delta),
             Field::WaveformWindowSecs => {
                 self.waveform_window_secs =
@@ -453,6 +466,16 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             state.field == Field::TopMargin,
             "Top margin (fraction)",
             format!("{:.2}", state.top_margin),
+        ),
+        FormRowSpec::new(
+            state.field == Field::OffsetX,
+            "Offset X (px)",
+            state.offset_x.to_string(),
+        ),
+        FormRowSpec::new(
+            state.field == Field::OffsetY,
+            "Offset Y (px)",
+            state.offset_y.to_string(),
         ),
         FormRowSpec::new(
             state.field == Field::Opacity,
@@ -678,6 +701,32 @@ fn guidance_for_field(state: &OsdState) -> Vec<Line<'_>> {
             Line::from(""),
             dim("Default: 0.85 (matches swayosd). 0.0 = top of screen, 1.0 = bottom."),
         ],
+        Field::OffsetX => vec![
+            heading("Offset X (px)"),
+            Line::from(""),
+            Line::from(
+                "Nudges the OSD sideways after Position and Margin place it: \
+                 positive moves it right, negative left. The OSD is kept \
+                 on-screen whatever the value.",
+            ),
+            Line::from(""),
+            Line::from("Applied by the Quickshell frontend."),
+            Line::from(""),
+            dim("Default: 0. Cycles through -64..64; any value works in config.toml."),
+        ],
+        Field::OffsetY => vec![
+            heading("Offset Y (px)"),
+            Line::from(""),
+            Line::from(
+                "Nudges the OSD vertically after Position and Margin place \
+                 it: positive moves it down, negative up. The OSD is kept \
+                 on-screen whatever the value.",
+            ),
+            Line::from(""),
+            Line::from("Applied by the Quickshell frontend."),
+            Line::from(""),
+            dim("Default: 0. Cycles through -64..64; any value works in config.toml."),
+        ],
         Field::Opacity => vec![
             heading("Opacity"),
             Line::from(""),
@@ -832,6 +881,8 @@ mod tests {
                 Field::HeightPx => "osd.height_px",
                 Field::MarginPx => "osd.margin_px",
                 Field::TopMargin => "osd.top_margin",
+                Field::OffsetX => "osd.offset_x",
+                Field::OffsetY => "osd.offset_y",
                 Field::Opacity => "osd.opacity",
                 Field::WaveformWindowSecs => "osd.waveform_window_secs",
                 Field::PeakDecayDbPerSec => "osd.peak_decay_db_per_sec",
@@ -876,6 +927,8 @@ mod tests {
             height_px: 48,
             margin_px: 24,
             top_margin: 0.85,
+            offset_x: 0,
+            offset_y: 0,
             opacity: 0.95,
             waveform_window_secs: 3.0,
             peak_decay_db_per_sec: 6.0,
@@ -926,6 +979,8 @@ mod tests {
             height_px: 48,
             margin_px: 24,
             top_margin: 0.85,
+            offset_x: 0,
+            offset_y: 0,
             opacity: 0.95,
             waveform_window_secs: 3.0,
             peak_decay_db_per_sec: 6.0,

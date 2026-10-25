@@ -28,6 +28,8 @@ QtObject {
             "position": "bottom-center",
             "margin_px": 24,
             "top_margin": 0.85,
+            "offset_x": 0,
+            "offset_y": 0,
             "package_dir": null,
             "asset_root": null,
             "custom_qml": null,

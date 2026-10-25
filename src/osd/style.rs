@@ -32,6 +32,8 @@ pub struct RuntimeOsdStyle {
     pub position: OsdPosition,
     pub margin_px: u32,
     pub top_margin: f32,
+    pub offset_x: i32,
+    pub offset_y: i32,
     pub package_dir: Option<PathBuf>,
     pub asset_root: Option<PathBuf>,
     pub custom_qml: Option<PathBuf>,
@@ -107,6 +109,8 @@ pub fn resolve_runtime_style(
         position: osd.position,
         margin_px: osd.margin_px,
         top_margin: osd.top_margin,
+        offset_x: osd.offset_x,
+        offset_y: osd.offset_y,
         package_dir,
         asset_root,
         custom_qml,
@@ -617,6 +621,19 @@ mod tests {
         assert_eq!(style.layout, OsdLayout::Orb);
         assert_eq!(style.frame.background, "none");
         assert_eq!(style.visual.layers.len(), 1);
+    }
+
+    #[test]
+    fn position_offsets_reach_the_runtime_json() {
+        let cfg = OsdConfig {
+            offset_x: -12,
+            offset_y: 30,
+            ..OsdConfig::default()
+        };
+        let style = resolve_runtime_style(&cfg, None).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&style_json(&style).unwrap()).unwrap();
+        assert_eq!(json["offset_x"], -12);
+        assert_eq!(json["offset_y"], 30);
     }
 
     #[test]
