@@ -1,6 +1,7 @@
 //! `voxtype record start|stop|toggle|cancel` — write override files for the
 //! daemon and send the appropriate signal. The override files (model,
-//! output_mode, profile, smart_auto_submit, auto_submit, shift_enter_newlines)
+//! output_mode, profile, smart_auto_submit, auto_submit, shift_enter_newlines,
+//! post_process)
 //! are intentionally separate sentinels under `runtime_dir/`; merging them
 //! would invent write-race surface that doesn't exist today (see
 //! `docs/REFACTORING.md`).
@@ -147,6 +148,40 @@ pub(crate) fn send_record_command(
         let override_file = config::Config::runtime_dir().join("shift_enter_override");
         std::fs::write(&override_file, if value { "true" } else { "false" })
             .map_err(|e| anyhow::anyhow!("Failed to write shift_enter override: {}", e))?;
+    }
+
+    // Write the post-processing override. A stop only means something while
+    // a recording or its transcription is in flight; written while idle, the
+    // sentinel would sit there and silently skip the next recording's
+    // post-processing.
+    let current_state = config
+        .resolve_state_file()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    if let Some(value) = action.post_process_override() {
+        let is_stop = matches!(action, RecordAction::Stop { .. });
+        if !is_stop
+            || matches!(
+                current_state.as_str(),
+                "recording" | "streaming" | "transcribing"
+            )
+        {
+            let override_file = config::Config::runtime_dir().join("post_process_override");
+            std::fs::write(&override_file, if value { "true" } else { "false" })
+                .map_err(|e| anyhow::anyhow!("Failed to write post_process override: {}", e))?;
+        }
+    }
+
+    // Past the recording, the daemon picks a skip request up from the
+    // sentinel while it waits on the post-process command. A stop signal
+    // would only queue behind that wait and land once the daemon is idle.
+    // --wait still goes through the signal path below, as before.
+    if matches!(action, RecordAction::Stop { wait: false, .. })
+        && action.post_process_override() == Some(false)
+        && current_state == "transcribing"
+    {
+        return Ok(());
     }
 
     // Write the OSD suppression sentinel if --no-osd was passed. Only written,

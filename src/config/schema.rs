@@ -1228,6 +1228,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Require an edit list",
         "Accept only a JSON list of exact, unambiguous edits from the post-process command.",
     ),
+    spec(
+        "output.post_process_enabled",
+        "output",
+        "post_process_enabled",
+        KeyType::Bool,
+        "Output",
+        "Post-processing",
+        "Run the post-process command (default or profile) on each transcription. Off outputs the transcription as is; `record start --post-process` still opts a single recording in.",
+    ),
     // -- Text ---------------------------------------------------------------
     spec(
         "text.lard_disfluency",
@@ -2840,6 +2849,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.shift_enter_newlines" => json!(cfg.output.shift_enter_newlines),
         "output.pre_type_delay_ms" => json!(cfg.output.pre_type_delay_ms),
         "output.append_text" => opt_str(cfg.output.append_text.as_ref()),
+        "output.post_process_enabled" => json!(cfg.output.post_process_enabled),
         "output.post_process.command" => match &cfg.output.post_process {
             Some(p) => json!(p.command),
             None => Json::Null,
