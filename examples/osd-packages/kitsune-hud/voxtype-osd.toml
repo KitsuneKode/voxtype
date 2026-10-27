@@ -1,0 +1,16 @@
+name = "kitsune-hud"
+version = "1.0.0"
+description = "Dictation HUD pill: state, live waveform, and bounded rolling transcript."
+compatibility = "voxtype quickshell style packages"
+layout = "custom"
+qml_entry = "KitsuneHud.qml"
+
+# Palette left unset on purpose: semantic roles (recording/streaming/
+# transcribing/accent/background/foreground/muted) resolve from the active
+# Omarchy theme when present, else the daemon's fallback palette.
+
+[frame]
+background = "none"
+border = "none"
+glow = false
+halo = false
