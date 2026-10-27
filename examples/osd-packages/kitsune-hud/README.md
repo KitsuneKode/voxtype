@@ -59,8 +59,10 @@ a blur rule, set `VOXTYPE_OSD_REDUCED_TRANSPARENCY=1` for the near-solid tint.
 
 ## Feedback
 
-- **Delivered:** when the daemon writes `output_done`, a tinted disc pops into
-  the meter's place (200ms, ~3% overshoot), the check draws itself over it as
+- **Delivered:** when the daemon writes `output_done`, the meter becomes the
+  badge: the bars slide into the centre, flatten and take the check's tone
+  (130ms), a tinted disc pops out of that point (200ms, ~3% overshoot) and the
+  check draws itself over it as
   one pen stroke (220ms ease-in-out by arc length: slow into the corner, a
   sweep up the long leg, easing onto the tip) and the pill's edge takes the
   same tone for a moment, then the pill closes. About 250ms in all: it plays
@@ -69,6 +71,11 @@ a blur rule, set `VOXTYPE_OSD_REDUCED_TRANSPARENCY=1` for the near-solid tint.
   `$XDG_RUNTIME_DIR/voxtype/pp_result` as `<epoch ms> passthrough`, the check
   is amber and the pill reads "Cleanup failed · typed as heard". Without that
   file the pill shows the normal check.
+- **Cancelled:** a cancel helper that writes `$XDG_RUNTIME_DIR/voxtype/cancelled`
+  (epoch ms) before `voxtype record cancel` makes the pill fold the transcript
+  away, lay the bars flat and read "Cancelled" for 450ms. If it writes
+  `cancel_armed` first (e.g. a double-tap Escape whose first press only arms),
+  the pill shows "Esc again to cancel" for 600ms.
 - **No mic input:** two seconds of digital silence (a muted mic or the wrong
   source) replace "Listening" with a warning.
 

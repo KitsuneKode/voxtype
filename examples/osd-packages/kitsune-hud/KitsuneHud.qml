@@ -97,6 +97,41 @@ Item {
     property double ppResultAt: 0
     property string ppVia: ""
     readonly property int rawHoldMs: 1400
+    // Cancelled (Escape / SUPER+SHIFT+D via voxtype-cancel.sh, which writes
+    // `cancelled`): the transcript folds away, the bars lie flat and the
+    // pill says so briefly, instead of vanishing like an empty session.
+    property bool wasCancelled: false
+    property double cancelledAt: 0
+    readonly property int cancelHoldMs: 450
+    // First Escape arms cancel for 600ms (voxtype-cancel.sh writes
+    // `cancel_armed`); the pill says how to finish it.
+    property bool cancelArmed: false
+    FileView {
+        path: root._runtimeDir.length > 0 ? root._runtimeDir + "/voxtype/cancel_armed" : ""
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            const ms = Number((text() || "").trim());
+            if (ms > 0 && root.active && ms >= root.localStart - 100 && Date.now() - ms < 600) {
+                root.cancelArmed = true;
+                armedTimer.interval = Math.max(1, 600 - (Date.now() - ms));
+                armedTimer.restart();
+            }
+        }
+    }
+    Timer { id: armedTimer; onTriggered: root.cancelArmed = false }
+
+    FileView {
+        path: root._runtimeDir.length > 0 ? root._runtimeDir + "/voxtype/cancelled" : ""
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            const ms = Number((text() || "").trim());
+            if (ms > 0) root.cancelledAt = ms;
+        }
+    }
 
     FileView {
         path: root._runtimeDir.length > 0 ? root._runtimeDir + "/voxtype/pp_result" : ""
@@ -285,6 +320,9 @@ Item {
             exitSeq.stop();
             confirmed = false;
             deliveredRaw = false;
+            wasCancelled = false;
+            cancelArmed = false;
+            badge.gather = 0; badge.pop = 0; badge.draw = 0;
             lingering = false;
             liveText = "";
             shownText = "";
@@ -305,6 +343,7 @@ Item {
         lingering = false;
         confirmed = false;
         deliveredRaw = false;
+        wasCancelled = false;
         liveText = "";
         shownText = "";
         level = 0;
@@ -321,7 +360,10 @@ Item {
             // Before `confirmed`: the check paints its colour as it starts drawing.
             root.deliveredRaw = delivered && root.ppVia === "passthrough"
                 && root.ppResultAt >= root.localStart - 100;
+            root.wasCancelled = !delivered && root.cancelledAt >= root.localStart - 100;
+            root.cancelArmed = false;
             root.confirmed = delivered;
+            if (root.wasCancelled) root.shownText = "";
             // The warning replaces the transcript, so the pill folds to the
             // label while it holds.
             if (root.deliveredRaw) root.shownText = "";
@@ -335,7 +377,7 @@ Item {
     // Reduced motion: fade only.
     SequentialAnimation {
         id: exitSeq
-        PauseAnimation { duration: root.deliveredRaw ? root.rawHoldMs : root.confirmed ? root.confirmHoldMs : 0 }
+        PauseAnimation { duration: root.deliveredRaw ? root.rawHoldMs : root.confirmed ? root.confirmHoldMs : root.wasCancelled ? root.cancelHoldMs : 0 }
         ScriptAction { script: card.settled = false }
         ParallelAnimation {
             NumberAnimation { target: card; property: "morph"; to: root.reducedMotion ? 1.0 : 0.0; duration: root.reducedMotion ? 0 : 240; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeInOut }
@@ -441,6 +483,7 @@ Item {
     }
 
     function _highlighted(i) {
+        if (wasCancelled) return false;
         const n = barCount;
         switch (meterMode) {
         case "speaking":
@@ -462,6 +505,7 @@ Item {
 
     function _barHeight(i) {
         const maxH = 16, minH = 3;
+        if (wasCancelled) return minH;
         if (meterMode === "thinking") return _highlighted(i) && !reducedMotion ? 8 : minH;
         if (meterMode === "connecting") return minH;
         const d = Math.abs(i - centerBar);
@@ -696,22 +740,27 @@ Item {
             anchors.leftMargin: root.padX
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2.5
-            opacity: root.confirmed ? 0.0 : 1.0
-            Behavior on opacity { NumberAnimation { duration: 120; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
+            // Delivered: the bars converge into the badge (see badge.gather),
+            // fading only as they arrive at the centre.
+            opacity: root.confirmed ? Math.max(0, Math.min(1, (1 - badge.gather) / 0.35)) : 1.0
 
             Repeater {
                 model: root.barCount
                 delegate: Rectangle {
                     required property int index
                     width: 3
-                    height: root._barHeight(index)
+                    height: root.confirmed ? root._barHeight(index) + (3 - root._barHeight(index)) * badge.gather
+                                           : root._barHeight(index)
+                    // Slide toward the centre bar (one bar pitch = 3 + 2.5).
+                    transform: Translate { x: root.confirmed ? (root.centerBar - index) * 5.5 * badge.gather : 0 }
                     radius: 1.5
                     anchors.verticalCenter: parent.verticalCenter
                     // Unlit bars are neutral, so "speaking" (all lit) reads
                     // clearly against the single blinking bar of "listening".
                     // The 160ms colour fade gives the thinking scan a short tail.
-                    color: root._highlighted(index) ? root.shownAccent : Qt.alpha(root.fg, 0.22)
-                    Behavior on height { NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
+                    color: root.confirmed ? badge.tone
+                         : root._highlighted(index) ? root.shownAccent : Qt.alpha(root.fg, 0.22)
+                    Behavior on height { enabled: !root.confirmed; NumberAnimation { duration: 90; easing.type: Easing.OutCubic } }
                     Behavior on color  { ColorAnimation  { duration: 160; easing.type: Easing.InOutQuad } }
                 }
             }
@@ -719,9 +768,14 @@ Item {
 
         // -- delivered badge ------------------------------------------
         // Plays once per dictation (tens a day) as feedback that the text
-        // landed, so it stays fast and quiet: done in ~250ms, then held.
-        //  - Pop in: a tinted disc scales 0.6 -> 1 with a small overshoot
-        //    (OutBack 1.2, ~3% past) over 200ms while the bars fade out.
+        // landed, so it stays fast and quiet: done in ~320ms, then held.
+        //  - Gather (continuity): the meter becomes the badge. The bars
+        //    slide into the centre, flatten to dots and take the badge's
+        //    tone (130ms, strong ease-in-out: on-screen movement), fading
+        //    only as they converge, so one object changes meaning instead
+        //    of one fading out while another pops in.
+        //  - Pop in: from that point a tinted disc scales 0.6 -> 1 with a
+        //    small overshoot (OutBack 1.2, ~3% past) over 200ms.
         //  - Line drawing: the tick is one continuous stroke drawn by
         //    arc length, so the pen slows into the corner and through the
         //    short leg, then sweeps the long leg and eases onto the tip
@@ -738,12 +792,13 @@ Item {
             anchors.centerIn: meter
             visible: root.confirmed
             readonly property color tone: root.deliveredRaw ? root.warnColor : root.checkColor
+            property real gather: 0
             property real pop: 0
             property real draw: 0
             function play() {
                 badgeIn.stop();
-                if (root.reducedMotion) { pop = 1; draw = 1; return; }
-                pop = 0; draw = 0;
+                if (root.reducedMotion) { gather = 1; pop = 1; draw = 1; return; }
+                gather = 0; pop = 0; draw = 0;
                 badgeIn.start();
             }
             Rectangle {
@@ -784,9 +839,13 @@ Item {
             }
             ParallelAnimation {
                 id: badgeIn
-                NumberAnimation { target: badge; property: "pop"; to: 1; duration: 200; easing.type: Easing.OutBack; easing.overshoot: 1.2 }
+                NumberAnimation { target: badge; property: "gather"; to: 1; duration: 130; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeInOut }
                 SequentialAnimation {
-                    PauseAnimation { duration: 50 }
+                    PauseAnimation { duration: 90 }
+                    NumberAnimation { target: badge; property: "pop"; to: 1; duration: 200; easing.type: Easing.OutBack; easing.overshoot: 1.2 }
+                }
+                SequentialAnimation {
+                    PauseAnimation { duration: 130 }
                     NumberAnimation { target: badge; property: "draw"; to: 1; duration: 220; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeInOut }
                 }
                 SequentialAnimation {
@@ -823,12 +882,13 @@ Item {
                 // content so it doesn't ride up when content grows to 2 lines.
                 anchors.verticalCenter: parent.verticalCenter
                 visible: opacity > 0
-                opacity: root.hasText ? 0 : 0.78
                 Behavior on opacity { NumberAnimation { duration: 120; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
                 // A muted mic or wrong source sends pure digital silence; say
                 // so instead of "Listening" to nothing for the whole take.
                 readonly property bool warn: (root.micDead && root.listening) || root.deliveredRaw
-                text: root.deliveredRaw ? "Cleanup failed · typed as heard"
+                text: root.wasCancelled ? "Cancelled"
+                    : root.cancelArmed ? "Esc again to cancel"
+                    : root.deliveredRaw ? "Cleanup failed · typed as heard"
                     : root.micDead && root.listening ? "No mic input"
                     : root.shownLabel
                 font.family: root.uiFont
@@ -837,6 +897,8 @@ Item {
                 font.letterSpacing: 0.2
                 renderType: Text.NativeRendering
                 color: warn ? root.warnColor : root.fg
+                // The hint shows over a transcript too (it hides for 600ms).
+                opacity: root.cancelArmed ? 0.78 : root.hasText ? 0 : (root.wasCancelled ? 0.55 : 0.78)
             }
 
             Text {
@@ -934,7 +996,7 @@ Item {
                 font.letterSpacing: 0.15
                 renderType: Text.NativeRendering
                 color: root.fg
-                opacity: !root.hasText ? 0 : (root.polishing && !shimmer.on ? 0.72 : 1.0)
+                opacity: !root.hasText || root.cancelArmed ? 0 : (root.polishing && !shimmer.on ? 0.72 : 1.0)
                 // The viewport clips the text to the opening pill, so it can
                 // fade in with the morph instead of waiting for it.
                 Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
