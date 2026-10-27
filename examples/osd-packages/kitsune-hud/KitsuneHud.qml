@@ -600,6 +600,22 @@ Item {
 
     // ------------------------------------------------------------------
     // Card
+    // Raised material, after the agency site's raised buttons (impact-
+    // coaching-center app/globals.css "Raised buttons"): a crisp contact
+    // shadow right under the edge (their tightest stacked shadow,
+    // 0 0.5px 0.5px), the card's own soft shadow for the wider stack, a dark
+    // ring drawing the edge, a light lip and glow from the top, and a faint
+    // shade inside the bottom.
+    Rectangle {
+        x: card.x
+        y: card.y + 1
+        width: card.width
+        height: card.height
+        radius: card.radius
+        color: Qt.alpha("#000000", 0.32)
+        opacity: card.opacity
+        visible: card.visible && card.opacity > 0
+    }
     Rectangle {
         id: card
 
@@ -675,7 +691,9 @@ Item {
         border.width: 1
         // Briefly tinted by the delivered badge (flash 0..1), else a hairline.
         property real flash: 0
-        border.color: Qt.tint(Qt.alpha("#ffffff", root.reducedTransparency ? 0.08 : 0.11), Qt.alpha(badge.tone, 0.4 * flash))
+        // The ring is darker than the fill and draws the edge on light
+        // backgrounds; the inner hairline below keeps it on dark ones.
+        border.color: Qt.tint(Qt.alpha("#000000", 0.55), Qt.alpha(badge.tone, 0.5 * flash))
 
         // Soft contact shadow so the pill floats over content.
         layer.enabled: true
@@ -721,12 +739,24 @@ Item {
             anchors.margins: 1
             radius: Math.max(0, card.radius - 1)
             visible: !root.reducedTransparency
+            // lip (first pixel), glow falling from the top, clear middle,
+            // shade inside the bottom edge
             gradient: Gradient {
-                GradientStop { position: 0.0;  color: Qt.alpha("#ffffff", 0.16) }
-                GradientStop { position: 0.06; color: Qt.alpha("#ffffff", 0.07) }
-                GradientStop { position: 0.5;  color: Qt.alpha("#ffffff", 0.02) }
-                GradientStop { position: 1.0;  color: Qt.alpha("#ffffff", 0.0) }
+                GradientStop { position: 0.0;  color: Qt.alpha("#ffffff", 0.20) }
+                GradientStop { position: 0.04; color: Qt.alpha("#ffffff", 0.10) }
+                GradientStop { position: 0.4;  color: Qt.alpha("#ffffff", 0.03) }
+                GradientStop { position: 0.7;  color: Qt.alpha("#ffffff", 0.0) }
+                GradientStop { position: 1.0;  color: Qt.alpha("#000000", 0.12) }
             }
+        }
+        // Inner hairline: the light half of the edge, inside the dark ring.
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: Math.max(0, card.radius - 1)
+            color: "transparent"
+            border.width: 1
+            border.color: Qt.alpha("#ffffff", 0.07)
         }
 
         // Everything inside the pill fades with the open/close morph. While
