@@ -1153,6 +1153,11 @@ pub struct Daemon {
     /// saw (see `stop_streaming_capture`). Dropped on every stop, cancel and
     /// shutdown path so the backend still sees end-of-stream.
     streaming_feed: Option<StreamingFeed>,
+    /// The whole recording of a drained streaming stop, kept for the
+    /// `[parakeet] streaming_final_pass` offline decode in `end_streaming`.
+    /// Set only when that option is on; taken by `end_streaming` and
+    /// dropped by every cut, so it never outlives its session.
+    streaming_final_audio: Option<Vec<f32>>,
     /// OSD child supervisor task. Holds the JoinHandle so dropping it (on
     /// daemon shutdown) kill_on_drop's the spawned voxtype-osd process.
     osd_supervisor_task: Option<tokio::task::JoinHandle<()>>,
@@ -1312,6 +1317,7 @@ impl Daemon {
             streaming_drain_pump: None,
             streaming_preview: None,
             streaming_feed: None,
+            streaming_final_audio: None,
             osd_supervisor_task: None,
             model_manager: None,
             model_load_task: None,
@@ -1895,6 +1901,7 @@ impl Daemon {
             handle.abort();
         }
         self.streaming_feed = None;
+        self.streaming_final_audio = None;
     }
 
     /// Abort the OSD draining pump (if running) so the visualizer can
@@ -1954,6 +1961,54 @@ impl Daemon {
             // A closed channel just means the backend already ended.
             let _ = feed.tx.send(tail).await;
         }
+        if drain && self.final_pass_enabled() {
+            self.streaming_final_audio = Some(captured);
+        }
+    }
+
+    fn final_pass_enabled(&self) -> bool {
+        self.config
+            .parakeet
+            .as_ref()
+            .is_some_and(|p| p.streaming_final_pass)
+    }
+
+    /// `[parakeet] streaming_final_pass`: decode the whole recording in one
+    /// offline pass with the same model the stream used. The stream decided
+    /// each word from at most a few seconds of left context and a fraction
+    /// of a second of lookahead; this pass sees the full recording around
+    /// every word. Returns `None` (keep the streamed text) when the option
+    /// is off, the recording is over the length limit, or the pass fails or
+    /// comes back empty.
+    async fn final_pass(&self, audio: Vec<f32>) -> Option<String> {
+        let max_secs = self.config.parakeet.as_ref()?.streaming_final_pass_max_secs;
+        let secs = audio.len() as f32 / self.config.audio.sample_rate as f32;
+        if audio.is_empty() || secs > max_secs {
+            tracing::debug!("Final pass skipped for {:.1}s recording", secs);
+            return None;
+        }
+        let transcriber = self.transcriber_preloaded.clone()?;
+        let started = std::time::Instant::now();
+        let result = tokio::task::spawn_blocking(move || transcriber.transcribe(&audio)).await;
+        match result {
+            Ok(Ok(text)) if !text.trim().is_empty() => {
+                tracing::info!(
+                    "Final pass decoded {:.1}s in {}ms",
+                    secs,
+                    started.elapsed().as_millis()
+                );
+                Some(text.trim().to_string())
+            }
+            Ok(Ok(_)) => None,
+            Ok(Err(e)) => {
+                tracing::warn!("Final pass failed, keeping streamed text: {}", e);
+                None
+            }
+            Err(e) => {
+                tracing::warn!("Final pass task failed, keeping streamed text: {}", e);
+                None
+            }
+        }
     }
 
     async fn end_streaming(
@@ -1969,6 +2024,7 @@ impl Daemon {
         }
         self.restore_recording_media();
         self.streaming_feed = None;
+        let final_audio = self.streaming_final_audio.take();
         if let Some(h) = streaming_handle.take() {
             // Don't error on join failure; the task may have already
             // completed. We drop events implicitly here.
@@ -2025,6 +2081,10 @@ impl Daemon {
             // the stop and re-expand when the text came back.
             *state = State::Transcribing { audio: Vec::new() };
             self.update_state("transcribing");
+            let text = match final_audio {
+                Some(audio) => self.final_pass(audio).await.unwrap_or(text),
+                None => text,
+            };
             self.handle_transcription_result(state, Ok(Ok(text))).await;
             if let Some(mut p) = preview {
                 p.clear();

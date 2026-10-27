@@ -56,6 +56,24 @@ pub struct ParakeetConfig {
     /// `UnifiedStreamingConfig::right_context_secs`.
     #[serde(default = "default_streaming_right_context_secs")]
     pub streaming_right_context_secs: f32,
+
+    /// After a streaming session that types nothing until stop
+    /// (`[output] streaming_commit = "on_stop"`), decode the whole recording
+    /// again in one offline pass with the same model and deliver that
+    /// instead of the streamed text. The offline pass sees the full
+    /// recording on both sides of every word, so it is more accurate than
+    /// the chunked stream, and it costs no extra VRAM. The live preview is
+    /// unchanged. Falls back to the streamed text if the pass fails or the
+    /// recording is longer than `streaming_final_pass_max_secs`.
+    /// Default: false.
+    #[serde(default)]
+    pub streaming_final_pass: bool,
+
+    /// Longest recording, in seconds, that gets the offline final pass.
+    /// The encoder attends over the whole recording at once, so memory
+    /// grows with length; longer sessions keep the streamed text.
+    #[serde(default = "default_streaming_final_pass_max_secs")]
+    pub streaming_final_pass_max_secs: f32,
 }
 
 // parakeet-rs validates that each context length maps to a mel-frame count
@@ -73,6 +91,10 @@ fn default_streaming_right_context_secs() -> f32 {
     0.32
 }
 
+fn default_streaming_final_pass_max_secs() -> f32 {
+    180.0
+}
+
 impl Default for ParakeetConfig {
     fn default() -> Self {
         Self {
@@ -83,6 +105,8 @@ impl Default for ParakeetConfig {
             streaming_chunk_secs: default_streaming_chunk_secs(),
             streaming_left_context_secs: default_streaming_left_context_secs(),
             streaming_right_context_secs: default_streaming_right_context_secs(),
+            streaming_final_pass: false,
+            streaming_final_pass_max_secs: default_streaming_final_pass_max_secs(),
         }
     }
 }

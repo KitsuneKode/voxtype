@@ -1904,6 +1904,28 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     .for_engine("parakeet")
     .gated("parakeet"),
     spec(
+        "parakeet.streaming_final_pass",
+        "parakeet",
+        "streaming_final_pass",
+        KeyType::Bool,
+        "Advanced",
+        "Offline final pass",
+        "With streaming_commit = \"on_stop\", re-decode the whole recording at stop for a more accurate transcript.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.streaming_final_pass_max_secs",
+        "parakeet",
+        "streaming_final_pass_max_secs",
+        KeyType::Float { min: 1.0, max: 3600.0 },
+        "Advanced",
+        "Final pass length limit",
+        "Recordings longer than this keep the streamed transcript.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
         "streaming.interval_secs",
         "streaming",
         "interval_secs",
@@ -2729,6 +2751,8 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.streaming_chunk_secs" => json!(pk().streaming_chunk_secs),
         "parakeet.streaming_left_context_secs" => json!(pk().streaming_left_context_secs),
         "parakeet.streaming_right_context_secs" => json!(pk().streaming_right_context_secs),
+        "parakeet.streaming_final_pass" => json!(pk().streaming_final_pass),
+        "parakeet.streaming_final_pass_max_secs" => json!(pk().streaming_final_pass_max_secs),
         "streaming.interval_secs" => json!(cfg.streaming.unwrap_or_default().interval_secs),
         "streaming.max_buffer_secs" => json!(cfg.streaming.unwrap_or_default().max_buffer_secs),
         "streaming.min_speech_rms" => json!(cfg.streaming.unwrap_or_default().min_speech_rms),
