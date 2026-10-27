@@ -28,10 +28,23 @@ linear amplitude: speech into a desk mic peaks around -30 to -12 dBFS
 smoothed level crossing about -38 dBFS, held 450ms between words. Tune
 `floorDb`, `ceilDb` and `speechLevel` in `KitsuneHud.qml` for your mic.
 
+## Motion
+
+- **Open / close:** the pill grows out of a 12px dot at its centre (280ms
+  strong ease-out, no overshoot: it opens from a hotkey many times a day) and
+  shrinks back into it on exit (240ms), the contents fading over the last part
+  of the open and the first part of the close.
+- **Polishing shimmer:** while post-processing runs, the transcript (or the
+  "Polishing" label) rests dimmed and a soft band of full-strength text sweeps
+  across it, after ElevenLabs' Shimmering Text. Drawn from a live texture of
+  the text, so the caption layout is shimmered as-is.
+- `VOXTYPE_OSD_REDUCED_MOTION=1` keeps opacity and colour changes only.
+
 ## Feedback
 
-- **Delivered:** when the daemon writes `output_done`, a check draws itself in
-  the meter's place before the pill leaves.
+- **Delivered:** when the daemon writes `output_done`, a tinted disc pops into
+  the meter's place, the check draws itself over it, a halo ring spreads once
+  and the pill's edge flashes the same tone, then the pill closes.
 - **Delivered raw:** if a post-process command writes
   `$XDG_RUNTIME_DIR/voxtype/pp_result` as `<epoch ms> passthrough`, the check
   is amber and the pill reads "Cleanup failed · typed as heard". Without that

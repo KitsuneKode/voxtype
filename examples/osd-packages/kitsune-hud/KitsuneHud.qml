@@ -66,7 +66,11 @@ Item {
     property string shownText: ""
     // Change handlers test vstate directly: a sibling binding such as
     // `active` can still hold its old value while this handler runs.
-    onLiveTextChanged: if (_isActive(vstate)) shownText = liveText
+    // While polishing, live_text is only ever replaced, never legitimately
+    // emptied: an empty write there is the end-of-session clear, which can
+    // land before the idle state does (separate file watches), and taking
+    // it folded the pill back to "Polishing" under the delivered check.
+    onLiveTextChanged: if (_isActive(vstate) && (liveText !== "" || vstate !== "transcribing")) shownText = liveText
 
     // ------------------------------------------------------------------
     // Exit and delivery confirmation
@@ -79,7 +83,7 @@ Item {
     property bool lingering: false
     property bool confirmed: false
     property double outputDoneAt: 0
-    readonly property int confirmHoldMs: 350
+    readonly property int confirmHoldMs: 600
     // Delivered, but as heard: every cleanup provider failed and
     // voxtype-postprocess.sh fell through to the raw transcript. The check
     // turns amber and the pill says so, held long enough to read, instead of
@@ -320,17 +324,24 @@ Item {
         }
     }
 
-    // Hold briefly on a confirmation, then leave the way it entered (fade +
-    // slight scale toward the anchor edge), shorter than the entrance.
+    // Hold briefly on a confirmation, then leave the way it entered: the
+    // contents fade, the pill shrinks back into the dot it grew from, and the
+    // dot fades in the last frames. Shorter than the entrance (240 vs 280ms).
+    // Reduced motion: fade only.
     SequentialAnimation {
         id: exitSeq
         PauseAnimation { duration: root.deliveredRaw ? root.rawHoldMs : root.confirmed ? root.confirmHoldMs : 0 }
+        ScriptAction { script: card.settled = false }
         ParallelAnimation {
-            NumberAnimation { target: card; property: "opacity"; to: 0.0; duration: 150; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
-            NumberAnimation { target: card; property: "scale"; to: root.reducedMotion ? 1.0 : 0.97; duration: 150; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+            NumberAnimation { target: card; property: "morph"; to: root.reducedMotion ? 1.0 : 0.0; duration: root.reducedMotion ? 0 : 240; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeInOut }
+            SequentialAnimation {
+                PauseAnimation { duration: root.reducedMotion ? 0 : 150 }
+                NumberAnimation { target: card; property: "opacity"; to: 0.0; duration: root.reducedMotion ? 150 : 90; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+            }
         }
         ScriptAction { script: root._finishExit() }
     }
+    onConfirmedChanged: if (confirmed) badge.play()
     // The OSD process is often spawned with daemonState already "recording",
     // so the change handler alone would miss the first session's edge.
     Component.onCompleted: _applyState(daemonState)
@@ -366,8 +377,10 @@ Item {
     property bool micDead: false         // nothing but digital silence: muted or wrong source
     property int tick: 0                 // step of the highlight sequence
     readonly property bool feeding: audio !== null && audio.running
+    // `lingering`: the exit keeps the scan; without it the idle edge read
+    // as "speaking" for a frame and the bars flared to full height.
     readonly property string meterMode:
-        polishing ? "thinking"
+        (polishing || lingering) ? "thinking"
       : !feeding  ? "connecting"
       : speaking  ? "speaking"
       :             "listening"
@@ -418,7 +431,7 @@ Item {
                 : root.meterMode === "thinking"   ? 90
                 :                                   500
         repeat: true
-        running: root.active && !root.reducedMotion && root.meterMode !== "speaking"
+        running: (root.active || root.lingering) && !root.reducedMotion && root.meterMode !== "speaking"
         onTriggered: root.tick++
     }
 
@@ -579,10 +592,20 @@ Item {
         onTextWChanged: if (root.hasText && textW > peakTextW) peakTextW = textW
         readonly property real minTextW: 0.6 * textMaxW
         readonly property real holdTextW: Math.min(textMaxW, Math.max(textW, peakTextW, minTextW))
-        width: Math.min(root.maxCardWidth,
+        readonly property real fullW: Math.min(root.maxCardWidth,
                         chrome + (root.hasText ? holdTextW : status.implicitWidth))
-        height: Math.max(34, (root.hasText ? viewH : status.implicitHeight) + 18)
+        readonly property real fullH: Math.max(34, (root.hasText ? viewH : status.implicitHeight) + 18)
+        // Open/close morph, Dynamic Island style: 0 is a 12px dot at the
+        // pill's centre, 1 the full pill. The contents only fade in over the
+        // last 40% so they never ride on a half-grown pill (and the clip below
+        // hides whatever does not fit yet).
+        property real morph: 0
+        readonly property real dot: 12
+        readonly property real reveal: Math.max(0, Math.min(1, (morph - 0.6) / 0.4))
+        width: dot + (fullW - dot) * morph
+        height: dot + (fullH - dot) * morph
         radius: Math.min(height / 2, 18)
+        clip: true
         // Whole pixels: fractional centring made edges shimmer between frames.
         x: Math.round(root._cardX(width))
         y: Math.round(root._cardY(height) + dropOffset)
@@ -590,7 +613,9 @@ Item {
 
         color: Qt.alpha(root._color("background", "#111114"), 0.95)
         border.width: 1
-        border.color: Qt.alpha(root.fg, 0.08)
+        // Briefly tinted by the delivered badge (flash 0..1), else a hairline.
+        property real flash: 0
+        border.color: Qt.tint(Qt.alpha(root.fg, 0.08), Qt.alpha(badge.tone, 0.5 * flash))
 
         // Soft contact shadow so the pill floats over content.
         layer.enabled: true
@@ -615,18 +640,30 @@ Item {
         Behavior on width  { enabled: card.settled && !root.reducedMotion; NumberAnimation { duration: 200; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
         Behavior on height { enabled: card.settled && !root.reducedMotion; NumberAnimation { duration: 220; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
 
-        // Entrance: 8px rise + scale-in from 0.96 (never from nothing), 180ms
-        // strong ease-out, no overshoot — it's hotkey-triggered and frequent.
-        transformOrigin: root.atTop ? Item.Top : Item.Bottom
-        scale: 1.0
+        // Entrance: grows out of a dot (never from nothing: the dot is
+        // visible from the first frame), 280ms strong ease-out, no overshoot,
+        // since it's hotkey-triggered tens of times a day. No `from`, so a
+        // session that starts mid-exit grows from wherever the shrink was.
         ParallelAnimation {
             id: entrance
             onStarted: card.settled = false
             onFinished: card.settled = true
-            NumberAnimation { target: card; property: "dropOffset"; from: root.reducedMotion ? 0 : (root.atTop ? -8 : 8); to: 0; duration: 180; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
-            NumberAnimation { target: card; property: "scale";      from: root.reducedMotion ? 1.0 : 0.96; to: 1.0; duration: 180; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
-            NumberAnimation { target: card; property: "opacity";    from: 0.0; to: 1.0; duration: 120; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+            NumberAnimation { target: card; property: "morph";   to: 1.0; duration: root.reducedMotion ? 0 : 280; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+            NumberAnimation { target: card; property: "opacity"; to: 1.0; duration: 100; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
         }
+
+        // Everything inside the pill fades with the open/close morph. While
+        // the pill opens or closes the contents keep their full-size layout,
+        // centred, and the pill's clip reveals them (squeezing them with the
+        // width ran the label into the clock). Once settled they follow the
+        // pill's animated size, so streaming growth still reveals new words
+        // at the moving edge.
+        Item {
+        id: inner
+        anchors.centerIn: parent
+        width: card.settled ? card.width : card.fullW
+        height: card.settled ? card.height : card.fullH
+        opacity: root.reducedMotion ? 1 : card.reveal
 
         // -- meter ------------------------------------------------------
         Row {
@@ -636,7 +673,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             spacing: 2.5
             opacity: root.confirmed ? 0.0 : 1.0
-            Behavior on opacity { NumberAnimation { duration: 160; easing.type: Easing.InOutQuad } }
+            Behavior on opacity { NumberAnimation { duration: 120; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
 
             Repeater {
                 model: root.barCount
@@ -656,41 +693,89 @@ Item {
             }
         }
 
-        // -- delivered check ------------------------------------------
-        // Drawn in the meter's slot (same place, new meaning), stroke by
-        // stroke over 200ms. Reduced motion: appears without the draw.
-        Canvas {
-            id: check
-            width: 14
-            height: 14
+        // -- delivered badge ------------------------------------------
+        // In the meter's slot (same place, new meaning): a tinted disc pops
+        // in with a small overshoot, the tick draws itself over it, one halo
+        // ring spreads and fades, and the pill's edge flashes the same tone.
+        // The only motion with overshoot: it's the reward moment, and it
+        // plays once per dictation, after the user has stopped acting.
+        // Amber instead of green when the text went in uncleaned.
+        // Reduced motion: disc and tick appear without movement.
+        Item {
+            id: badge
+            width: 18
+            height: 18
             anchors.centerIn: meter
-            property real progress: root.confirmed ? 1.0 : 0.0
-            Behavior on progress {
-                enabled: root.confirmed && !root.reducedMotion
-                NumberAnimation { duration: 200; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+            visible: root.confirmed
+            readonly property color tone: root.deliveredRaw ? root.warnColor : root.checkColor
+            property real pop: 0
+            property real draw: 0
+            property real ring: 0
+            function play() {
+                badgeIn.stop();
+                if (root.reducedMotion) { pop = 1; draw = 1; ring = 0; return; }
+                pop = 0; draw = 0; ring = 0;
+                badgeIn.start();
             }
-            visible: progress > 0
-            onProgressChanged: requestPaint()
-            onPaint: {
-                const ctx = getContext("2d");
-                ctx.reset();
-                const pts = [[2.0, 7.6], [5.6, 11.0], [12.0, 3.6]];
-                const seg = [Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]),
-                             Math.hypot(pts[2][0] - pts[1][0], pts[2][1] - pts[1][1])];
-                let left = (seg[0] + seg[1]) * progress;
-                ctx.lineWidth = 2;
-                ctx.lineCap = "round";
-                ctx.lineJoin = "round";
-                ctx.strokeStyle = root.deliveredRaw ? root.warnColor : root.checkColor;
-                ctx.beginPath();
-                ctx.moveTo(pts[0][0], pts[0][1]);
-                for (let i = 0; i < 2 && left > 0; i++) {
-                    const t = Math.min(1, left / seg[i]);
-                    ctx.lineTo(pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t,
-                               pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t);
-                    left -= seg[i];
+            Rectangle {
+                anchors.centerIn: parent
+                width: parent.width; height: width; radius: width / 2
+                color: "transparent"
+                border.width: 1.5
+                border.color: badge.tone
+                scale: 1 + 0.75 * badge.ring
+                opacity: badge.ring > 0 ? 0.6 * (1 - badge.ring) : 0
+            }
+            Rectangle {
+                anchors.centerIn: parent
+                width: parent.width; height: width; radius: width / 2
+                color: Qt.alpha(badge.tone, 0.2)
+                scale: 0.4 + 0.6 * badge.pop
+                opacity: Math.min(1, badge.pop * 2)
+            }
+            Canvas {
+                id: check
+                anchors.fill: parent
+                property real progress: badge.draw
+                visible: progress > 0
+                onProgressChanged: requestPaint()
+                onPaint: {
+                    const ctx = getContext("2d");
+                    ctx.reset();
+                    const pts = [[5.4, 9.4], [8.0, 11.9], [12.8, 6.3]];
+                    const seg = [Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]),
+                                 Math.hypot(pts[2][0] - pts[1][0], pts[2][1] - pts[1][1])];
+                    let left = (seg[0] + seg[1]) * progress;
+                    ctx.lineWidth = 1.9;
+                    ctx.lineCap = "round";
+                    ctx.lineJoin = "round";
+                    ctx.strokeStyle = badge.tone;
+                    ctx.beginPath();
+                    ctx.moveTo(pts[0][0], pts[0][1]);
+                    for (let i = 0; i < 2 && left > 0; i++) {
+                        const t = Math.min(1, left / seg[i]);
+                        ctx.lineTo(pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t,
+                                   pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t);
+                        left -= seg[i];
+                    }
+                    ctx.stroke();
                 }
-                ctx.stroke();
+            }
+            ParallelAnimation {
+                id: badgeIn
+                NumberAnimation { target: badge; property: "pop"; to: 1; duration: 320; easing.type: Easing.OutBack; easing.overshoot: 2.0 }
+                SequentialAnimation {
+                    PauseAnimation { duration: 80 }
+                    NumberAnimation { target: badge; property: "draw"; to: 1; duration: 220; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+                }
+                SequentialAnimation {
+                    PauseAnimation { duration: 140 }
+                    NumberAnimation { target: badge; property: "ring"; to: 1; duration: 460; easing.type: Easing.OutCubic }
+                }
+                SequentialAnimation {
+                    NumberAnimation { target: card; property: "flash"; to: 1; duration: 90; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+                    NumberAnimation { target: card; property: "flash"; to: 0; duration: 480; easing.type: Easing.OutCubic }
+                }
             }
         }
 
@@ -704,8 +789,8 @@ Item {
             // A viewport onto the transcript, sized from the card's animated
             // geometry. Clipping here works because it happens inside the
             // card's layer, before the shadow effect composites it.
-            width: Math.max(0, card.width - card.chrome)
-            height: root.hasText ? Math.max(0, card.height - 18) : status.implicitHeight
+            width: Math.max(0, inner.width - card.chrome)
+            height: root.hasText ? Math.max(0, inner.height - 18) : status.implicitHeight
             clip: root.hasText
             // Expose the top visible line's real baseline so the clock can
             // anchor to it (Qt's own metrics; the hand-computed offset left the
@@ -832,7 +917,7 @@ Item {
                 font.letterSpacing: 0.15
                 renderType: Text.NativeRendering
                 color: root.fg
-                opacity: !root.hasText ? 0 : (root.polishing ? 0.72 : 1.0)
+                opacity: !root.hasText ? 0 : (root.polishing && !shimmer.on ? 0.72 : 1.0)
                 // The viewport clips the text to the opening pill, so it can
                 // fade in with the morph instead of waiting for it.
                 Behavior on opacity { NumberAnimation { duration: 140; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
@@ -857,6 +942,61 @@ Item {
                 gradient: Gradient {
                     GradientStop { position: 0.0; color: card.color }
                     GradientStop { position: 1.0; color: Qt.alpha(card.color, 0) }
+                }
+            }
+        }
+
+        // -- polishing shimmer --------------------------------------------
+        // ElevenLabs "Shimmering Text": while the cleanup runs, whatever the
+        // pill says (transcript or "Polishing") rests dimmed and a soft band
+        // of full-strength text sweeps across it, left to right, ~1.1s a
+        // pass. Drawn from a live texture of `content`, so the transcript's
+        // own layout (indents, scroll, ellipsis) is shimmered as-is.
+        // Reduced motion: the plain 0.72 dim instead.
+        ShaderEffectSource {
+            id: contentTex
+            sourceItem: content
+            hideSource: shimmer.on
+            visible: false
+        }
+        Item {
+            id: shimmer
+            readonly property bool on: root.polishing && !root.reducedMotion
+            anchors.fill: content
+            visible: on
+            property real phase: 0
+            NumberAnimation on phase { from: 0; to: 1; duration: 1100; loops: Animation.Infinite; running: shimmer.on }
+            MultiEffect {
+                anchors.fill: parent
+                source: contentTex
+                opacity: shimmer.on ? 0.45 : 1.0
+                Behavior on opacity { NumberAnimation { duration: 200; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
+            }
+            MultiEffect {
+                anchors.fill: parent
+                source: contentTex
+                maskEnabled: true
+                maskSource: band
+                // Threshold 0 passes even fully transparent mask pixels, so
+                // the whole text lit up; ramp around 0.5 instead.
+                maskThresholdMin: 0.5
+                maskSpreadAtMin: 1.0
+            }
+            Item {
+                id: band
+                anchors.fill: parent
+                layer.enabled: true
+                visible: false
+                Rectangle {
+                    width: Math.max(48, parent.width * 0.4)
+                    height: parent.height
+                    x: -width + (parent.width + width) * shimmer.phase
+                    gradient: Gradient {
+                        orientation: Gradient.Horizontal
+                        GradientStop { position: 0.0; color: "#00ffffff" }
+                        GradientStop { position: 0.5; color: "#ffffffff" }
+                        GradientStop { position: 1.0; color: "#00ffffff" }
+                    }
                 }
             }
         }
@@ -890,6 +1030,7 @@ Item {
                 // widest digits for the current magnitude; grows once at 10:00
                 text: root.elapsed >= 600 ? "00:00" : "0:00"
             }
+        }
         }
     }
 }
