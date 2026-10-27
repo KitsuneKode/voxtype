@@ -633,14 +633,23 @@ Item {
         // and the last line sat low and was clipped.
         readonly property real lineH: transcript.pitch
         readonly property real viewH: Math.min(transcript.textH, 2 * lineH)
-        // Width holds steady while you read. The pill starts at minTextW and
-        // only ever grows (peakTextW), so the sentence's left edge doesn't
-        // slide as words arrive and a revised, shorter transcript can't make
-        // the pill breathe. Reset with the session (hasText -> false).
+        // Width hugs the words but moves in a few tiers, not per word: it
+        // steps up through 22/42/62/82/100% of the text area, so a short
+        // "Hello." gets a small pill and a long dictation resizes about four
+        // times in all (each one 250ms, edges anchored in between) instead
+        // of twitching on every chunk. It only ever grows (peakTextW), so a
+        // revised, shorter transcript can't make the pill breathe. Reset
+        // with the session (hasText -> false). (Was a flat 60% minimum: no
+        // twitching, but short phrases sat in a mostly empty pill.)
         property real peakTextW: 0
         onTextWChanged: if (root.hasText && textW > peakTextW) peakTextW = textW
-        readonly property real minTextW: 0.6 * textMaxW
-        readonly property real holdTextW: Math.min(textMaxW, Math.max(textW, peakTextW, minTextW))
+        readonly property var widthTiers: [0.22, 0.42, 0.62, 0.82, 1.0]
+        function _tier(w) {
+            for (let i = 0; i < widthTiers.length; i++)
+                if (w <= widthTiers[i] * textMaxW) return Math.ceil(widthTiers[i] * textMaxW);
+            return textMaxW;
+        }
+        readonly property real holdTextW: _tier(Math.max(textW, peakTextW))
         readonly property real fullW: Math.min(root.maxCardWidth,
                         chrome + (root.hasText ? holdTextW : status.implicitWidth))
         readonly property real fullH: Math.max(34, (root.hasText ? viewH : status.implicitHeight) + 18)
@@ -688,7 +697,7 @@ Item {
         // distance in the first frames (the words are revealed fast, and the
         // tail fade carries the softness) and retargets cleanly when the next
         // chunk arrives mid-flight.
-        Behavior on width  { enabled: card.settled && !root.reducedMotion; NumberAnimation { duration: 200; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
+        Behavior on width  { enabled: card.settled && !root.reducedMotion; NumberAnimation { duration: 250; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
         Behavior on height { enabled: card.settled && !root.reducedMotion; NumberAnimation { duration: 220; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut } }
 
         // Entrance: grows out of a dot (never from nothing: the dot is
