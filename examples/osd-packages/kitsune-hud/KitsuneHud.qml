@@ -56,6 +56,11 @@ Item {
     // No system-wide reduced-motion signal on Hyprland; opt in per user.
     // Reduced = opacity/color only, no scale, rise or morph.
     readonly property bool reducedMotion: Quickshell.env("VOXTYPE_OSD_REDUCED_MOTION") === "1"
+    // Liquid glass needs the compositor to blur behind the pill (Hyprland:
+    // a `layerrule` with blur on and ignore_alpha 0.5 for namespace
+    // voxtype-osd). Without it, or with VOXTYPE_OSD_REDUCED_TRANSPARENCY=1,
+    // the tint goes back to near-solid so text never sits on raw content.
+    readonly property bool reducedTransparency: Quickshell.env("VOXTYPE_OSD_REDUCED_TRANSPARENCY") === "1"
 
     // ------------------------------------------------------------------
     // Transcript transport
@@ -83,7 +88,7 @@ Item {
     property bool lingering: false
     property bool confirmed: false
     property double outputDoneAt: 0
-    readonly property int confirmHoldMs: 600
+    readonly property int confirmHoldMs: 420
     // Delivered, but as heard: every cleanup provider failed and
     // voxtype-postprocess.sh fell through to the raw transcript. The check
     // turns amber and the pill says so, held long enough to read, instead of
@@ -611,11 +616,13 @@ Item {
         y: Math.round(root._cardY(height) + dropOffset)
         property real dropOffset: 0
 
-        color: Qt.alpha(root._color("background", "#111114"), 0.95)
+        // Glass: a dark tint over the compositor's blur. 0.58 stays above
+        // the blur rule's ignore_alpha (0.5), so the whole pill is blurred.
+        color: Qt.alpha(root._color("background", "#111114"), root.reducedTransparency ? 0.95 : 0.58)
         border.width: 1
         // Briefly tinted by the delivered badge (flash 0..1), else a hairline.
         property real flash: 0
-        border.color: Qt.tint(Qt.alpha(root.fg, 0.08), Qt.alpha(badge.tone, 0.5 * flash))
+        border.color: Qt.tint(Qt.alpha("#ffffff", root.reducedTransparency ? 0.08 : 0.11), Qt.alpha(badge.tone, 0.4 * flash))
 
         // Soft contact shadow so the pill floats over content.
         layer.enabled: true
@@ -650,6 +657,23 @@ Item {
             onFinished: card.settled = true
             NumberAnimation { target: card; property: "morph";   to: 1.0; duration: root.reducedMotion ? 0 : 280; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
             NumberAnimation { target: card; property: "opacity"; to: 1.0; duration: 100; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+        }
+
+        // Light on the glass: a sheen falling from the top edge, brightest in
+        // its first pixel so the top of the rim reads lit and the bottom
+        // stays dark, as if lit from above. Under the contents, inside the
+        // rim (inset 1px).
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: 1
+            radius: Math.max(0, card.radius - 1)
+            visible: !root.reducedTransparency
+            gradient: Gradient {
+                GradientStop { position: 0.0;  color: Qt.alpha("#ffffff", 0.16) }
+                GradientStop { position: 0.06; color: Qt.alpha("#ffffff", 0.07) }
+                GradientStop { position: 0.5;  color: Qt.alpha("#ffffff", 0.02) }
+                GradientStop { position: 1.0;  color: Qt.alpha("#ffffff", 0.0) }
+            }
         }
 
         // Everything inside the pill fades with the open/close morph. While
@@ -694,13 +718,19 @@ Item {
         }
 
         // -- delivered badge ------------------------------------------
-        // In the meter's slot (same place, new meaning): a tinted disc pops
-        // in with a small overshoot, the tick draws itself over it, one halo
-        // ring spreads and fades, and the pill's edge flashes the same tone.
-        // The only motion with overshoot: it's the reward moment, and it
-        // plays once per dictation, after the user has stopped acting.
+        // Plays once per dictation (tens a day) as feedback that the text
+        // landed, so it stays fast and quiet: done in ~250ms, then held.
+        //  - Pop in: a tinted disc scales 0.6 -> 1 with a small overshoot
+        //    (OutBack 1.2, ~3% past) over 200ms while the bars fade out.
+        //  - Line drawing: the tick is one continuous stroke drawn by
+        //    arc length, so the pen slows into the corner and through the
+        //    short leg, then sweeps the long leg and eases onto the tip
+        //    (strong ease-in-out over 220ms, starting 50ms in, once the
+        //    disc is mostly there). Round caps and joins: a pen, not a wipe.
+        //  - The pill's edge takes the same tone for a moment.
+        // No halo ring: at this frequency it was decoration.
         // Amber instead of green when the text went in uncleaned.
-        // Reduced motion: disc and tick appear without movement.
+        // Reduced motion: disc and tick appear in place, no scale or draw.
         Item {
             id: badge
             width: 18
@@ -710,28 +740,18 @@ Item {
             readonly property color tone: root.deliveredRaw ? root.warnColor : root.checkColor
             property real pop: 0
             property real draw: 0
-            property real ring: 0
             function play() {
                 badgeIn.stop();
-                if (root.reducedMotion) { pop = 1; draw = 1; ring = 0; return; }
-                pop = 0; draw = 0; ring = 0;
+                if (root.reducedMotion) { pop = 1; draw = 1; return; }
+                pop = 0; draw = 0;
                 badgeIn.start();
             }
             Rectangle {
                 anchors.centerIn: parent
                 width: parent.width; height: width; radius: width / 2
-                color: "transparent"
-                border.width: 1.5
-                border.color: badge.tone
-                scale: 1 + 0.75 * badge.ring
-                opacity: badge.ring > 0 ? 0.6 * (1 - badge.ring) : 0
-            }
-            Rectangle {
-                anchors.centerIn: parent
-                width: parent.width; height: width; radius: width / 2
                 color: Qt.alpha(badge.tone, 0.2)
-                scale: 0.4 + 0.6 * badge.pop
-                opacity: Math.min(1, badge.pop * 2)
+                scale: 0.6 + 0.4 * badge.pop
+                opacity: Math.min(1, badge.pop * 2.5)
             }
             Canvas {
                 id: check
@@ -742,11 +762,12 @@ Item {
                 onPaint: {
                     const ctx = getContext("2d");
                     ctx.reset();
-                    const pts = [[5.4, 9.4], [8.0, 11.9], [12.8, 6.3]];
+                    // short leg down-right, corner, long leg up-right
+                    const pts = [[5.3, 9.3], [8.0, 12.0], [13.0, 6.3]];
                     const seg = [Math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1]),
                                  Math.hypot(pts[2][0] - pts[1][0], pts[2][1] - pts[1][1])];
                     let left = (seg[0] + seg[1]) * progress;
-                    ctx.lineWidth = 1.9;
+                    ctx.lineWidth = 2.0;
                     ctx.lineCap = "round";
                     ctx.lineJoin = "round";
                     ctx.strokeStyle = badge.tone;
@@ -763,18 +784,14 @@ Item {
             }
             ParallelAnimation {
                 id: badgeIn
-                NumberAnimation { target: badge; property: "pop"; to: 1; duration: 320; easing.type: Easing.OutBack; easing.overshoot: 2.0 }
+                NumberAnimation { target: badge; property: "pop"; to: 1; duration: 200; easing.type: Easing.OutBack; easing.overshoot: 1.2 }
                 SequentialAnimation {
-                    PauseAnimation { duration: 80 }
-                    NumberAnimation { target: badge; property: "draw"; to: 1; duration: 220; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+                    PauseAnimation { duration: 50 }
+                    NumberAnimation { target: badge; property: "draw"; to: 1; duration: 220; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeInOut }
                 }
                 SequentialAnimation {
-                    PauseAnimation { duration: 140 }
-                    NumberAnimation { target: badge; property: "ring"; to: 1; duration: 460; easing.type: Easing.OutCubic }
-                }
-                SequentialAnimation {
-                    NumberAnimation { target: card; property: "flash"; to: 1; duration: 90; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
-                    NumberAnimation { target: card; property: "flash"; to: 0; duration: 480; easing.type: Easing.OutCubic }
+                    NumberAnimation { target: card; property: "flash"; to: 1; duration: 80; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
+                    NumberAnimation { target: card; property: "flash"; to: 0; duration: 320; easing.type: Easing.BezierSpline; easing.bezierCurve: root.easeOut }
                 }
             }
         }

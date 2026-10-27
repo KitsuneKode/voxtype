@@ -40,11 +40,31 @@ smoothed level crossing about -38 dBFS, held 450ms between words. Tune
   the text, so the caption layout is shimmered as-is.
 - `VOXTYPE_OSD_REDUCED_MOTION=1` keeps opacity and colour changes only.
 
+## Glass
+
+The pill is a translucent tint (58% alpha) with a top-lit sheen and rim, made
+for a compositor blur behind it. On Hyprland (0.53+ block syntax):
+
+```
+layerrule {
+    name = voxtype-osd-blur
+    match:namespace = voxtype-osd
+    blur = on
+    ignore_alpha = 0.5
+}
+```
+
+`ignore_alpha` keeps the soft shadow around the pill out of the blur. Without
+a blur rule, set `VOXTYPE_OSD_REDUCED_TRANSPARENCY=1` for the near-solid tint.
+
 ## Feedback
 
 - **Delivered:** when the daemon writes `output_done`, a tinted disc pops into
-  the meter's place, the check draws itself over it, a halo ring spreads once
-  and the pill's edge flashes the same tone, then the pill closes.
+  the meter's place (200ms, ~3% overshoot), the check draws itself over it as
+  one pen stroke (220ms ease-in-out by arc length: slow into the corner, a
+  sweep up the long leg, easing onto the tip) and the pill's edge takes the
+  same tone for a moment, then the pill closes. About 250ms in all: it plays
+  on every dictation, so it stays quick.
 - **Delivered raw:** if a post-process command writes
   `$XDG_RUNTIME_DIR/voxtype/pp_result` as `<epoch ms> passthrough`, the check
   is amber and the pill reads "Cleanup failed · typed as heard". Without that
