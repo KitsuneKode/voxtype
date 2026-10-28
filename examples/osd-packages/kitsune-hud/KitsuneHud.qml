@@ -332,6 +332,8 @@ Item {
             ripple = [];
             speechAt = 0;
             signalAt = 0;
+            noiseDb = -60;
+            topDb = -60 + minSpanDb;
             speaking = false;
             micDead = false;
             tick = 0;
@@ -411,9 +413,18 @@ Item {
     // floor and normal speech spans the full height.
     readonly property int barCount: 9
     readonly property int centerBar: Math.floor(barCount / 2)
-    readonly property real floorDb: -48
-    readonly property real ceilDb: -14
-    readonly property real speechLevel: 0.3      // ≈ -38 dBFS on the scale above
+    // Auto-ranging: a fixed -48..-14 dBFS window never moved for the real
+    // mic chain (EasyEffects -> voxtype), where speech peaks at -60..-46
+    // dBFS and RNNoise sends exact zeros between words. The window now
+    // follows the session: its top jumps up to each new peak and sinks
+    // 4 dB/s, its bottom tracks the noise floor (instantly down, 2 dB/s up),
+    // and it never gets narrower than minSpanDb, so room noise stays on the
+    // floor while any voice level fills the bars.
+    readonly property real absFloorDb: -72       // below the bridge's 0.001 step
+    readonly property real minSpanDb: 18
+    property real noiseDb: -60
+    property real topDb: -60 + minSpanDb
+    readonly property real speechLevel: 0.3      // of the live window
     // Centre-weighted, indexed by distance from the centre bar.
     readonly property var profile: [1.0, 0.9, 0.78, 0.64, 0.5]
     property real level: 0
@@ -432,10 +443,15 @@ Item {
       : speaking  ? "speaking"
       :             "listening"
 
+    // One frame in, 0..1 out; also moves the window (100Hz, so the per-frame
+    // steps below are 0.02 dB = 2 dB/s and 0.04 dB = 4 dB/s).
     function _dbLevel(peak) {
+        const db = peak > 0 ? Math.max(absFloorDb, 20 * Math.log10(peak)) : absFloorDb;
+        noiseDb = db < noiseDb ? db : noiseDb + 0.02;
+        const lo = Math.max(absFloorDb, noiseDb + 3);
+        topDb = Math.max(db, topDb - 0.04, lo + minSpanDb);
         if (peak <= 0) return 0;
-        const db = 20 * Math.log10(peak);
-        return Math.max(0, Math.min(1, (db - floorDb) / (ceilDb - floorDb)));
+        return Math.max(0, Math.min(1, (db - lo) / (topDb - lo)));
     }
 
     Connections {
@@ -469,7 +485,9 @@ Item {
             root.ripple = r;
             const now = Date.now();
             root.speaking = now - root.speechAt < 450;
-            root.micDead = root.feeding && now - Math.max(root.signalAt, root.startedAt) > 2000;
+            // Only before the first sound: RNNoise sends exact zeros in every
+            // pause, so "no signal for 2s" mid-take was a normal breath.
+            root.micDead = root.feeding && root.signalAt === 0 && now - root.startedAt > 2500;
         }
     }
 
