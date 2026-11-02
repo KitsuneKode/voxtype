@@ -167,6 +167,19 @@ fn main() -> ExitCode {
 
     spawn_theme_follower(&runtime_style, cli_style.as_deref(), config_path.as_deref());
 
+    // External host (opt-in: VOXTYPE_OSD_HOST=<pid file>). A desktop shell
+    // that already runs Quickshell (kuwai's island) draws these same QML
+    // components inside its own process, reading the same state, flag and
+    // style files, so there is no second Quickshell. This launcher still
+    // writes the style file (above) and stays alive for the daemon's
+    // supervisor. If the host's pid file is missing or its process is gone
+    // for a few seconds, it falls through and launches the normal Quickshell
+    // OSD, so the transcription UI is never lost.
+    if let Some(host) = env::var_os("VOXTYPE_OSD_HOST").filter(|h| !h.is_empty()) {
+        wait_for_external_host(Path::new(&host));
+        tracing::warn!("external OSD host gone; launching the Quickshell OSD");
+    }
+
     let mut cmd = Command::new(QS_BIN);
     if daemonize {
         cmd.arg("-d");
@@ -179,6 +192,41 @@ fn main() -> ExitCode {
         shell_dir.display()
     );
     ExitCode::from(1)
+}
+
+/// Whether the process named in `pid_file` is alive and is a Quickshell.
+fn external_host_alive(pid_file: &Path) -> bool {
+    let Ok(text) = fs::read_to_string(pid_file) else { return false };
+    let Ok(pid) = text.trim().parse::<i32>() else { return false };
+    if pid <= 1 || unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    // Guard against a reused pid: it must still be a Quickshell process.
+    fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|c| String::from_utf8_lossy(&c).split('\0').any(|a| a.ends_with("/qs") || a == "qs" || a.ends_with("quickshell")))
+        .unwrap_or(false)
+}
+
+/// Block while the external host is alive. Returns once it has been gone
+/// for 5 s (12 s before it has been seen at all: at login the shell may
+/// start after the daemon).
+fn wait_for_external_host(pid_file: &Path) {
+    let tick = std::time::Duration::from_millis(500);
+    let mut seen = false;
+    let mut missing = 0u32;
+    tracing::info!(pid_file = %pid_file.display(), "OSD drawn by an external host");
+    loop {
+        if external_host_alive(pid_file) {
+            seen = true;
+            missing = 0;
+        } else {
+            missing += 1;
+            if missing >= if seen { 10 } else { 24 } {
+                return;
+            }
+        }
+        std::thread::sleep(tick);
+    }
 }
 
 fn print_help() {
