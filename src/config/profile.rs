@@ -33,6 +33,20 @@ pub struct PostProcessConfig {
     /// e.g. filtering out unwanted transcriptions like [BLANK_AUDIO].
     #[serde(default = "default_true")]
     pub fallback_on_empty: bool,
+
+    /// Type the command's output as it arrives instead of after it exits
+    /// (default: false). The command is started with VOXTYPE_STREAM_OUTPUT=1
+    /// and may then print its result in pieces (a cleanup LLM streamed one
+    /// sentence at a time, say); in type mode each piece is typed as soon as
+    /// it is read, so a long dictation starts appearing with the first
+    /// sentence. Everything the command prints is delivered: once a piece is
+    /// typed it cannot be taken back, so a command that opts in must only
+    /// print text it stands by, and never the transcript again after a
+    /// failure (it has to append what is missing itself). If it fails before
+    /// printing anything, the original text is typed as usual. Other output
+    /// modes (clipboard, paste, file) collect the pieces and deliver once.
+    #[serde(default)]
+    pub streaming: bool,
 }
 
 impl Default for PostProcessConfig {
@@ -42,6 +56,7 @@ impl Default for PostProcessConfig {
             timeout_ms: default_post_process_timeout(),
             trim: true,
             fallback_on_empty: true,
+            streaming: false,
         }
     }
 }

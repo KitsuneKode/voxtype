@@ -24,6 +24,7 @@ pub mod cgevent;
 pub mod clipboard;
 pub mod dotool;
 pub mod eitype;
+pub mod incremental;
 // modifier_guard is evdev-based; macOS has its own osascript modifier handling.
 #[cfg(target_os = "linux")]
 pub mod modifier_guard;

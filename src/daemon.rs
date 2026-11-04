@@ -365,6 +365,134 @@ async fn wait_for_post_process(run: impl std::future::Future<Output = String>) -
     }
 }
 
+/// How a streamed post-process delivery ([`stream_post_process`]) ended.
+enum StreamedDelivery {
+    /// Delivered; the whole text.
+    Delivered(String),
+    /// No output method took the text.
+    Failed(crate::error::OutputError),
+    /// `record cancel` arrived. What was already typed stays typed.
+    Cancelled,
+}
+
+/// Run a streaming post-process command and type its output as it arrives
+/// (`[output.post_process] streaming = true`, type mode). The modifier wait
+/// and pre-output hook run while the command is still working, so they cost
+/// nothing; the first sentence is typed as soon as the command prints it.
+///
+/// Fallbacks match the batch path: a command that fails or prints nothing
+/// before any text went out gets the original text typed instead. Once text
+/// is on screen it cannot be taken back, so a later failure delivers only
+/// what the command printed (a streaming command is responsible for
+/// appending what is missing itself, see `voxtype_pp_stream.py`).
+/// `--no-post-process` arriving before the first piece delivers the original
+/// text; after it, it is too late and the cleanup finishes.
+async fn stream_post_process(
+    processor: &PostProcessor,
+    text: &str,
+    context: Option<&str>,
+    output_config: &crate::config::OutputConfig,
+) -> StreamedDelivery {
+    use crate::output::incremental::{chain_factory, IncrementalOutput};
+    use crate::output::post_process::StreamEnd;
+
+    let options = output::OutputOptions {
+        pre_output_command: output_config.pre_output_command.as_deref(),
+        post_output_command: output_config.post_output_command.as_deref(),
+        wait_for_modifier_release: output_config.wait_for_modifier_release,
+        modifier_release_timeout: Duration::from_millis(output_config.modifier_release_timeout_ms),
+    };
+    let mut out = IncrementalOutput::new(chain_factory(output_config), options, processor.trims());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let run = processor.process_streaming(text, context, tx);
+    tokio::pin!(run);
+    let mut end: Option<StreamEnd> = None;
+
+    // Modifier wait + pre-output hook, overlapping the command's start.
+    {
+        let begin = out.begin();
+        tokio::pin!(begin);
+        loop {
+            tokio::select! {
+                _ = &mut begin => break,
+                e = &mut run, if end.is_none() => end = Some(e),
+            }
+        }
+    }
+
+    let started = Instant::now();
+    let mut first_piece_ms: Option<u128> = None;
+    let mut printed = false; // any visible text from the command
+    let mut skipped = false;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            piece = rx.recv() => match piece {
+                Some(piece) => {
+                    if !piece.trim().is_empty() {
+                        printed = true;
+                        first_piece_ms.get_or_insert_with(|| started.elapsed().as_millis());
+                    }
+                    out.push(&piece).await;
+                }
+                // The sender lives in `run`: closed means the command is done.
+                None => break,
+            },
+            e = &mut run, if end.is_none() => end = Some(e),
+            _ = tick.tick() => {
+                if check_cancel_requested() {
+                    tracing::info!("Post-processing cancelled");
+                    out.abort().await;
+                    return StreamedDelivery::Cancelled;
+                }
+                if !printed && read_bool_override("post_process") == Some(false) {
+                    tracing::info!("Post-processing skipped, delivering the transcript as is");
+                    skipped = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if skipped {
+        out.push(text).await;
+    } else {
+        match end {
+            Some(StreamEnd::Done) | None => {
+                if !printed && processor.falls_back_on_empty() {
+                    tracing::warn!("Post-process command returned empty output, using original text");
+                    out.push(text).await;
+                }
+            }
+            Some(StreamEnd::Failed(e)) if !printed => {
+                tracing::warn!("Post-process command failed: {}, using original text", e);
+                out.push(text).await;
+            }
+            Some(StreamEnd::Failed(e)) => {
+                tracing::warn!(
+                    "Post-process command failed after printing part of its output: {}; \
+                     delivering what it printed",
+                    e
+                );
+            }
+        }
+    }
+    match out.finish().await {
+        Ok(delivered) => {
+            tracing::info!(
+                "Post-processed (streamed): changed: {}, first text after {}ms, done after {}ms",
+                delivered != text,
+                first_piece_ms.map_or_else(|| "-".to_string(), |ms| ms.to_string()),
+                started.elapsed().as_millis()
+            );
+            StreamedDelivery::Delivered(delivered)
+        }
+        Err(e) => StreamedDelivery::Failed(e),
+    }
+}
+
 /// Clean up any stale cancel file on startup
 fn cleanup_cancel_file() {
     let cancel_file = Config::runtime_dir().join("cancel");
@@ -3898,6 +4026,7 @@ impl Daemon {
                                 timeout_ms: profile.post_process_timeout_ms.unwrap_or(30000),
                                 trim: true,
                                 fallback_on_empty: true,
+                                streaming: false,
                             })
                         });
                     let processor = if post_process_enabled {
@@ -3906,64 +4035,8 @@ impl Daemon {
                         tracing::info!("Post-processing disabled for this recording");
                         None
                     };
-                    let final_text = match processor {
-                        None => processed_text,
-                        Some(processor) => {
-                            tracing::info!(
-                                "Post-processing (profile: {:?}), has_context: {}",
-                                profile_processor.as_ref().and(profile_override.as_ref()),
-                                recent_context.is_some()
-                            );
-                            tracing::debug!(
-                                "Post-processing input: {:?}, context: {:?}",
-                                processed_text,
-                                recent_context
-                            );
-                            let run = processor
-                                .process_with_context(&processed_text, recent_context.as_deref());
-                            match wait_for_post_process(run).await {
-                                PostProcessWait::Done(result) => {
-                                    tracing::info!(
-                                        "Post-processed: changed: {}",
-                                        result != processed_text
-                                    );
-                                    tracing::debug!("Post-processed result: {:?}", result);
-                                    result
-                                }
-                                PostProcessWait::Skipped => {
-                                    tracing::info!(
-                                        "Post-processing skipped, delivering the transcript as is"
-                                    );
-                                    processed_text
-                                }
-                                PostProcessWait::Cancelled => {
-                                    tracing::info!("Post-processing cancelled");
-                                    self.publish_empty_outcome();
-                                    self.play_feedback(SoundEvent::Cancelled);
-                                    self.reset_to_idle(state).await;
-                                    end_recording_notification(
-                                        "Cancelled",
-                                        "Transcription discarded",
-                                        &self.config.output.notification,
-                                        self.config.engine,
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            }
-                        }
-                    };
-
-                    // Track last dictation for context in subsequent post-processing
-                    self.last_dictation = Some((final_text.clone(), Instant::now()));
-
-                    if smart_submit {
-                        tracing::debug!(
-                            "Smart auto-submit: final text after post-processing: {:?}",
-                            final_text
-                        );
-                    }
-
+                    // Where the text goes is settled before post-processing: a streamed
+                    // post-process types into it while the command is still running.
                     // Check for output mode override from CLI flags
                     let output_override = read_output_mode_override();
 
@@ -3982,46 +4055,6 @@ impl Daemon {
                     // --no-auto-submit with --file hit this on every dictation.
                     let auto_submit_override = read_bool_override("auto_submit");
                     let shift_enter_override = read_bool_override("shift_enter");
-
-                    if let Some(output_path) = file_output_path {
-                        *state = State::Outputting {
-                            text: final_text.clone(),
-                        };
-
-                        match self.deliver_file_output(&output_path, &final_text).await {
-                            FileDelivery::Written => {
-                                let mode_str = match self.config.output.file_mode {
-                                    FileMode::Overwrite => "wrote",
-                                    FileMode::Append => "appended",
-                                };
-                                tracing::info!("{} transcription to {:?}", mode_str, output_path);
-                                let outcome = if final_text.is_empty() {
-                                    TranscriptOutcome::empty()
-                                } else {
-                                    TranscriptOutcome::ok(final_text.chars().count())
-                                };
-                                write_result_sidecar(&output_path, &outcome);
-                                self.play_feedback(SoundEvent::TranscriptionComplete);
-                            }
-                            FileDelivery::FellBack(err) => {
-                                write_result_sidecar(
-                                    &output_path,
-                                    &TranscriptOutcome::error(&format!(
-                                        "{err}; copied to the clipboard instead"
-                                    )),
-                                );
-                                self.play_feedback(SoundEvent::TranscriptionComplete);
-                            }
-                            FileDelivery::Lost(err) => {
-                                write_result_sidecar(&output_path, &TranscriptOutcome::error(&err));
-                                self.play_feedback(SoundEvent::Error);
-                            }
-                        }
-
-                        *state = State::Idle;
-                        self.update_state("idle");
-                        return;
-                    }
 
                     // Create output chain with potential mode override (for non-file modes)
                     // Priority: 1. CLI override, 2. profile output_mode, 3. config default
@@ -4108,6 +4141,157 @@ impl Daemon {
                                 }
                             }
                         }
+                    }
+
+                    let final_text = match processor {
+                        None => processed_text,
+                        Some(processor)
+                            if processor.streaming()
+                                && file_output_path.is_none()
+                                && output_config.mode == OutputMode::Type =>
+                        {
+                            tracing::info!(
+                                "Post-processing, typed as it streams (profile: {:?}), has_context: {}",
+                                profile_processor.as_ref().and(profile_override.as_ref()),
+                                recent_context.is_some()
+                            );
+                            let delivery = stream_post_process(
+                                processor,
+                                &processed_text,
+                                recent_context.as_deref(),
+                                &output_config,
+                            )
+                            .await;
+                            match delivery {
+                                StreamedDelivery::Delivered(text) => {
+                                    self.last_dictation = Some((text.clone(), Instant::now()));
+                                    write_output_done(text.chars().count());
+                                    self.play_feedback(SoundEvent::TranscriptionComplete);
+                                    if self.config.output.notification.on_transcription {
+                                        output::send_transcription_notification(
+                                            &text,
+                                            self.config.output.notification.show_engine_icon,
+                                            self.config.engine,
+                                            &self.config.output.notification.urgency,
+                                        )
+                                        .await;
+                                    }
+                                }
+                                StreamedDelivery::Failed(e) => {
+                                    tracing::error!("Output failed: {}", e);
+                                }
+                                StreamedDelivery::Cancelled => {
+                                    self.publish_empty_outcome();
+                                    self.play_feedback(SoundEvent::Cancelled);
+                                    self.reset_to_idle(state).await;
+                                    end_recording_notification(
+                                        "Cancelled",
+                                        "Transcription discarded",
+                                        &self.config.output.notification,
+                                        self.config.engine,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                            *state = State::Idle;
+                            self.update_state("idle");
+                            return;
+                        }
+                        Some(processor) => {
+                            tracing::info!(
+                                "Post-processing (profile: {:?}), has_context: {}",
+                                profile_processor.as_ref().and(profile_override.as_ref()),
+                                recent_context.is_some()
+                            );
+                            tracing::debug!(
+                                "Post-processing input: {:?}, context: {:?}",
+                                processed_text,
+                                recent_context
+                            );
+                            let run = processor
+                                .process_with_context(&processed_text, recent_context.as_deref());
+                            match wait_for_post_process(run).await {
+                                PostProcessWait::Done(result) => {
+                                    tracing::info!(
+                                        "Post-processed: changed: {}",
+                                        result != processed_text
+                                    );
+                                    tracing::debug!("Post-processed result: {:?}", result);
+                                    result
+                                }
+                                PostProcessWait::Skipped => {
+                                    tracing::info!(
+                                        "Post-processing skipped, delivering the transcript as is"
+                                    );
+                                    processed_text
+                                }
+                                PostProcessWait::Cancelled => {
+                                    tracing::info!("Post-processing cancelled");
+                                    self.publish_empty_outcome();
+                                    self.play_feedback(SoundEvent::Cancelled);
+                                    self.reset_to_idle(state).await;
+                                    end_recording_notification(
+                                        "Cancelled",
+                                        "Transcription discarded",
+                                        &self.config.output.notification,
+                                        self.config.engine,
+                                    )
+                                    .await;
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    // Track last dictation for context in subsequent post-processing
+                    self.last_dictation = Some((final_text.clone(), Instant::now()));
+
+                    if smart_submit {
+                        tracing::debug!(
+                            "Smart auto-submit: final text after post-processing: {:?}",
+                            final_text
+                        );
+                    }
+
+                    if let Some(output_path) = file_output_path {
+                        *state = State::Outputting {
+                            text: final_text.clone(),
+                        };
+
+                        match self.deliver_file_output(&output_path, &final_text).await {
+                            FileDelivery::Written => {
+                                let mode_str = match self.config.output.file_mode {
+                                    FileMode::Overwrite => "wrote",
+                                    FileMode::Append => "appended",
+                                };
+                                tracing::info!("{} transcription to {:?}", mode_str, output_path);
+                                let outcome = if final_text.is_empty() {
+                                    TranscriptOutcome::empty()
+                                } else {
+                                    TranscriptOutcome::ok(final_text.chars().count())
+                                };
+                                write_result_sidecar(&output_path, &outcome);
+                                self.play_feedback(SoundEvent::TranscriptionComplete);
+                            }
+                            FileDelivery::FellBack(err) => {
+                                write_result_sidecar(
+                                    &output_path,
+                                    &TranscriptOutcome::error(&format!(
+                                        "{err}; copied to the clipboard instead"
+                                    )),
+                                );
+                                self.play_feedback(SoundEvent::TranscriptionComplete);
+                            }
+                            FileDelivery::Lost(err) => {
+                                write_result_sidecar(&output_path, &TranscriptOutcome::error(&err));
+                                self.play_feedback(SoundEvent::Error);
+                            }
+                        }
+
+                        *state = State::Idle;
+                        self.update_state("idle");
+                        return;
                     }
 
                     let output_chain = output::create_output_chain(&output_config);

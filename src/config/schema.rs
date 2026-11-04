@@ -1091,6 +1091,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Output the original transcription when the command prints nothing. Turn off to let the command drop a transcription.",
     ),
     spec(
+        "output.post_process.streaming",
+        "output.post_process",
+        "streaming",
+        KeyType::Bool,
+        "Output",
+        "Type post-process output as it arrives",
+        "Start the command with VOXTYPE_STREAM_OUTPUT=1 and type each piece it prints right away, instead of waiting for it to exit. Only for commands that support it.",
+    ),
+    spec(
         "output.post_process_enabled",
         "output",
         "post_process_enabled",
@@ -2695,6 +2704,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.post_process.timeout_ms" => json!(pp().timeout_ms),
         "output.post_process.trim" => json!(pp().trim),
         "output.post_process.fallback_on_empty" => json!(pp().fallback_on_empty),
+        "output.post_process.streaming" => json!(pp().streaming),
 
         "text.spoken_punctuation" => json!(cfg.text.spoken_punctuation),
         "text.smart_auto_submit" => json!(cfg.text.smart_auto_submit),

@@ -13,12 +13,18 @@
 //!
 //! The command receives the transcribed text on stdin and should output
 //! the processed text on stdout. On any failure, the original text is used.
+//!
+//! With `streaming = true` the command is started with
+//! `VOXTYPE_STREAM_OUTPUT=1` and its stdout is read as it arrives
+//! ([`PostProcessor::process_streaming`]), so the daemon can type each piece
+//! while the command is still running.
 
 use crate::config::PostProcessConfig;
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /// Post-processor that runs an external command on transcribed text
@@ -27,6 +33,18 @@ pub struct PostProcessor {
     timeout: Duration,
     trim: bool,
     fallback_on_empty: bool,
+    streaming: bool,
+}
+
+/// How a streamed post-process run ([`PostProcessor::process_streaming`])
+/// ended. The pieces themselves went out over the channel as they were read.
+#[derive(Debug)]
+pub enum StreamEnd {
+    /// The command exited 0; what it printed is the result.
+    Done,
+    /// It failed (timeout, non-zero exit, output that is not UTF-8) after
+    /// the pieces already sent, if any.
+    Failed(PostProcessError),
 }
 
 impl PostProcessor {
@@ -37,7 +55,141 @@ impl PostProcessor {
             timeout: Duration::from_millis(config.timeout_ms),
             trim: config.trim,
             fallback_on_empty: config.fallback_on_empty,
+            streaming: config.streaming,
         }
+    }
+
+    /// Whether the command prints its output progressively (see
+    /// [`Self::process_streaming`]).
+    pub fn streaming(&self) -> bool {
+        self.streaming
+    }
+
+    /// Whether whitespace around the command's output is dropped.
+    pub fn trims(&self) -> bool {
+        self.trim
+    }
+
+    /// Whether an empty result means "use the original text".
+    pub fn falls_back_on_empty(&self) -> bool {
+        self.fallback_on_empty
+    }
+
+    /// Run the command with `VOXTYPE_STREAM_OUTPUT=1` and send its stdout to
+    /// `pieces` as it is read, in order, each piece valid UTF-8 (a character
+    /// split across two reads goes out whole with the second). Returns once
+    /// the command has exited or failed. Dropping the future kills the
+    /// command, like the batch path.
+    pub async fn process_streaming(
+        &self,
+        text: &str,
+        context: Option<&str>,
+        pieces: mpsc::UnboundedSender<String>,
+    ) -> StreamEnd {
+        match self.stream_command(text, context, &pieces).await {
+            Ok(()) => StreamEnd::Done,
+            Err(e) => StreamEnd::Failed(e),
+        }
+    }
+
+    async fn stream_command(
+        &self,
+        text: &str,
+        context: Option<&str>,
+        pieces: &mpsc::UnboundedSender<String>,
+    ) -> Result<(), PostProcessError> {
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        let timed_out = || PostProcessError::Timeout(self.timeout.as_secs());
+        let mut cmd = self.command(context);
+        cmd.env("VOXTYPE_STREAM_OUTPUT", "1");
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| PostProcessError::SpawnFailed(e.to_string()))?;
+        let mut group = ProcessGroupGuard(child.id());
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = tokio::time::timeout_at(deadline, stdin.write_all(text.as_bytes())).await;
+            drop(stdin);
+        }
+        // Drain stderr on the side so a chatty command cannot block on a
+        // full pipe while we wait for its stdout.
+        let stderr_task = child.stderr.take().map(|mut err| {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let _ = err.read_to_end(&mut buf).await;
+                String::from_utf8_lossy(&buf).trim().to_string()
+            })
+        });
+
+        let mut stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| PostProcessError::WaitFailed("no stdout".into()))?;
+        let mut buf = [0u8; 4096];
+        let mut carry: Vec<u8> = Vec::new();
+        loop {
+            let n = tokio::time::timeout_at(deadline, stdout.read(&mut buf))
+                .await
+                .map_err(|_| timed_out())?
+                .map_err(|e| PostProcessError::WaitFailed(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            carry.extend_from_slice(&buf[..n]);
+            let valid = match std::str::from_utf8(&carry) {
+                Ok(s) => s.len(),
+                // Incomplete character at the end: keep it for the next read.
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(e) => return Err(PostProcessError::InvalidUtf8(e.to_string())),
+            };
+            if valid > 0 {
+                let rest = carry.split_off(valid);
+                let piece = String::from_utf8(std::mem::replace(&mut carry, rest))
+                    .expect("validated above");
+                let _ = pieces.send(piece);
+            }
+        }
+        if !carry.is_empty() {
+            return Err(PostProcessError::InvalidUtf8(
+                "output ended inside a character".into(),
+            ));
+        }
+
+        let status = tokio::time::timeout_at(deadline, child.wait())
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(|e| PostProcessError::WaitFailed(e.to_string()))?;
+        group.disarm();
+        if !status.success() {
+            let stderr = match stderr_task {
+                Some(t) => t.await.unwrap_or_default(),
+                None => String::new(),
+            };
+            return Err(PostProcessError::NonZeroExit {
+                code: status.code(),
+                stderr,
+            });
+        }
+        Ok(())
+    }
+
+    fn command(&self, context: Option<&str>) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", &self.command])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            // Own process group, so the guard below can kill what `sh -c`
+            // started (a curl to an LLM API, say) and not just the shell.
+            .process_group(0);
+
+        // Always clear to prevent inheriting stale context from parent environment
+        cmd.env_remove("VOXTYPE_CONTEXT");
+        cmd.env_remove("VOXTYPE_STREAM_OUTPUT");
+        if let Some(ctx) = context {
+            cmd.env("VOXTYPE_CONTEXT", ctx);
+        }
+        cmd
     }
 
     /// Process text with optional context from a previous chunk
@@ -86,21 +238,7 @@ impl PostProcessor {
         text: &str,
         context: Option<&str>,
     ) -> Result<String, PostProcessError> {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", &self.command])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // Own process group, so the guard below can kill what `sh -c`
-            // started (a curl to an LLM API, say) and not just the shell.
-            .process_group(0);
-
-        // Always clear to prevent inheriting stale context from parent environment
-        cmd.env_remove("VOXTYPE_CONTEXT");
-        if let Some(ctx) = context {
-            cmd.env("VOXTYPE_CONTEXT", ctx);
-        }
-
+        let mut cmd = self.command(context);
         let mut child = cmd
             .spawn()
             .map_err(|e| PostProcessError::SpawnFailed(e.to_string()))?;
@@ -218,6 +356,7 @@ mod tests {
             timeout_ms,
             trim: true,
             fallback_on_empty: true,
+            streaming: false,
         }
     }
 
@@ -416,6 +555,7 @@ mod tests {
             timeout_ms: 5000,
             trim: false,
             fallback_on_empty: true,
+            streaming: false,
         };
         let processor = PostProcessor::new(&config);
         let result = processor.process("hello world.").await;
@@ -430,6 +570,7 @@ mod tests {
             timeout_ms: 5000,
             trim: false,
             fallback_on_empty: true,
+            streaming: false,
         };
         let processor = PostProcessor::new(&config);
         let result = processor.process("ignored").await;
@@ -444,6 +585,7 @@ mod tests {
             timeout_ms: 5000,
             trim: true,
             fallback_on_empty: false,
+            streaming: false,
         };
         let processor = PostProcessor::new(&config);
         let result = processor.process("original text").await;
@@ -468,6 +610,7 @@ mod tests {
             timeout_ms: 5000,
             trim: false,
             fallback_on_empty: false,
+            streaming: false,
         };
         let processor = PostProcessor::new(&config);
         let result = processor.process("original text").await;
@@ -483,6 +626,7 @@ mod tests {
             timeout_ms: 5000,
             trim: true,
             fallback_on_empty: true,
+            streaming: false,
         };
         let processor = PostProcessor::new(&config);
         let result = processor.process("original text").await;
@@ -497,6 +641,7 @@ mod tests {
             timeout_ms: 5000,
             trim: true,
             fallback_on_empty: false,
+            streaming: false,
         };
         let processor = PostProcessor::new(&config);
         let result = processor.process("original text").await;
@@ -538,4 +683,82 @@ mod tests {
         std::env::remove_var("VOXTYPE_CONTEXT");
         assert_eq!(result, "unset");
     }
+
+    async fn collect_stream(
+        command: &str,
+        timeout_ms: u64,
+    ) -> (Vec<(String, u128)>, super::StreamEnd) {
+        let mut config = make_config(command, timeout_ms);
+        config.streaming = true;
+        let processor = PostProcessor::new(&config);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let started = std::time::Instant::now();
+        let run = processor.process_streaming("in", None, tx);
+        tokio::pin!(run);
+        let mut got = Vec::new();
+        let mut end = None;
+        loop {
+            tokio::select! {
+                p = rx.recv() => match p {
+                    Some(p) => got.push((p, started.elapsed().as_millis())),
+                    None => break,
+                },
+                e = &mut run, if end.is_none() => end = Some(e),
+            }
+        }
+        (got, end.expect("run finished"))
+    }
+
+    #[tokio::test]
+    async fn streaming_delivers_pieces_while_the_command_runs() {
+        let (got, end) = collect_stream("printf 'One.'; sleep 0.4; printf ' Two.'", 5000).await;
+        assert!(matches!(end, super::StreamEnd::Done));
+        let text: String = got.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(text, "One. Two.");
+        assert!(got.len() >= 2, "{got:?}");
+        assert!(got[0].1 < 300, "first piece arrived after {}ms", got[0].1);
+    }
+
+    #[tokio::test]
+    async fn streaming_tells_the_command_and_passes_stdin() {
+        let (got, _) = collect_stream("printf '%s:' \"$VOXTYPE_STREAM_OUTPUT\"; cat", 5000).await;
+        let text: String = got.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(text, "1:in");
+    }
+
+    #[tokio::test]
+    async fn streaming_keeps_a_split_character_whole() {
+        // "é" is 0xC3 0xA9; the two bytes arrive in separate writes.
+        let (got, end) =
+            collect_stream("printf 'caf\\303'; sleep 0.2; printf '\\251!'", 5000).await;
+        assert!(matches!(end, super::StreamEnd::Done));
+        let text: String = got.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(text, "café!");
+    }
+
+    #[tokio::test]
+    async fn streaming_reports_failure_after_output() {
+        let (got, end) = collect_stream("printf 'Part.'; exit 3", 5000).await;
+        assert_eq!(got.len(), 1);
+        assert!(matches!(
+            end,
+            super::StreamEnd::Failed(PostProcessError::NonZeroExit { code: Some(3), .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn streaming_times_out_and_keeps_what_arrived() {
+        let (got, end) = collect_stream("printf 'Part.'; sleep 5; printf 'never'", 400).await;
+        let text: String = got.into_iter().map(|(p, _)| p).collect();
+        assert_eq!(text, "Part.");
+        assert!(matches!(end, super::StreamEnd::Failed(PostProcessError::Timeout(_))));
+    }
+
+    #[tokio::test]
+    async fn batch_runs_do_not_see_the_streaming_flag() {
+        let config = make_config("printf '%s' \"${VOXTYPE_STREAM_OUTPUT:-unset}\"", 5000);
+        let processor = PostProcessor::new(&config);
+        assert_eq!(processor.process("x").await, "unset");
+    }
+
 }
