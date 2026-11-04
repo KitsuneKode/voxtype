@@ -1158,6 +1158,17 @@ pub struct Daemon {
     /// Set only when that option is on; taken by `end_streaming` and
     /// dropped by every cut, so it never outlives its session.
     streaming_final_audio: Option<Vec<f32>>,
+    /// Background decode of the pieces of an on_stop streaming session that
+    /// are already complete (see `transcribe::incremental`). Started with
+    /// the capture when the final pass is on; consumed at stop.
+    incremental_final_pass: Option<crate::transcribe::incremental::IncrementalFinalPass>,
+    /// The final pass of a stopped on_stop session, started the moment the
+    /// mic closes (the live preview is cancelled rather than drained, since
+    /// its text would be replaced anyway). Awaited by `end_streaming`;
+    /// `None` result = keep the streamed text.
+    /// Yields the final text (`None` = keep the streamed text) and the
+    /// recording, which `end_streaming` may still need for the VAD gate.
+    final_pass_task: Option<tokio::task::JoinHandle<(Option<String>, Arc<Vec<f32>>)>>,
     /// OSD child supervisor task. Holds the JoinHandle so dropping it (on
     /// daemon shutdown) kill_on_drop's the spawned voxtype-osd process.
     osd_supervisor_task: Option<tokio::task::JoinHandle<()>>,
@@ -1318,6 +1329,8 @@ impl Daemon {
             streaming_preview: None,
             streaming_feed: None,
             streaming_final_audio: None,
+            incremental_final_pass: None,
+            final_pass_task: None,
             osd_supervisor_task: None,
             model_manager: None,
             model_load_task: None,
@@ -1765,10 +1778,12 @@ impl Daemon {
     /// keybinding) and the silence-timeout auto-stop, which need identical
     /// per-state-variant stop behavior; the only difference between them is
     /// *why* the stop fired, not what happens next.
+    #[allow(clippy::too_many_arguments)]
     async fn stop_active_recording(
         &mut self,
         state: &mut State,
         audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
         streaming_session: &mut Option<StreamingSession>,
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
         eager_transcriber: &mut Option<Arc<dyn Transcriber>>,
@@ -1799,7 +1814,7 @@ impl Daemon {
             } else {
                 tracing::info!("Stopping streaming session; closing capture and disowning session");
             }
-            self.stop_streaming_capture(audio_capture, silent).await;
+            self.stop_streaming_capture(audio_capture, streaming_handle, silent).await;
             if !silent {
                 // Drop the typing surface synchronously so any
                 // Final/Partial events the backend emits while
@@ -1929,8 +1944,17 @@ impl Daemon {
     async fn stop_streaming_capture(
         &mut self,
         audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
         drain: bool,
     ) {
+        // A second stop while the session is still closing (the pill
+        // already says "transcribing", and the toggle script sends a stop
+        // there) has nothing left to stop. Without this it would replace the
+        // recording kept for the final pass with an empty one.
+        if audio_capture.is_none() {
+            tracing::debug!("Stop while the streaming session is already closing; ignored");
+            return;
+        }
         let feed = if drain {
             self.streaming_feed.take()
         } else {
@@ -1943,6 +1967,68 @@ impl Daemon {
             None => Vec::new(),
         };
         self.restore_recording_media();
+
+        // Deferred-commit sessions get their transcript from the final pass.
+        // Start it now and cancel the live preview instead of draining it:
+        // the streamed text would be replaced anyway, and on a CPU the
+        // drain is seconds of decoding the stream fell behind on. The OSD
+        // moves to "transcribing" at once instead of after the drain.
+        let secs = captured.len() as f32 / self.config.audio.sample_rate as f32;
+        let max_secs = self
+            .config
+            .parakeet
+            .as_ref()
+            .map_or(0.0, |p| p.streaming_final_pass_max_secs);
+        let on_stop = self.config.output.streaming_commit == StreamingCommit::OnStop;
+        if drain && on_stop && self.final_pass_enabled() && !captured.is_empty() && secs <= max_secs {
+            if let Some(transcriber) = self.transcriber_preloaded.clone() {
+                if let Some(h) = streaming_handle.as_mut() {
+                    let (tx, _rx) = tokio::sync::oneshot::channel();
+                    let _ = std::mem::replace(&mut h.cancel, tx).send(());
+                }
+                drop(feed);
+                let incremental = self.incremental_final_pass.take();
+                let captured = Arc::new(captured);
+                self.final_pass_task = Some(tokio::spawn(async move {
+                    let started = std::time::Instant::now();
+                    let result = match incremental {
+                        Some(pass) => pass.finish(captured.clone()).await,
+                        None => {
+                            let audio = captured.clone();
+                            tokio::task::spawn_blocking(move || transcriber.transcribe(&audio))
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Err(crate::error::TranscribeError::InferenceFailed(e.to_string()))
+                                })
+                        }
+                    };
+                    let text = match result {
+                        Ok(text) if !text.trim().is_empty() => {
+                            tracing::info!(
+                                "Final pass decoded {:.1}s in {}ms after stop",
+                                secs,
+                                started.elapsed().as_millis()
+                            );
+                            Some(text.trim().to_string())
+                        }
+                        Ok(_) => None,
+                        Err(e) => {
+                            tracing::warn!("Final pass failed, keeping streamed text: {}", e);
+                            None
+                        }
+                    };
+                    (text, captured)
+                }));
+                self.update_state("transcribing");
+                return;
+            }
+        }
+        if let Some(pass) = self.incremental_final_pass.take() {
+            pass.abandon();
+        }
+        if drain {
+            self.update_state("transcribing");
+        }
 
         if let Some(feed) = feed {
             let from = feed
@@ -1963,6 +2049,48 @@ impl Daemon {
         }
         if drain && self.final_pass_enabled() {
             self.streaming_final_audio = Some(captured);
+        }
+    }
+
+    /// Start the background final pass for an on_stop streaming session
+    /// when it is on, tapping the capture's chunk stream. Returns the stream
+    /// the rest of the pipeline should read.
+    fn start_incremental_final_pass(
+        &mut self,
+        chunk_rx: tokio::sync::mpsc::Receiver<Vec<f32>>,
+    ) -> tokio::sync::mpsc::Receiver<Vec<f32>> {
+        if let Some(old) = self.incremental_final_pass.take() {
+            old.abandon();
+        }
+        let segment_secs = self
+            .config
+            .parakeet
+            .as_ref()
+            .map_or(0.0, |p| p.final_pass_segment_secs);
+        let on_stop = self.config.output.streaming_commit == StreamingCommit::OnStop;
+        let transcriber = self.transcriber_preloaded.clone();
+        match transcriber {
+            Some(t) if on_stop && segment_secs > 0.0 && self.final_pass_enabled() => {
+                let (pass, rx) = crate::transcribe::incremental::IncrementalFinalPass::start(
+                    chunk_rx,
+                    t,
+                    self.config.audio.sample_rate,
+                    segment_secs,
+                );
+                self.incremental_final_pass = Some(pass);
+                rx
+            }
+            _ => chunk_rx,
+        }
+    }
+
+    /// Drop the final pass work of the current session (cancel/teardown).
+    fn abandon_final_pass(&mut self) {
+        if let Some(pass) = self.incremental_final_pass.take() {
+            pass.abandon();
+        }
+        if let Some(task) = self.final_pass_task.take() {
+            task.abort();
         }
     }
 
@@ -2059,12 +2187,47 @@ impl Daemon {
             }
             // Deltas carry their leading word-boundary space; batch
             // transcribers return trimmed text, so match that.
-            let text = streaming_session
+            let streamed = streaming_session
                 .as_ref()
                 .map(|s| s.finalized_text().trim().to_string())
                 .unwrap_or_default();
             *streaming_session = None;
             *streaming_chain = None;
+
+            // A final pass started at stop decides the transcript. The
+            // stream was cancelled rather than flushed, so a short utterance
+            // can have no streamed text while the final pass has it. In that
+            // case the recording has to pass the same VAD gate a batch
+            // recording does, so a stray tap still never becomes text.
+            let mut text = streamed;
+            if let Some(task) = self.final_pass_task.take() {
+                let (final_text, audio) = task.await.unwrap_or_else(|_| (None, Arc::new(Vec::new())));
+                if let Some(final_text) = final_text {
+                    if text.is_empty() {
+                        let no_speech = match &self.vad {
+                            Some(vad) => {
+                                let vad = vad.clone();
+                                let audio = audio.clone();
+                                match tokio::task::spawn_blocking(move || vad.detect(&audio)).await {
+                                    Ok(Ok(r)) if !r.has_speech => Some(r),
+                                    _ => None,
+                                }
+                            }
+                            None => None,
+                        };
+                        if let Some(result) = no_speech {
+                            self.report_no_speech(&result).await;
+                            if let Some(mut p) = preview {
+                                p.clear();
+                            }
+                            self.publish_empty_outcome();
+                            self.reset_to_idle(state).await;
+                            return;
+                        }
+                    }
+                    text = final_text;
+                }
+            }
 
             if text.is_empty() {
                 tracing::debug!("Streaming session produced no text");
@@ -2094,6 +2257,7 @@ impl Daemon {
         if let Some(mut p) = preview {
             p.clear();
         }
+        self.abandon_final_pass();
 
         // File-output sessions (`--file=path`) never typed anything as
         // they went — see the event pump's `file_output` branch — so the
@@ -2332,6 +2496,11 @@ impl Daemon {
             h.task
         });
         self.cut_streaming_audio();
+        self.abandon_final_pass();
+        // Show the cancel right away: the OSD and the cancel sound should
+        // not wait for the mic to close or the backend to wind down.
+        self.update_state("idle");
+        self.play_feedback(SoundEvent::Cancelled);
         if let Some(mut c) = audio_capture.take() {
             let _ = c.stop().await;
         }
@@ -2353,8 +2522,6 @@ impl Daemon {
 
         discard_recording_overrides();
         *state = State::Idle;
-        self.update_state("idle");
-        self.play_feedback(SoundEvent::Cancelled);
 
         if let Some(cmd) = &self.config.output.post_output_command {
             if let Err(e) = output::run_hook(cmd, "post_output").await {
@@ -2397,9 +2564,14 @@ impl Daemon {
         match audio::create_capture(&self.config.audio) {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
+                    let chunk_rx = self.start_incremental_final_pass(chunk_rx);
                     // Bounded; backed-up streaming backend drops chunks
-                    // rather than back-pressuring the capture.
-                    let (streaming_tx, streaming_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(64);
+                    // rather than back-pressuring the capture. Deep enough
+                    // (~2048 capture chunks, tens of seconds) that the
+                    // preview only lags and catches up, without losing audio,
+                    // while the final pass holds the shared model to decode
+                    // a finished piece in the background.
+                    let (streaming_tx, streaming_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(2048);
                     let pumped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
                     let feed = StreamingFeed {
                         tx: streaming_tx.clone(),
@@ -4474,7 +4646,7 @@ impl Daemon {
                             tracing::debug!("Received HotkeyEvent::Released (push-to-talk), state.is_recording() = {}", state.is_recording());
                             if state.is_streaming() {
                                 let silent = state.is_silent_streaming();
-                                self.stop_streaming_capture(&mut audio_capture, silent).await;
+                                self.stop_streaming_capture(&mut audio_capture, &mut streaming_handle, silent).await;
                                 if silent {
                                     // Nothing was typed; the flushed tail is
                                     // part of what end_streaming delivers.
@@ -4624,7 +4796,7 @@ impl Daemon {
                             } else if state.is_streaming() {
                                 tracing::info!("Toggle stop while streaming; closing capture");
                                 let silent = state.is_silent_streaming();
-                                self.stop_streaming_capture(&mut audio_capture, silent).await;
+                                self.stop_streaming_capture(&mut audio_capture, &mut streaming_handle, silent).await;
                             } else if let State::Recording { model_override: current_model_override, .. } = &state {
                                 let model_override = current_model_override.clone();
 
@@ -4880,6 +5052,7 @@ impl Daemon {
                                     self.stop_active_recording(
                                         &mut state,
                                         &mut audio_capture,
+                                        &mut streaming_handle,
                                         &mut streaming_session,
                                         &mut streaming_chain,
                                         &mut eager_transcriber,
@@ -4914,7 +5087,7 @@ impl Daemon {
                                 max_duration.as_secs_f32()
                             );
                             let silent = state.is_silent_streaming();
-                            self.stop_streaming_capture(&mut audio_capture, silent).await;
+                            self.stop_streaming_capture(&mut audio_capture, &mut streaming_handle, silent).await;
                             continue;
                         }
 
@@ -5088,6 +5261,7 @@ impl Daemon {
                     self.stop_active_recording(
                         &mut state,
                         &mut audio_capture,
+                        &mut streaming_handle,
                         &mut streaming_session,
                         &mut streaming_chain,
                         &mut eager_transcriber,

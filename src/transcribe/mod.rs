@@ -16,6 +16,8 @@
 pub mod cli;
 #[cfg(feature = "parakeet")]
 pub mod parakeet_streaming;
+pub mod incremental;
+pub mod segment;
 pub mod remote;
 pub mod sliding_window;
 pub mod soniox;

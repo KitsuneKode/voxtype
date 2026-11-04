@@ -343,3 +343,7 @@ required-features = ["cohere"]
 # if needed) once that PR merges and ships in a crates.io release.
 [patch.crates-io]
 openvino-genai = { git = "https://github.com/voxtype/openvino-rs", branch = "whisper-pipeline-with-properties" }
+
+[[example]]
+name = "parakeet_bench"
+required-features = ["parakeet"]

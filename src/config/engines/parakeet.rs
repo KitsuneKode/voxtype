@@ -74,6 +74,52 @@ pub struct ParakeetConfig {
     /// grows with length; longer sessions keep the streamed text.
     #[serde(default = "default_streaming_final_pass_max_secs")]
     pub streaming_final_pass_max_secs: f32,
+
+    /// Longest piece, in seconds, the final pass decodes at once. Longer
+    /// recordings are split at their pauses and each piece is decoded with
+    /// its own full context. Past about a minute of audio the offline pass
+    /// starts dropping punctuation and its cost grows faster than the audio,
+    /// so splitting is both more accurate and faster. Pieces that finish
+    /// while the user is still speaking are decoded in the background, so
+    /// the wait at stop is one piece at most however long the recording.
+    /// 0 decodes the whole recording at once. Default: 45.
+    #[serde(default = "default_final_pass_segment_secs")]
+    pub final_pass_segment_secs: f32,
+
+    /// Settings that apply only when the model runs on the CPU (no GPU
+    /// execution provider). The final transcript comes from the same model
+    /// either way; these trade nothing in it for speed. See
+    /// [`ParakeetCpuConfig`].
+    #[serde(default)]
+    pub cpu: ParakeetCpuConfig,
+}
+
+/// `[parakeet.cpu]`: overrides used only on the CPU execution provider.
+///
+/// A GPU makes the live preview stream nearly free; on the CPU it is the
+/// most expensive part of a session (every chunk re-encodes its whole left
+/// context), and when it falls behind real time the stop waits for it.
+/// These keys give the preview a lighter streaming profile without touching
+/// the final pass, which decodes the whole recording with full context.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+pub struct ParakeetCpuConfig {
+    /// ONNX Runtime intra-op threads for the final pass. Unset uses one per
+    /// performance core (efficiency cores and hyperthreads make it slower).
+    #[serde(default)]
+    pub threads: Option<usize>,
+
+
+    /// Preview chunk length on CPU (overrides `streaming_chunk_secs`).
+    #[serde(default)]
+    pub streaming_chunk_secs: Option<f32>,
+
+    /// Preview left context on CPU (overrides `streaming_left_context_secs`).
+    #[serde(default)]
+    pub streaming_left_context_secs: Option<f32>,
+
+    /// Preview lookahead on CPU (overrides `streaming_right_context_secs`).
+    #[serde(default)]
+    pub streaming_right_context_secs: Option<f32>,
 }
 
 // parakeet-rs validates that each context length maps to a mel-frame count
@@ -95,6 +141,10 @@ fn default_streaming_final_pass_max_secs() -> f32 {
     180.0
 }
 
+fn default_final_pass_segment_secs() -> f32 {
+    45.0
+}
+
 impl Default for ParakeetConfig {
     fn default() -> Self {
         Self {
@@ -107,6 +157,8 @@ impl Default for ParakeetConfig {
             streaming_right_context_secs: default_streaming_right_context_secs(),
             streaming_final_pass: false,
             streaming_final_pass_max_secs: default_streaming_final_pass_max_secs(),
+            final_pass_segment_secs: default_final_pass_segment_secs(),
+            cpu: ParakeetCpuConfig::default(),
         }
     }
 }

@@ -29,7 +29,7 @@ pub use audio::{AudioConfig, AudioFeedbackConfig};
 pub use default_config::{default_config_content, DEFAULT_CONFIG};
 pub use engines::{
     CohereConfig, DolphinConfig, MoonshineConfig, OmnilingualConfig, OpenVinoConfig,
-    ParaformerConfig, ParakeetConfig, ParakeetModelType, SenseVoiceConfig, SonioxConfig,
+    ParaformerConfig, ParakeetConfig, ParakeetCpuConfig, ParakeetModelType, SenseVoiceConfig, SonioxConfig,
     TranscriptionEngine,
 };
 pub use hotkey::{ActivationMode, HotkeyConfig};

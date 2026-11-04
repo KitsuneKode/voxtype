@@ -56,7 +56,7 @@ impl ParakeetTranscriber {
         let start = std::time::Instant::now();
 
         // Configure execution provider based on feature flags
-        let exec_config = build_execution_config();
+        let exec_config = Some(final_execution_config(config));
 
         let model = match model_type {
             ParakeetModelType::Ctc => {
@@ -283,6 +283,70 @@ impl Transcriber for ParakeetTranscriber {
         );
 
         Ok(segments)
+    }
+}
+
+/// Execution config for the model that produces the delivered transcript
+/// (batch transcription and the streaming final pass): the GPU provider when
+/// one is usable, otherwise the CPU with `[parakeet.cpu] threads` (default:
+/// one per performance core).
+pub(super) fn final_execution_config(config: &ParakeetConfig) -> ExecutionConfig {
+    match build_execution_config() {
+        Some(gpu) => gpu,
+        None => {
+            let threads = config.cpu.threads.unwrap_or_else(performance_cores);
+            tracing::info!("Parakeet on CPU with {} threads", threads);
+            ExecutionConfig::new().with_intra_threads(threads)
+        }
+    }
+}
+
+/// Physical cores of the fastest tier. On hybrid CPUs (Intel P/E cores) an
+/// ONNX Runtime thread pool that spills onto efficiency cores or
+/// hyperthreads gets slower, not faster: every op waits for its slowest
+/// worker. Measured on an i5-13450HX (6P+4E): 6 threads 52 ms per second of
+/// audio, 4 threads 66, 12 threads 135.
+pub(super) fn performance_cores() -> usize {
+    let fallback = || num_cpus::get_physical().clamp(1, 8);
+    let Ok(entries) = std::fs::read_dir("/sys/devices/system/cpu") else {
+        return fallback();
+    };
+    let mut cpus = Vec::new();
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) || name.len() == 3 {
+            continue;
+        }
+        let read = |rel: &str| {
+            std::fs::read_to_string(e.path().join(rel))
+                .ok()
+                .and_then(|v| v.trim().parse::<u64>().ok())
+        };
+        if let (Some(freq), Some(core), Some(pkg)) = (
+            read("cpufreq/cpuinfo_max_freq"),
+            read("topology/core_id"),
+            read("topology/physical_package_id"),
+        ) {
+            cpus.push((freq, pkg, core));
+        }
+    }
+    let Some(top) = cpus.iter().map(|c| c.0).max() else {
+        return fallback();
+    };
+    // Favored-core boost makes P-cores differ by a few percent; E-cores are
+    // well below that.
+    let mut cores: Vec<(u64, u64)> = cpus
+        .iter()
+        .filter(|c| c.0 * 10 >= top * 9)
+        .map(|c| (c.1, c.2))
+        .collect();
+    cores.sort_unstable();
+    cores.dedup();
+    if cores.is_empty() {
+        fallback()
+    } else {
+        cores.len()
     }
 }
 

@@ -33,19 +33,23 @@
 //! commit happening at hotkey release. Mid-recording incremental typing
 //! (commit-on-pause) is a follow-up once VAD-segmentation lands.
 
-use super::parakeet::{build_execution_config, resolve_model_path};
+use super::parakeet::{build_execution_config, performance_cores, resolve_model_path};
 use super::streaming::{StreamHandle, StreamingEvent, StreamingTranscriber};
 use super::{TimedSegment, Transcriber};
 use crate::config::ParakeetConfig;
 use crate::error::TranscribeError;
-use parakeet_rs::{ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
+use parakeet_rs::{ExecutionConfig, ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
 use std::sync::Mutex;
 use tokio::sync::{mpsc, oneshot};
 
 /// Streaming-capable Parakeet transcriber backed by `ParakeetUnified`.
 pub struct ParakeetStreamingTranscriber {
-    /// Shared model weights. Cloned cheaply for each streaming session.
+    /// Shared model weights. Cloned cheaply for each streaming session; the
+    /// live preview and the final pass run the same model.
     handle: ParakeetUnifiedHandle,
+    /// Longest piece the batch/final pass decodes at once
+    /// (`final_pass_segment_secs`); 0 = whole recording.
+    segment_secs: f32,
     /// Streaming-config snapshot used both for batch (so the handle's
     /// `from_shared_with_streaming_config` succeeds) and for spawning each
     /// streaming task.
@@ -100,8 +104,14 @@ impl ParakeetStreamingTranscriber {
         );
         let start = std::time::Instant::now();
 
-        let exec_config = build_execution_config();
-        let handle = ParakeetUnifiedHandle::load(&model_path, exec_config).map_err(|e| {
+        let gpu = build_execution_config();
+        let on_cpu = gpu.is_none();
+        let final_exec = gpu.unwrap_or_else(|| {
+            let threads = config.cpu.threads.unwrap_or_else(performance_cores);
+            tracing::info!("Parakeet on CPU with {} threads", threads);
+            ExecutionConfig::new().with_intra_threads(threads)
+        });
+        let handle = ParakeetUnifiedHandle::load(&model_path, Some(final_exec)).map_err(|e| {
             TranscribeError::InitFailed(format!(
                 "Parakeet streaming (ParakeetUnified) init failed: {}\n\n\
                 Streaming requires a TDT v3 model directory containing tokenizer.model.\n\
@@ -111,10 +121,16 @@ impl ParakeetStreamingTranscriber {
             ))
         })?;
 
+        // On the CPU the preview uses a lighter streaming profile
+        // (`[parakeet.cpu] streaming_*`): less left context, so each chunk
+        // re-encodes less. The final pass sees the whole recording either
+        // way, so the delivered text does not depend on it.
+        let cpu = &config.cpu;
+        let pick = |cpu_value: Option<f32>, value: f32| if on_cpu { cpu_value.unwrap_or(value) } else { value };
         let streaming_config = UnifiedStreamingConfig {
-            chunk_secs: config.streaming_chunk_secs,
-            left_context_secs: config.streaming_left_context_secs,
-            right_context_secs: config.streaming_right_context_secs,
+            chunk_secs: pick(cpu.streaming_chunk_secs, config.streaming_chunk_secs),
+            left_context_secs: pick(cpu.streaming_left_context_secs, config.streaming_left_context_secs),
+            right_context_secs: pick(cpu.streaming_right_context_secs, config.streaming_right_context_secs),
         }
         .validate()
         .map_err(|e| {
@@ -145,6 +161,7 @@ impl ParakeetStreamingTranscriber {
 
         Ok(Self {
             handle,
+            segment_secs: config.final_pass_segment_secs,
             streaming_config,
             batch: Mutex::new(batch),
         })
@@ -163,17 +180,30 @@ impl Transcriber for ParakeetStreamingTranscriber {
             TranscribeError::InferenceFailed(format!("Failed to lock ParakeetUnified mutex: {}", e))
         })?;
 
-        // Reset between batch calls so accumulated state from a prior
-        // streaming or batch invocation doesn't bleed in.
-        batch.reset();
+        // Long recordings are decoded piece by piece, cut at pauses: see
+        // `segment::plan_segments`. A recording shorter than one piece is a
+        // single full-context decode, exactly as before.
+        let segments = if self.segment_secs > 0.0 {
+            super::segment::plan_segments(samples, 16000, self.segment_secs)
+        } else {
+            vec![(0, samples.len())]
+        };
+        let mut parts = Vec::with_capacity(segments.len());
+        for (start, end) in segments {
+            // transcribe_audio resets the instance first, so no state from
+            // a prior piece or call bleeds in.
+            let piece = batch
+                .transcribe_audio(samples[start..end].to_vec(), 16000, 1)
+                .map_err(|e| {
+                    TranscribeError::InferenceFailed(format!("ParakeetUnified inference failed: {}", e))
+                })?;
+            let piece = piece.trim();
+            if !piece.is_empty() {
+                parts.push(piece.to_string());
+            }
+        }
 
-        let result = batch
-            .transcribe_audio(samples.to_vec(), 16000, 1)
-            .map_err(|e| {
-                TranscribeError::InferenceFailed(format!("ParakeetUnified inference failed: {}", e))
-            })?;
-
-        Ok(result.trim().to_string())
+        Ok(parts.join(" "))
     }
 
     fn transcribe_timed(&self, _samples: &[f32]) -> Result<Vec<TimedSegment>, TranscribeError> {
@@ -215,11 +245,14 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
             let runtime = tokio::runtime::Handle::current();
 
             loop {
-                // Check cancel without blocking.
+                // Check cancel without blocking. A cancelled stream ends at
+                // once, without decoding its buffered tail: its text is
+                // being discarded (cancel) or replaced by the final pass.
                 match cancel_rx.try_recv() {
                     Ok(()) => {
                         tracing::debug!("Parakeet streaming session cancelled");
-                        break;
+                        let _ = runtime.block_on(events_tx.send(StreamingEvent::Ended));
+                        return Ok(());
                     }
                     Err(oneshot::error::TryRecvError::Closed) => {
                         // Sender dropped without sending; treat as cancel.

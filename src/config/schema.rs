@@ -1926,6 +1926,61 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     .for_engine("parakeet")
     .gated("parakeet"),
     spec(
+        "parakeet.final_pass_segment_secs",
+        "parakeet",
+        "final_pass_segment_secs",
+        KeyType::Float { min: 0.0, max: 3600.0 },
+        "Advanced",
+        "Final pass piece length",
+        "Split longer recordings at pauses into pieces of at most this many seconds for the final pass. 0 decodes all at once.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.cpu.threads",
+        "parakeet.cpu",
+        "threads",
+        KeyType::Int { min: 1, max: 256 },
+        "Advanced",
+        "CPU threads",
+        "ONNX Runtime threads for the final pass on CPU. Unset uses one per performance core.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.cpu.streaming_chunk_secs",
+        "parakeet.cpu",
+        "streaming_chunk_secs",
+        KeyType::Float { min: 0.0, max: 60.0 },
+        "Advanced",
+        "CPU streaming chunk",
+        "Preview chunk seconds on CPU. Unset uses streaming_chunk_secs.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.cpu.streaming_left_context_secs",
+        "parakeet.cpu",
+        "streaming_left_context_secs",
+        KeyType::Float { min: 0.0, max: 60.0 },
+        "Advanced",
+        "CPU streaming left context",
+        "Preview left context seconds on CPU. Unset uses streaming_left_context_secs.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.cpu.streaming_right_context_secs",
+        "parakeet.cpu",
+        "streaming_right_context_secs",
+        KeyType::Float { min: 0.0, max: 60.0 },
+        "Advanced",
+        "CPU streaming lookahead",
+        "Preview lookahead seconds on CPU. Unset uses streaming_right_context_secs.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
         "streaming.interval_secs",
         "streaming",
         "interval_secs",
@@ -2422,8 +2477,11 @@ fn ensure_required_siblings(editor: &mut ConfigEditor, spec: &KeySpec) {
     if engine == "whisper" || spec.field == "model" || default.is_empty() {
         return;
     }
-    if editor.get_string(spec.table, "model").is_none() {
-        editor.set_string(spec.table, "model", default);
+    // Nested tables (`parakeet.cpu`) belong to the engine's root table,
+    // which is where `model` lives.
+    let root = spec.table.split('.').next().unwrap_or(spec.table);
+    if editor.get_string(root, "model").is_none() {
+        editor.set_string(root, "model", default);
     }
 }
 
@@ -2753,6 +2811,11 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.streaming_right_context_secs" => json!(pk().streaming_right_context_secs),
         "parakeet.streaming_final_pass" => json!(pk().streaming_final_pass),
         "parakeet.streaming_final_pass_max_secs" => json!(pk().streaming_final_pass_max_secs),
+        "parakeet.final_pass_segment_secs" => json!(pk().final_pass_segment_secs),
+        "parakeet.cpu.threads" => pk().cpu.threads.map_or(Json::Null, |n| json!(n)),
+        "parakeet.cpu.streaming_chunk_secs" => pk().cpu.streaming_chunk_secs.map_or(Json::Null, |v| f32_json(v)),
+        "parakeet.cpu.streaming_left_context_secs" => pk().cpu.streaming_left_context_secs.map_or(Json::Null, |v| f32_json(v)),
+        "parakeet.cpu.streaming_right_context_secs" => pk().cpu.streaming_right_context_secs.map_or(Json::Null, |v| f32_json(v)),
         "streaming.interval_secs" => json!(cfg.streaming.unwrap_or_default().interval_secs),
         "streaming.max_buffer_secs" => json!(cfg.streaming.unwrap_or_default().max_buffer_secs),
         "streaming.min_speech_rms" => json!(cfg.streaming.unwrap_or_default().min_speech_rms),
