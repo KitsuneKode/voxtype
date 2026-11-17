@@ -346,9 +346,23 @@ pub(super) fn final_execution_config(config: &ParakeetConfig) -> ExecutionConfig
             // one per performance core.
             let threads = config.cpu.threads.or(config.threads).unwrap_or_else(performance_cores);
             tracing::info!("Parakeet on CPU with {} threads", threads);
-            ExecutionConfig::new().with_intra_threads(threads)
+            no_spin(ExecutionConfig::new().with_intra_threads(threads))
         }
     }
+}
+
+/// ONNX Runtime's worker threads busy-wait for their next job by default.
+/// Streaming runs the model every chunk (a third of a second), so they never
+/// got to sleep: 200 s of CPU across 9 threads for 70 s of dictation on the
+/// GPU path, the fans up for something the GPU was doing. With spinning off
+/// they block between runs, and a run starts microseconds later instead.
+pub(super) fn no_spin(config: ExecutionConfig) -> ExecutionConfig {
+    config.with_custom_configure(|builder| {
+        builder
+            .with_intra_op_spinning(false)
+            .and_then(|b| b.with_inter_op_spinning(false))
+            .map_err(Into::into)
+    })
 }
 
 /// Physical cores of the fastest tier. On hybrid CPUs (Intel P/E cores) an
@@ -404,9 +418,9 @@ pub(super) fn performance_cores() -> usize {
 /// features select, with `threads` intra-op threads when it is set. Unset
 /// keeps parakeet-rs's default of 4.
 pub(super) fn build_execution_config(threads: Option<usize>) -> Option<ExecutionConfig> {
-    let config = provider_execution_config();
+    let config = provider_execution_config().map(no_spin);
     match threads {
-        Some(n) => Some(config.unwrap_or_default().with_intra_threads(n)),
+        Some(n) => Some(config.unwrap_or_else(|| no_spin(ExecutionConfig::default())).with_intra_threads(n)),
         None => config,
     }
 }

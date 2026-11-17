@@ -109,7 +109,7 @@ impl ParakeetStreamingTranscriber {
         let final_exec = gpu.unwrap_or_else(|| {
             let threads = config.cpu.threads.or(config.threads).unwrap_or_else(performance_cores);
             tracing::info!("Parakeet on CPU with {} threads", threads);
-            ExecutionConfig::new().with_intra_threads(threads)
+            super::parakeet::no_spin(ExecutionConfig::new().with_intra_threads(threads))
         });
         let handle = ParakeetUnifiedHandle::load(&model_path, Some(final_exec)).map_err(|e| {
             TranscribeError::InitFailed(format!(
