@@ -2055,6 +2055,49 @@ impl Daemon {
         }
     }
 
+    /// Keep the take that was just stopped, 16 kHz mono, so a bad cleanup
+    /// can be replayed. Overwrites the previous one. A failure here does
+    /// not affect the transcript.
+    fn write_last_take(samples: &[f32], sample_rate: u32) {
+        if samples.is_empty() || sample_rate == 0 {
+            return;
+        }
+        let Some(base) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return;
+        };
+        if base.is_empty() {
+            return;
+        }
+        let dir = PathBuf::from(base).join("voxtype");
+        if std::fs::create_dir_all(&dir).is_err() {
+            return;
+        }
+        let tmp = dir.join("last_take.wav.tmp");
+        let dest = dir.join("last_take.wav");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let written = (|| -> std::result::Result<(), hound::Error> {
+            let mut writer = hound::WavWriter::create(&tmp, spec)?;
+            for &sample in samples {
+                let scaled = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                writer.write_sample(scaled)?;
+            }
+            writer.finalize()
+        })();
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!("could not write {}", dest.display());
+            return;
+        }
+        if std::fs::rename(&tmp, &dest).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
     /// Early-stop the streaming capture: cut audio flow to the backend,
     /// start the OSD silence pump so the visualizer stays alive during
     /// drain, and stop the mic. Leaves `streaming_session`/`_chain` for
@@ -2117,17 +2160,42 @@ impl Daemon {
                 drop(feed);
                 let incremental = self.incremental_final_pass.take();
                 let captured = Arc::new(captured);
+                let wav = Arc::clone(&captured);
+                let rate = self.config.audio.sample_rate;
+                tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
+                let transcriber_retry = transcriber.clone();
                 self.final_pass_task = Some(tokio::spawn(async move {
                     let started = std::time::Instant::now();
-                    let result = match incremental {
+                    let first = match incremental {
                         Some(pass) => pass.finish(captured.clone()).await,
                         None => {
                             let audio = captured.clone();
-                            tokio::task::spawn_blocking(move || transcriber.transcribe(&audio))
+                            let worker = transcriber.clone();
+                            tokio::task::spawn_blocking(move || worker.transcribe(&audio))
                                 .await
                                 .unwrap_or_else(|e| {
                                     Err(crate::error::TranscribeError::InferenceFailed(e.to_string()))
                                 })
+                        }
+                    };
+                    // One failure retries the whole recording once. The streamed
+                    // text is the fallback only when that retry fails too. An
+                    // empty success is silence, not a failure, so it is not retried.
+                    let result = match first {
+                        Ok(text) => Ok(text),
+                        Err(e) => {
+                            tracing::warn!(
+                                "Final pass failed, retrying the whole take once: {}",
+                                e
+                            );
+                            let audio = captured.clone();
+                            tokio::task::spawn_blocking(move || {
+                                transcriber_retry.transcribe(&audio)
+                            })
+                            .await
+                            .unwrap_or_else(|err| {
+                                Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
+                            })
                         }
                     };
                     let text = match result {
@@ -2141,7 +2209,7 @@ impl Daemon {
                         }
                         Ok(_) => None,
                         Err(e) => {
-                            tracing::warn!("Final pass failed, keeping streamed text: {}", e);
+                            tracing::warn!("Final pass retry failed, keeping streamed text: {}", e);
                             None
                         }
                     };
@@ -2245,9 +2313,30 @@ impl Daemon {
         }
         let transcriber = self.transcriber_preloaded.clone()?;
         let started = std::time::Instant::now();
-        let result = tokio::task::spawn_blocking(move || transcriber.transcribe(&audio)).await;
+        let audio_retry = audio.clone();
+        let transcriber_retry = transcriber.clone();
+        let first = tokio::task::spawn_blocking(move || transcriber.transcribe(&audio)).await;
+        let result = match first {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(e)) => {
+                tracing::warn!("Final pass failed, retrying the whole take once: {}", e);
+                tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio_retry))
+                    .await
+                    .unwrap_or_else(|err| {
+                        Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
+                    })
+            }
+            Err(e) => {
+                tracing::warn!("Final pass task failed, retrying the whole take once: {}", e);
+                tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio_retry))
+                    .await
+                    .unwrap_or_else(|err| {
+                        Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
+                    })
+            }
+        };
         match result {
-            Ok(Ok(text)) if !text.trim().is_empty() => {
+            Ok(text) if !text.trim().is_empty() => {
                 tracing::info!(
                     "Final pass decoded {:.1}s in {}ms",
                     secs,
@@ -2255,13 +2344,9 @@ impl Daemon {
                 );
                 Some(text.trim().to_string())
             }
-            Ok(Ok(_)) => None,
-            Ok(Err(e)) => {
-                tracing::warn!("Final pass failed, keeping streamed text: {}", e);
-                None
-            }
+            Ok(_) => None,
             Err(e) => {
-                tracing::warn!("Final pass task failed, keeping streamed text: {}", e);
+                tracing::warn!("Final pass retry failed, keeping streamed text: {}", e);
                 None
             }
         }
@@ -2281,6 +2366,11 @@ impl Daemon {
         self.restore_recording_media();
         self.streaming_feed = None;
         let final_audio = self.streaming_final_audio.take();
+        if let Some(ref audio) = final_audio {
+            let wav = audio.clone();
+            let rate = self.config.audio.sample_rate;
+            tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
+        }
         if let Some(h) = streaming_handle.take() {
             // Don't error on join failure; the task may have already
             // completed. We drop events implicitly here.
