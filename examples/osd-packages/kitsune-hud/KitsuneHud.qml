@@ -172,6 +172,38 @@ Item {
         onFileChanged: reload()
     }
 
+    // Class of the window this take will land in, written by
+    // voxtype-toggle.sh when recording starts. The pill says so, because
+    // "Listening" alone does not say where the text is going.
+    property string destClass: ""
+    FileView {
+        path: root._runtimeDir.length > 0 ? root._runtimeDir + "/voxtype/target_window" : ""
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoadFailed: root.destClass = ""
+        onLoaded: {
+            let cls = "";
+            try { cls = JSON.parse(text() || "{}").class || ""; } catch (e) { cls = ""; }
+            cls = String(cls).trim();
+            const name = root._appName(cls);
+            root.destClass = name.length > 24 ? name.substring(0, 23) + "…" : name;
+        }
+    }
+
+    // The app's own name, not its window class: "com.t3tools.T3Code" is
+    // "T3 Code" (its desktop entry); without one, the class's last part,
+    // spaced and capitalised ("org.kde.dolphin" → "Dolphin", "kitty" → "Kitty").
+    function _appName(cls) {
+        if (!cls) return "";
+        try {
+            const e = DesktopEntries.heuristicLookup(cls);
+            if (e && e.name) return String(e.name);
+        } catch (err) {}
+        const last = cls.split(".").pop().replace(/[-_]+/g, " ").replace(/([a-z])([A-Z])/g, "$1 $2");
+        return last.charAt(0).toUpperCase() + last.slice(1);
+    }
+
     // Only the last two lines are visible (the transcript scrolls inside a
     // clipped viewport), so cap what gets laid out on long dictations. The
     // cut lands far above the visible lines; it is never on screen.
@@ -547,15 +579,26 @@ Item {
     readonly property color checkColor: "#86E0B4"
     readonly property color warnColor: _color("warning", "#F2CC4D")
 
-    // SF Pro is the Dynamic Island face; it can't be redistributed, so fall
-    // back to Inter, then IBM Plex Sans, then whatever fontconfig picks.
+    // SF Pro is the Dynamic Island face. Prefer the variable "SF Pro" and
+    // pin its optical size to the Text cut: "SF Pro Display" is drawn for
+    // 20pt and up and reads loose and thin at 13-14px. Fall back to the
+    // static Text cut, then Inter (whose opsz axis takes the same values),
+    // then IBM Plex Sans, then whatever fontconfig picks.
     readonly property string uiFont: {
         const have = Qt.fontFamilies();
-        const chain = ["SF Pro Display", "Inter", "IBM Plex Sans"];
+        const chain = ["SF Pro", "SF Pro Text", "Inter", "IBM Plex Sans"];
         for (let i = 0; i < chain.length; i++)
             if (have.indexOf(chain[i]) >= 0) return chain[i];
         return "";
     }
+    // Optical size + weight for the variable faces (ignored by static ones).
+    // SF Pro's opsz runs 17 (Text) to 28 (Display); Apple sets it to the
+    // point size, so anything this small sits at the Text end.
+    function fontAxes(px, weight) { return { "opsz": Math.max(17, Math.min(28, px)), "wght": weight }; }
+    // Apple's tracking for SF Pro at these sizes, read from the font's own
+    // `trak` table (track 0, 1/2048 em): 13px -12 → -0.08px, 14px -22 → -0.15px.
+    readonly property real track13: -0.08
+    readonly property real track14: -0.15
     // Listening accent for streaming sessions (the fork's daily mode). Empty =
     // the theme's "streaming" role.
     readonly property string listenAccent: "#FF7A98"
@@ -572,7 +615,10 @@ Item {
 
     // Silence is shown by dimming the bars, not by swapping the label — VAD
     // toggles on room noise and a flickering label reads as broken.
-    function _labelFor(s) { return s === "transcribing" ? "Polishing" : "Listening"; }
+    function _labelFor(s) {
+        const base = s === "transcribing" ? "Polishing" : "Listening";
+        return destClass.length > 0 ? base + "  ·  " + destClass : base;
+    }
     readonly property string label: _labelFor(vstate)
     property string shownLabel: label
     onLabelChanged: if (_isActive(vstate)) shownLabel = label
@@ -624,6 +670,21 @@ Item {
     // 0 0.5px 0.5px), the card's own soft shadow for the wider stack, a dark
     // ring drawing the edge, a light lip and glow from the top, and a faint
     // shade inside the bottom.
+    // Soft shadow so the pill floats over content. Drawn analytically beside
+    // the card: it was the card's own layer + MultiEffect, which re-rendered
+    // the whole card offscreen and blurred it on every frame the meter or
+    // the words moved (30-60 times a second while dictating).
+    RectangularShadow {
+        x: card.x
+        y: card.y + 3
+        width: card.width
+        height: card.height
+        radius: card.radius
+        blur: 18
+        color: Qt.alpha("#000000", 0.42)
+        opacity: card.opacity
+        visible: card.visible && card.opacity > 0
+    }
     Rectangle {
         x: card.x
         y: card.y + 1
@@ -712,17 +773,6 @@ Item {
         // The ring is darker than the fill and draws the edge on light
         // backgrounds; the inner hairline below keeps it on dark ones.
         border.color: Qt.tint(Qt.alpha("#000000", 0.55), Qt.alpha(badge.tone, 0.5 * flash))
-
-        // Soft contact shadow so the pill floats over content.
-        layer.enabled: true
-        layer.effect: MultiEffect {
-            shadowEnabled: true
-            shadowColor: "#000000"
-            shadowOpacity: 0.42
-            shadowBlur: 0.55
-            shadowVerticalOffset: 3
-            autoPaddingEnabled: true
-        }
 
         // Morph only after the entrance: animating from the initial 0 width
         // showed bare text with no pill behind it for the first frames.
@@ -951,7 +1001,8 @@ Item {
                 font.family: root.uiFont
                 font.pixelSize: 13
                 font.weight: Font.Medium
-                font.letterSpacing: 0.2
+                font.variableAxes: root.fontAxes(13, 510)
+                font.letterSpacing: root.track13
                 renderType: Text.NativeRendering
                 color: warn ? root.warnColor : root.fg
                 // The hint shows over a transcript too (it hides for 600ms).
@@ -1050,7 +1101,8 @@ Item {
                 lineHeight: 1.16
                 font.family: root.uiFont
                 font.pixelSize: 14
-                font.letterSpacing: 0.15
+                font.variableAxes: root.fontAxes(14, 400)
+                font.letterSpacing: root.track14
                 renderType: Text.NativeRendering
                 color: root.fg
                 opacity: !root.hasText || root.cancelArmed ? 0 : (root.polishing && !shimmer.on ? 0.72 : 1.0)
@@ -1156,6 +1208,8 @@ Item {
             // Secondary emphasis comes from opacity, not size.
             font.pixelSize: 13
             font.weight: Font.Medium
+            font.variableAxes: root.fontAxes(13, 510)
+            font.letterSpacing: root.track13
             font.features: { "tnum": 1 }
             renderType: Text.NativeRendering
             color: root.fg
