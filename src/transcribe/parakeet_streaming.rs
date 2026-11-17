@@ -104,10 +104,10 @@ impl ParakeetStreamingTranscriber {
         );
         let start = std::time::Instant::now();
 
-        let gpu = build_execution_config();
+        let gpu = build_execution_config(None);
         let on_cpu = gpu.is_none();
         let final_exec = gpu.unwrap_or_else(|| {
-            let threads = config.cpu.threads.unwrap_or_else(performance_cores);
+            let threads = config.cpu.threads.or(config.threads).unwrap_or_else(performance_cores);
             tracing::info!("Parakeet on CPU with {} threads", threads);
             ExecutionConfig::new().with_intra_threads(threads)
         });

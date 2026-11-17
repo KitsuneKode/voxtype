@@ -1,9 +1,22 @@
 //! Profile and post-process configuration.
 
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use super::default_true;
 use super::OutputMode;
+
+/// Terms that should keep their configured spelling in this profile.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct VocabularyConfig {
+    /// Product names, people, acronyms, and other terms used by this profile.
+    #[serde(default)]
+    pub terms: Vec<String>,
+
+    /// JSON file containing an array of additional terms.
+    #[serde(default)]
+    pub terms_file: Option<PathBuf>,
+}
 
 /// Post-processing command configuration
 ///
@@ -47,6 +60,10 @@ pub struct PostProcessConfig {
     /// modes (clipboard, paste, file) collect the pieces and deliver once.
     #[serde(default)]
     pub streaming: bool,
+    /// Require command output to be a JSON edit list and apply only exact,
+    /// unambiguous edits (default: false).
+    #[serde(default)]
+    pub edit_list: bool,
 }
 
 impl Default for PostProcessConfig {
@@ -57,6 +74,7 @@ impl Default for PostProcessConfig {
             trim: true,
             fallback_on_empty: true,
             streaming: false,
+            edit_list: false,
         }
     }
 }
@@ -79,6 +97,10 @@ impl Default for PostProcessConfig {
 /// Use with: `voxtype record start --profile slack`
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Profile {
+    /// Profile-specific vocabulary correction.
+    #[serde(default)]
+    pub vocabulary: VocabularyConfig,
+
     /// Post-processing command for this profile
     /// Overrides [output.post_process.command] when the profile is active
     #[serde(default)]
@@ -139,6 +161,7 @@ mod tests {
         assert_eq!(config.profiles.len(), 2);
 
         let slack = config.get_profile("slack").unwrap();
+        assert!(slack.vocabulary.terms.is_empty());
         assert_eq!(
             slack.post_process_command,
             Some("cleanup-for-slack.sh".to_string())
@@ -272,5 +295,24 @@ mod tests {
 
         let config: Config = toml::from_str(toml_str).unwrap();
         assert!(config.profiles.is_empty());
+    }
+
+    #[test]
+    fn test_parse_profile_vocabulary() {
+        let config: Config = toml::from_str(
+            r#"
+            [profiles.code.vocabulary]
+            terms = ["Voxtype", "PipeWire"]
+            terms_file = "/tmp/team-terms.json"
+            "#,
+        )
+        .unwrap();
+
+        let vocabulary = &config.get_profile("code").unwrap().vocabulary;
+        assert_eq!(vocabulary.terms, ["Voxtype", "PipeWire"]);
+        assert_eq!(
+            vocabulary.terms_file.as_deref(),
+            Some(std::path::Path::new("/tmp/team-terms.json"))
+        );
     }
 }
