@@ -2171,6 +2171,17 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     .for_engine("parakeet")
     .gated("parakeet"),
     spec(
+        "parakeet.streaming_max_pause_secs",
+        "parakeet",
+        "streaming_max_pause_secs",
+        KeyType::Float { min: 0.0, max: 60.0 },
+        "Advanced",
+        "Streaming pause limit",
+        "Leave pauses longer than this out of the live stream, so the word after a long pause is not dropped. 0 keeps every pause.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
         "parakeet.streaming_final_pass",
         "parakeet",
         "streaming_final_pass",
@@ -3142,6 +3153,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.streaming_chunk_secs" => json!(pk().streaming_chunk_secs),
         "parakeet.streaming_left_context_secs" => json!(pk().streaming_left_context_secs),
         "parakeet.streaming_right_context_secs" => json!(pk().streaming_right_context_secs),
+        "parakeet.streaming_max_pause_secs" => json!(pk().streaming_max_pause_secs),
         "parakeet.streaming_final_pass" => json!(pk().streaming_final_pass),
         "parakeet.streaming_final_pass_max_secs" => json!(pk().streaming_final_pass_max_secs),
         "parakeet.streaming_final_pass_skip_when_clean" => json!(pk().streaming_final_pass_skip_when_clean),

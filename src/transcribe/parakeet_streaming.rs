@@ -61,6 +61,8 @@ pub struct ParakeetStreamingTranscriber {
     batch: Mutex<ParakeetUnified>,
     /// Progress of the current (or last) stream.
     progress: Arc<Mutex<StreamProgress>>,
+    /// `[parakeet] streaming_max_pause_secs`, in samples (0 = off).
+    max_pause: usize,
 }
 
 impl ParakeetStreamingTranscriber {
@@ -170,6 +172,7 @@ impl ParakeetStreamingTranscriber {
             streaming_config,
             batch: Mutex::new(batch),
             progress: Arc::default(),
+            max_pause: (config.streaming_max_pause_secs.max(0.0) * 16000.0) as usize,
         })
     }
 }
@@ -251,6 +254,61 @@ fn ends_in_speech(samples: &[f32]) -> bool {
     rms(&samples[samples.len() - TAIL..]) > 4.0 * floor.max(1e-4)
 }
 
+/// `[parakeet] streaming_max_pause_secs`: keeps at most that much of any
+/// pause in the audio the stream decodes. After a pause longer than the
+/// left context (5.6 s), the model starts again with no context at all and
+/// drops the first word or two of the next sentence ("in fact he is" ->
+/// "he is"); a shorter pause leaves it some. Quiet is judged like
+/// `segment`'s cuts, relative to the levels heard so far: closer to the
+/// noise floor than to the speech level, in 1 dB bins.
+struct PauseLimiter {
+    max: usize,
+    quiet_run: usize,
+    histogram: [u32; 121],
+    blocks: u32,
+}
+
+impl PauseLimiter {
+    fn new(max: usize) -> Self {
+        Self { max, quiet_run: 0, histogram: [0; 121], blocks: 0 }
+    }
+
+    fn percentile(&self, fraction: f32) -> f32 {
+        let target = (self.blocks as f32 * fraction) as u32;
+        let mut seen = 0;
+        for (bin, count) in self.histogram.iter().enumerate() {
+            seen += count;
+            if seen > target {
+                return bin as f32 - 120.0;
+            }
+        }
+        0.0
+    }
+
+    /// Whether to leave `chunk` out of the stream.
+    fn skip(&mut self, chunk: &[f32]) -> bool {
+        if self.max == 0 {
+            return false;
+        }
+        let power = chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32;
+        let db = (10.0 * (power + 1e-12).log10()).clamp(-120.0, 0.0);
+        self.histogram[(db + 120.0) as usize] += 1;
+        self.blocks += 1;
+        // A second of audio before the levels mean anything.
+        if self.blocks < 50 {
+            return false;
+        }
+        let floor = self.percentile(0.1);
+        let speech = self.percentile(0.9);
+        if speech - floor < 10.0 || db >= floor + 0.25 * (speech - floor) {
+            self.quiet_run = 0;
+            return false;
+        }
+        self.quiet_run += chunk.len();
+        self.quiet_run > self.max
+    }
+}
+
 impl StreamingTranscriber for ParakeetStreamingTranscriber {
     fn stream_progress(&self) -> Option<StreamProgress> {
         self.progress.lock().ok().map(|p| p.clone())
@@ -275,6 +333,7 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
             *p = StreamProgress::default();
         }
         let right_context = self.streaming_config.right_context_samples();
+        let mut pauses = PauseLimiter::new(self.max_pause);
 
         let (events_tx, events_rx) = mpsc::channel::<StreamingEvent>(64);
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
@@ -306,6 +365,12 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 };
 
                 if chunk.is_empty() {
+                    continue;
+                }
+                if pauses.skip(&chunk) {
+                    if let Ok(mut p) = progress.lock() {
+                        p.fed += chunk.len();
+                    }
                     continue;
                 }
 
@@ -422,6 +487,26 @@ mod tests {
         let mut cut: Vec<f32> = (0..8000).map(noise).collect();
         cut.extend((0..32000).map(|i| speech(i) + noise(i)));
         assert!(ends_in_speech(&cut));
+    }
+
+    #[test]
+    fn pauses_past_the_limit_are_left_out_of_the_stream() {
+        let block = |loud: bool| -> Vec<f32> {
+            (0..320)
+                .map(|i| if loud { (i as f32 * 0.3).sin() * 0.2 } else { ((i * 31) % 7) as f32 * 1e-4 })
+                .collect()
+        };
+        let mut limiter = PauseLimiter::new(16000);
+        // Half a second of room noise, then speech: the levels to judge by.
+        let start: Vec<bool> = (0..125).map(|i| limiter.skip(&block(i >= 25))).collect();
+        assert!(start.iter().all(|s| !s));
+        // 1 s of pause kept, the rest of a 3 s pause skipped.
+        let pause: Vec<bool> = (0..150).map(|_| limiter.skip(&block(false))).collect();
+        assert_eq!(pause.iter().filter(|s| !**s).count(), 50);
+        // Speech resets the run.
+        assert!(!limiter.skip(&block(true)));
+        assert!(!limiter.skip(&block(false)));
+        assert!(!PauseLimiter::new(0).skip(&block(false)));
     }
 
     #[test]

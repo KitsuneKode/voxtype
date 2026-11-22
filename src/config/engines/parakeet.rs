@@ -100,6 +100,14 @@ pub struct ParakeetConfig {
     #[serde(default = "default_streaming_right_context_secs")]
     pub streaming_right_context_secs: f32,
 
+    /// Longest pause, in seconds, the live stream decodes; the rest of a
+    /// longer pause is left out of it. After a pause longer than the
+    /// stream's left context the model has no context left and drops the
+    /// first word or two after it. Affects the live preview and live typing,
+    /// not the final pass. 0 keeps every pause. Default: 2.5.
+    #[serde(default = "default_streaming_max_pause_secs")]
+    pub streaming_max_pause_secs: f32,
+
     /// After a streaming session that types nothing until stop
     /// (`[output] streaming_commit = "on_stop"`), decode the whole recording
     /// again in one offline pass with the same model and deliver that
@@ -223,6 +231,10 @@ fn default_final_pass_segment_secs() -> f32 {
     45.0
 }
 
+fn default_streaming_max_pause_secs() -> f32 {
+    2.5
+}
+
 fn default_pad_secs() -> f32 {
     0.5
 }
@@ -245,6 +257,7 @@ impl Default for ParakeetConfig {
             streaming_final_pass: false,
             streaming_final_pass_max_secs: default_streaming_final_pass_max_secs(),
             streaming_final_pass_skip_when_clean: false,
+            streaming_max_pause_secs: default_streaming_max_pause_secs(),
             final_pass_segment_secs: default_final_pass_segment_secs(),
             pad_secs: default_pad_secs(),
             cpu: ParakeetCpuConfig::default(),
