@@ -67,77 +67,63 @@ impl CpalCapture {
 fn find_audio_device(host: &cpal::Host, device_name: &str) -> Result<cpal::Device, AudioError> {
     use cpal::traits::{DeviceTrait, HostTrait};
 
-    let devices: Vec<cpal::Device> = host
+    let search_lower = device_name.to_lowercase();
+    let mut devices: Vec<(String, cpal::Device)> = Vec::new();
+
+    // Iterate once and short-circuit immediately on exact match. On Linux ALSA,
+    // `host.input_devices()` probes every PCM hint via `snd_pcm_open`, so
+    // stopping on the first exact hit (and never re-enumerating a second time)
+    // avoids probing unrelated dmix/dsnoop/OSS/HDMI devices.
+    for device in host
         .input_devices()
         .map_err(|e| AudioError::Connection(e.to_string()))?
-        .collect();
-
-    // Collect device names for error message
-    let device_names: Vec<String> = devices.iter().filter_map(|d| d.name().ok()).collect();
-
-    let search_lower = device_name.to_lowercase();
-
-    // 1. Try exact match (case-sensitive)
-    for device in &devices {
+    {
         if let Ok(name) = device.name() {
             if name == device_name {
                 tracing::debug!("Found audio device by exact match: {}", name);
-                return host
-                    .input_devices()
-                    .map_err(|e| AudioError::Connection(e.to_string()))?
-                    .find(|d| d.name().map(|n| n == device_name).unwrap_or(false))
-                    .ok_or_else(|| AudioError::DeviceNotFound(device_name.to_string()));
+                return Ok(device);
             }
+            devices.push((name, device));
         }
     }
 
     // 2. Try exact match (case-insensitive)
-    for device in &devices {
-        if let Ok(name) = device.name() {
-            if name.to_lowercase() == search_lower {
-                tracing::debug!(
-                    "Found audio device by case-insensitive match: {} (searched for: {})",
-                    name,
-                    device_name
-                );
-                let matched_name = name.clone();
-                return host
-                    .input_devices()
-                    .map_err(|e| AudioError::Connection(e.to_string()))?
-                    .find(|d| d.name().map(|n| n == matched_name).unwrap_or(false))
-                    .ok_or_else(|| AudioError::DeviceNotFound(device_name.to_string()));
-            }
-        }
+    if let Some(pos) = devices
+        .iter()
+        .position(|(name, _)| name.to_lowercase() == search_lower)
+    {
+        let (name, device) = devices.swap_remove(pos);
+        tracing::debug!(
+            "Found audio device by case-insensitive match: {} (searched for: {})",
+            name,
+            device_name
+        );
+        return Ok(device);
     }
 
     // 3. Try substring match (case-insensitive)
-    for device in &devices {
-        if let Ok(name) = device.name() {
-            if name.to_lowercase().contains(&search_lower) {
-                tracing::debug!(
-                    "Found audio device by substring match: {} (searched for: {})",
-                    name,
-                    device_name
-                );
-                let matched_name = name.clone();
-                return host
-                    .input_devices()
-                    .map_err(|e| AudioError::Connection(e.to_string()))?
-                    .find(|d| d.name().map(|n| n == matched_name).unwrap_or(false))
-                    .ok_or_else(|| AudioError::DeviceNotFound(device_name.to_string()));
-            }
-        }
+    if let Some(pos) = devices
+        .iter()
+        .position(|(name, _)| name.to_lowercase().contains(&search_lower))
+    {
+        let (name, device) = devices.swap_remove(pos);
+        tracing::debug!(
+            "Found audio device by substring match: {} (searched for: {})",
+            name,
+            device_name
+        );
+        return Ok(device);
     }
 
     // No match found - provide helpful error with available devices
-    let available = if device_names.is_empty() {
+    let available = if devices.is_empty() {
         "No audio input devices found.".to_string()
     } else {
         format!(
             "Available devices:\n{}",
-            device_names
+            devices
                 .iter()
-                .map(|n| format!("  - {}", n))
+                .map(|(n, _)| format!("  - {}", n))
                 .collect::<Vec<_>>()
                 .join("\n")
         )
