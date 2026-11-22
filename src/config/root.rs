@@ -464,6 +464,18 @@ impl Config {
         }
     }
 
+    /// Idle timeout before unloading a preloaded non-Whisper model (0 = never).
+    pub fn idle_unload_secs(&self) -> u64 {
+        match self.engine {
+            TranscriptionEngine::Parakeet => self
+                .parakeet
+                .as_ref()
+                .map(|p| p.idle_unload_secs)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     /// The language code configured for the active engine, if it has one.
     ///
     /// Engines disagree about where language lives, and several do not take a

@@ -2204,6 +2204,17 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     .for_engine("parakeet")
     .gated("parakeet"),
     spec(
+        "parakeet.idle_unload_secs",
+        "parakeet",
+        "idle_unload_secs",
+        KeyType::Int { min: 0, max: 86400 },
+        "Advanced",
+        "Idle model unload",
+        "Unload the Parakeet model from memory/VRAM after this many seconds of inactivity (0 keeps it loaded).",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
         "parakeet.cpu.threads",
         "parakeet.cpu",
         "threads",
@@ -3112,6 +3123,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.streaming_final_pass" => json!(pk().streaming_final_pass),
         "parakeet.streaming_final_pass_max_secs" => json!(pk().streaming_final_pass_max_secs),
         "parakeet.final_pass_segment_secs" => json!(pk().final_pass_segment_secs),
+        "parakeet.idle_unload_secs" => json!(pk().idle_unload_secs),
         "parakeet.cpu.threads" => pk().cpu.threads.map_or(Json::Null, |n| json!(n)),
         "parakeet.cpu.streaming_chunk_secs" => pk().cpu.streaming_chunk_secs.map_or(Json::Null, |v| f32_json(v)),
         "parakeet.cpu.streaming_left_context_secs" => pk().cpu.streaming_left_context_secs.map_or(Json::Null, |v| f32_json(v)),

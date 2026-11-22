@@ -1351,6 +1351,8 @@ pub struct Daemon {
     // instance (#643) — get_transcriber_for_recording re-creates it on the
     // next recording when it finds this empty.
     transcriber_preloaded: Option<Arc<dyn Transcriber>>,
+    // Last time `transcriber_preloaded` was used (for `idle_unload_secs`).
+    transcriber_last_used: Option<std::time::Instant>,
     // Background tasks for eager chunk transcriptions (chunk_index, task)
     eager_chunk_tasks: Vec<(
         usize,
@@ -1540,6 +1542,7 @@ impl Daemon {
             transcription_task: None,
             active_transcriber: None,
             transcriber_preloaded: None,
+            transcriber_last_used: None,
             eager_chunk_tasks: Vec::new(),
             vad,
             meeting_daemon: None,
@@ -1559,6 +1562,54 @@ impl Daemon {
             osd_outcome_sent: std::sync::atomic::AtomicBool::new(false),
             model_upgrade_pending,
         }
+    }
+
+    fn touch_transcriber_used(&mut self) {
+        if self.transcriber_preloaded.is_some() {
+            self.transcriber_last_used = Some(std::time::Instant::now());
+        }
+    }
+
+    fn maybe_evict_idle_preloaded(&mut self, state: &State) -> bool {
+        let timeout = self.config.idle_unload_secs();
+        if timeout == 0 || !matches!(state, State::Idle) {
+            return false;
+        }
+        if self.transcriber_preloaded.is_none()
+            || self.active_transcriber.is_some()
+            || self.transcription_task.is_some()
+            || self.final_pass_task.is_some()
+            || self.incremental_final_pass.is_some()
+            || self.meeting_daemon.is_some()
+            || self.model_load_task.is_some()
+        {
+            return false;
+        }
+        let Some(last) = self.transcriber_last_used else {
+            return false;
+        };
+        if last.elapsed() < Duration::from_secs(timeout) {
+            return false;
+        }
+        tracing::info!(
+            "Unloading idle transcription model after {}s of inactivity",
+            timeout
+        );
+        self.transcriber_preloaded = None;
+        self.transcriber_last_used = None;
+        self.override_cache = None;
+        release_freed_memory();
+        true
+    }
+
+    fn parakeet_streaming_configured(&self) -> bool {
+        self.config.engine == crate::config::TranscriptionEngine::Parakeet
+            && self
+                .config
+                .parakeet
+                .as_ref()
+                .map(|p| p.streaming)
+                .unwrap_or(false)
     }
 
     /// Play audio feedback sound if enabled
@@ -1676,6 +1727,7 @@ impl Daemon {
             task.abort();
         }
         self.transcriber_preloaded = None;
+        self.transcriber_last_used = None;
         self.override_cache = None;
         self.config = next;
         self.model_manager = (self.config.engine == crate::config::TranscriptionEngine::Whisper)
@@ -2020,11 +2072,19 @@ impl Daemon {
             }
         }
         // Clone out of the field so the borrow doesn't overlap the
-        // `&mut self` capture start below.
-        let Some(transcriber) = self.transcriber_preloaded.clone() else {
-            return false;
-        };
-        if transcriber.as_streaming().is_none() {
+        // `&mut self` capture start below. When `idle_unload_secs > 0`, the
+        // model may be unloaded while idle: start audio capture first so no
+        // speech is lost, then lazy-load and cache the streaming transcriber.
+        let preloaded = self.transcriber_preloaded.clone();
+        let cold_parakeet_stream = preloaded.is_none()
+            && !self.config.on_demand_loading()
+            && self.config.idle_unload_secs() > 0
+            && self.parakeet_streaming_configured();
+        if let Some(ref t) = preloaded {
+            if t.as_streaming().is_none() {
+                return false;
+            }
+        } else if !cold_parakeet_stream {
             return false;
         }
 
@@ -2032,6 +2092,50 @@ impl Daemon {
             Ok(v) => v,
             Err(()) => return false,
         };
+
+        let transcriber = match preloaded {
+            Some(t) => t,
+            None => {
+                tracing::info!(
+                    "Loading transcription model on demand (idle_unload_secs={})",
+                    self.config.idle_unload_secs()
+                );
+                let config = self.config.clone();
+                let created = tokio::task::spawn_blocking(move || {
+                    crate::transcribe::create_transcriber(&config)
+                })
+                .await;
+                match created {
+                    Ok(Ok(t)) => {
+                        let t: Arc<dyn Transcriber> = Arc::from(t);
+                        if t.as_streaming().is_none() {
+                            let mut c = capture;
+                            let _ = c.stop().await;
+                            self.transcriber_preloaded = Some(t);
+                            self.touch_transcriber_used();
+                            return false;
+                        }
+                        self.transcriber_preloaded = Some(t.clone());
+                        t
+                    }
+                    Ok(Err(e)) => {
+                        tracing::error!("Failed to load streaming transcriber: {}", e);
+                        self.play_feedback(SoundEvent::Error);
+                        let mut c = capture;
+                        let _ = c.stop().await;
+                        return false;
+                    }
+                    Err(e) => {
+                        tracing::error!("Streaming transcriber load task panicked: {}", e);
+                        self.play_feedback(SoundEvent::Error);
+                        let mut c = capture;
+                        let _ = c.stop().await;
+                        return false;
+                    }
+                }
+            }
+        };
+        self.touch_transcriber_used();
 
         let streaming = transcriber.as_streaming().expect("checked above");
         let handle = match streaming.start_stream(samples_rx) {
@@ -2786,6 +2890,7 @@ impl Daemon {
 
             discard_recording_overrides();
             *state = State::Idle;
+            self.touch_transcriber_used();
             self.update_state("idle");
             discard_recording_overrides();
             return;
@@ -2816,6 +2921,7 @@ impl Daemon {
         }
 
         *state = State::Idle;
+        self.touch_transcriber_used();
         self.update_state("idle");
         discard_recording_overrides();
     }
@@ -2987,6 +3093,7 @@ impl Daemon {
 
         discard_recording_overrides();
         *state = State::Idle;
+        self.touch_transcriber_used();
 
         if let Some(cmd) = &self.config.output.post_output_command {
             if let Err(e) = output::run_hook(cmd, "post_output").await {
@@ -3446,12 +3553,13 @@ impl Daemon {
                 | crate::config::TranscriptionEngine::Soniox => {
                     if let Some(t) = self.transcriber_preloaded.clone() {
                         t.set_vocabulary(&vocabulary);
+                        self.touch_transcriber_used();
                         Ok(t)
                     } else {
-                        // Empty on the non-on-demand path means the panic
-                        // recovery discarded a poisoned instance (#643).
-                        // Re-create rather than error so one bad recording
-                        // doesn't disable every one after it.
+                        // Empty on the non-on-demand path means either
+                        // idle_unload_secs evicted the model or panic recovery
+                        // discarded a poisoned instance (#643). Re-create
+                        // rather than error.
                         tracing::info!("Transcriber not loaded; creating a fresh instance");
                         let config = self.config.clone();
                         let created = tokio::task::spawn_blocking(move || {
@@ -3463,6 +3571,7 @@ impl Daemon {
                                 let t: Arc<dyn Transcriber> = Arc::from(t);
                                 t.set_vocabulary(&vocabulary);
                                 self.transcriber_preloaded = Some(t.clone());
+                                self.touch_transcriber_used();
                                 Ok(t)
                             }
                             Ok(Err(e)) => {
@@ -4383,6 +4492,8 @@ impl Daemon {
         // transcriber, so by here the model has been dropped.
         if self.config.on_demand_loading() {
             release_freed_memory();
+        } else {
+            self.touch_transcriber_used();
         }
     }
 
@@ -5098,8 +5209,9 @@ impl Daemon {
         // Initialize model manager for multi-model support (Whisper only)
         let mut model_manager = ModelManager::new(&self.config.whisper, self.config_path.clone());
 
-        // Pre-load transcription model if on_demand_loading is disabled
-        if !self.config.on_demand_loading() {
+        // Pre-load transcription model if neither on_demand_loading nor
+        // idle_unload_secs defers startup loading.
+        if !self.config.on_demand_loading() && self.config.idle_unload_secs() == 0 {
             tracing::info!("Loading transcription model: {}", self.config.model_name());
             match self.config.engine {
                 crate::config::TranscriptionEngine::Whisper => {
@@ -5142,6 +5254,11 @@ impl Daemon {
                 }
             }
             tracing::info!("Model loaded, ready for voice input");
+        } else if self.config.idle_unload_secs() > 0 {
+            tracing::info!(
+                "Idle model unload enabled ({}s); model will load on first recording",
+                self.config.idle_unload_secs()
+            );
         } else {
             tracing::info!("On-demand loading enabled, model will be loaded when recording starts");
         }
@@ -6184,6 +6301,9 @@ impl Daemon {
                         std::sync::atomic::AtomicU32::new(0);
                     let count =
                         EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if count.is_multiple_of(50) && matches!(state, State::Idle) {
+                        self.maybe_evict_idle_preloaded(&state);
+                    }
                     if count.is_multiple_of(600) && matches!(state, State::Idle) {
                         if let Some(ref mut mm) = self.model_manager {
                             mm.evict_idle_models();
@@ -6655,6 +6775,43 @@ while True:
         config.set_model_for(TranscriptionEngine::Parakeet, "parakeet-tdt-0.6b-v2");
         config.parakeet.as_mut().unwrap().on_demand_loading = on_demand;
         Daemon::new(config, None)
+    }
+
+    #[test]
+    fn idle_unload_evicts_preloaded_parakeet_only_when_idle_past_timeout() {
+        let mut daemon = parakeet_daemon(false);
+        daemon.config.parakeet.as_mut().unwrap().idle_unload_secs = 60;
+        daemon.transcriber_preloaded = Some(Arc::new(FixedTranscriber("ok")));
+        daemon.transcriber_last_used = Some(std::time::Instant::now() - Duration::from_secs(30));
+
+        // Still warm: not evicted yet.
+        assert!(!daemon.maybe_evict_idle_preloaded(&State::Idle));
+        assert!(daemon.transcriber_preloaded.is_some());
+
+        // Past timeout, but recording: never evict out from under an active session.
+        daemon.transcriber_last_used = Some(std::time::Instant::now() - Duration::from_secs(120));
+        let recording = State::Recording {
+            started_at: std::time::Instant::now(),
+            model_override: None,
+        };
+        assert!(!daemon.maybe_evict_idle_preloaded(&recording));
+        assert!(daemon.transcriber_preloaded.is_some());
+
+        // Past timeout and idle: evicted cleanly.
+        assert!(daemon.maybe_evict_idle_preloaded(&State::Idle));
+        assert!(daemon.transcriber_preloaded.is_none());
+        assert!(daemon.transcriber_last_used.is_none());
+    }
+
+    #[test]
+    fn idle_unload_disabled_when_zero() {
+        let mut daemon = parakeet_daemon(false);
+        daemon.config.parakeet.as_mut().unwrap().idle_unload_secs = 0;
+        daemon.transcriber_preloaded = Some(Arc::new(FixedTranscriber("ok")));
+        daemon.transcriber_last_used = Some(std::time::Instant::now() - Duration::from_secs(999));
+
+        assert!(!daemon.maybe_evict_idle_preloaded(&State::Idle));
+        assert!(daemon.transcriber_preloaded.is_some());
     }
 
     #[test]

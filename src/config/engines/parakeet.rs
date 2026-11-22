@@ -45,6 +45,14 @@ pub struct ParakeetConfig {
     #[serde(default = "default_on_demand_loading")]
     pub on_demand_loading: bool,
 
+    /// Unload the loaded model from memory/VRAM after this many seconds of
+    /// inactivity (0 = keep loaded, default). When > 0, the model is not
+    /// preloaded at daemon startup; it loads on first recording (while audio
+    /// capture is already buffering, so no words are lost), stays warm across
+    /// back-to-back recordings, and unloads once idle for this duration.
+    #[serde(default)]
+    pub idle_unload_secs: u64,
+
     /// Longest stretch of audio handed to the model in one pass, in seconds
     /// (default: 240). Longer recordings are split into overlapping windows
     /// and the transcripts are stitched back together.
@@ -203,6 +211,7 @@ impl Default for ParakeetConfig {
             model_type: None, // Auto-detect
             threads: None,
             on_demand_loading: false,
+            idle_unload_secs: 0,
             max_window_secs: default_parakeet_max_window_secs(),
             window_overlap_secs: default_parakeet_window_overlap_secs(),
             streaming: false,
