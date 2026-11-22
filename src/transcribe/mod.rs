@@ -31,7 +31,9 @@ pub mod window;
 pub mod worker;
 
 pub use sliding_window::{SlidingWindowConfig, SlidingWindowStreamingTranscriber};
-pub use streaming::{SegmentId, StreamHandle, StreamingEvent, StreamingTranscriber};
+pub use streaming::{
+    stream_is_clean, SegmentId, StreamHandle, StreamProgress, StreamingEvent, StreamingTranscriber,
+};
 
 /// Shared log-mel filterbank feature extraction for ONNX-based ASR engines
 #[cfg(any(

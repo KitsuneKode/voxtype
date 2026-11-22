@@ -2193,6 +2193,17 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     .for_engine("parakeet")
     .gated("parakeet"),
     spec(
+        "parakeet.streaming_final_pass_skip_when_clean",
+        "parakeet",
+        "streaming_final_pass_skip_when_clean",
+        KeyType::Bool,
+        "Advanced",
+        "Skip final pass when clean",
+        "Deliver the streamed text without the final pass when it ends a sentence and only silence follows it (faster on CPU).",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
         "parakeet.final_pass_segment_secs",
         "parakeet",
         "final_pass_segment_secs",
@@ -3133,6 +3144,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.streaming_right_context_secs" => json!(pk().streaming_right_context_secs),
         "parakeet.streaming_final_pass" => json!(pk().streaming_final_pass),
         "parakeet.streaming_final_pass_max_secs" => json!(pk().streaming_final_pass_max_secs),
+        "parakeet.streaming_final_pass_skip_when_clean" => json!(pk().streaming_final_pass_skip_when_clean),
         "parakeet.final_pass_segment_secs" => json!(pk().final_pass_segment_secs),
         "parakeet.pad_secs" => json!(pk().pad_secs),
         "parakeet.idle_unload_secs" => json!(pk().idle_unload_secs),

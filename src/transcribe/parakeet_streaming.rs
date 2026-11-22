@@ -34,12 +34,12 @@
 //! (commit-on-pause) is a follow-up once VAD-segmentation lands.
 
 use super::parakeet::{build_execution_config, performance_cores, resolve_model_path};
-use super::streaming::{StreamHandle, StreamingEvent, StreamingTranscriber};
+use super::streaming::{StreamHandle, StreamProgress, StreamingEvent, StreamingTranscriber};
 use super::{TimedSegment, Transcriber};
 use crate::config::ParakeetConfig;
 use crate::error::TranscribeError;
 use parakeet_rs::{ExecutionConfig, ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
 /// Streaming-capable Parakeet transcriber backed by `ParakeetUnified`.
@@ -59,6 +59,8 @@ pub struct ParakeetStreamingTranscriber {
     /// Reusable batch instance for `Transcriber::transcribe`. Reset between
     /// calls so no inter-call state leaks.
     batch: Mutex<ParakeetUnified>,
+    /// Progress of the current (or last) stream.
+    progress: Arc<Mutex<StreamProgress>>,
 }
 
 impl ParakeetStreamingTranscriber {
@@ -167,6 +169,7 @@ impl ParakeetStreamingTranscriber {
             pad: (config.pad_secs.max(0.0) * 16000.0) as usize,
             streaming_config,
             batch: Mutex::new(batch),
+            progress: Arc::default(),
         })
     }
 }
@@ -249,6 +252,10 @@ fn ends_in_speech(samples: &[f32]) -> bool {
 }
 
 impl StreamingTranscriber for ParakeetStreamingTranscriber {
+    fn stream_progress(&self) -> Option<StreamProgress> {
+        self.progress.lock().ok().map(|p| p.clone())
+    }
+
     fn start_stream(
         &self,
         mut samples_rx: mpsc::Receiver<Vec<f32>>,
@@ -262,6 +269,12 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                         e
                     ))
                 })?;
+
+        let progress = self.progress.clone();
+        if let Ok(mut p) = progress.lock() {
+            *p = StreamProgress::default();
+        }
+        let right_context = self.streaming_config.right_context_samples();
 
         let (events_tx, events_rx) = mpsc::channel::<StreamingEvent>(64);
         let (cancel_tx, mut cancel_rx) = oneshot::channel::<()>();
@@ -308,6 +321,14 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                         return Ok(());
                     }
                 };
+
+                if let Ok(mut p) = progress.lock() {
+                    p.fed += chunk.len();
+                    if !text.is_empty() {
+                        p.text.push_str(&text);
+                        p.text_through = p.fed.saturating_sub(right_context);
+                    }
+                }
 
                 // Every non-empty delta is new text. Comparing against the
                 // previous delta (as a cumulative-transcript backend would)

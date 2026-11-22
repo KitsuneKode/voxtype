@@ -128,6 +128,45 @@ pub struct StreamHandle {
 /// Errors during setup (auth, network, model load) should be returned
 /// from `start_stream` directly. Errors during the session should arrive
 /// as `StreamingEvent::Error` followed by `Ended`.
+/// How far the current stream has got, for backends that track it.
+/// Sample positions count from the start of the stream's audio, which is
+/// also the start of the recording the daemon captures.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamProgress {
+    /// Everything the stream has emitted so far.
+    pub text: String,
+    /// Samples handed to the model.
+    pub fed: usize,
+    /// Where the audio behind `text` ends: the end of the last chunk that
+    /// produced text.
+    pub text_through: usize,
+}
+
+/// `[parakeet] streaming_final_pass_skip_when_clean`: whether the streamed
+/// text can stand in for the final pass. It must end a sentence (`.` `?`
+/// `!` `…`), and at least 0.3 s of the recording must follow the audio
+/// behind it, all of it quiet (every 20 ms frame closer to the noise floor
+/// than to the speech level, the relative test `segment` cuts at).
+/// Anything the stream had not decoded yet lies in that stretch, so a
+/// stream that fell behind never passes.
+pub fn stream_is_clean(progress: &StreamProgress, audio: &[f32], sample_rate: u32) -> bool {
+    if !progress.text.trim_end().ends_with(['.', '?', '!', '…']) {
+        return false;
+    }
+    let frame = (sample_rate as usize / 50).max(1);
+    let tail = &audio[progress.text_through.min(audio.len())..];
+    if tail.len() < sample_rate as usize * 3 / 10 {
+        return false;
+    }
+    let db = |c: &[f32]| 10.0 * (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32 + 1e-10).log10();
+    let mut levels: Vec<f32> = audio.chunks_exact(frame).map(db).collect();
+    levels.sort_by(f32::total_cmp);
+    let floor = levels[levels.len() / 10];
+    let speech = levels[levels.len() * 9 / 10];
+    let threshold = floor + 0.25 * (speech - floor);
+    tail.chunks_exact(frame).all(|c| db(c) < threshold)
+}
+
 pub trait StreamingTranscriber: Send + Sync {
     /// Open a streaming session.
     ///
@@ -138,11 +177,39 @@ pub trait StreamingTranscriber: Send + Sync {
         &self,
         samples_rx: mpsc::Receiver<Vec<f32>>,
     ) -> Result<StreamHandle, TranscribeError>;
+
+    /// Progress of the most recent stream, for backends that track it.
+    fn stream_progress(&self) -> Option<StreamProgress> {
+        None
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_sentence_ends_followed_by_quiet_audio_are_clean() {
+        let speech = |i: usize| (i as f32 * 0.05).sin() * 0.2;
+        let noise = |i: usize| ((i * 7919) % 97) as f32 * 2e-5;
+        // 2 s of speech, then 0.6 s of room noise.
+        let audio: Vec<f32> = (0..41600)
+            .map(|i| if i < 32000 { speech(i) + noise(i) } else { noise(i) })
+            .collect();
+        let at = |text: &str, through: usize| StreamProgress {
+            text: text.into(),
+            fed: audio.len(),
+            text_through: through,
+        };
+        assert!(stream_is_clean(&at("Done.", 32000), &audio, 16000));
+        assert!(stream_is_clean(&at("Really?", 33000), &audio, 16000));
+        // No sentence end: the speaker may have more to say.
+        assert!(!stream_is_clean(&at("Done", 32000), &audio, 16000));
+        // The stream's text ends inside the speech: it is behind.
+        assert!(!stream_is_clean(&at("Done.", 20000), &audio, 16000));
+        // Too little audio after the text to tell.
+        assert!(!stream_is_clean(&at("Done.", 38000), &audio, 16000));
+    }
 
     #[test]
     fn streaming_event_partial_fields() {

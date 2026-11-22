@@ -118,6 +118,15 @@ pub struct ParakeetConfig {
     #[serde(default = "default_streaming_final_pass_max_secs")]
     pub streaming_final_pass_max_secs: f32,
 
+    /// Skip the final pass when the stream already got the take right, as
+    /// far as can be told: its text ends a sentence (`.` `?` `!` `…`) and
+    /// everything recorded after the audio behind that text is quiet. The
+    /// streamed text is delivered at once instead of after a full decode.
+    /// Worth it where the final pass is slow (CPU); on a GPU the pass costs
+    /// little and is more accurate. Default: false.
+    #[serde(default)]
+    pub streaming_final_pass_skip_when_clean: bool,
+
     /// Longest piece, in seconds, the final pass decodes at once. Longer
     /// recordings are split at their pauses and each piece is decoded with
     /// its own full context. Past about a minute of audio the offline pass
@@ -235,6 +244,7 @@ impl Default for ParakeetConfig {
             streaming_right_context_secs: default_streaming_right_context_secs(),
             streaming_final_pass: false,
             streaming_final_pass_max_secs: default_streaming_final_pass_max_secs(),
+            streaming_final_pass_skip_when_clean: false,
             final_pass_segment_secs: default_final_pass_segment_secs(),
             pad_secs: default_pad_secs(),
             cpu: ParakeetCpuConfig::default(),

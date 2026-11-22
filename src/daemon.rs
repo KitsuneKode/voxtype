@@ -2710,12 +2710,27 @@ impl Daemon {
         let on_stop = self.config.output.streaming_commit == StreamingCommit::OnStop;
         if drain && on_stop && self.final_pass_enabled() && !captured.is_empty() && secs <= max_secs {
             if let Some(transcriber) = self.transcriber_preloaded.clone() {
+                // Read before the cancel: the stream's progress stops there.
+                let clean = self.clean_streamed_text(transcriber.as_ref(), &captured);
                 if let Some(h) = streaming_handle.as_mut() {
                     let (tx, _rx) = tokio::sync::oneshot::channel();
                     let _ = std::mem::replace(&mut h.cancel, tx).send(());
                 }
                 drop(feed);
                 let incremental = self.incremental_final_pass.take();
+                if let Some(text) = clean {
+                    if let Some(pass) = incremental {
+                        pass.abandon();
+                    }
+                    tracing::info!("Streamed text ends cleanly; final pass skipped for {:.1}s take", secs);
+                    let captured = Arc::new(captured);
+                    let wav = Arc::clone(&captured);
+                    let rate = self.config.audio.sample_rate;
+                    tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
+                    self.final_pass_task = Some(tokio::spawn(async move { (Some(text), captured) }));
+                    self.update_state("transcribing");
+                    return;
+                }
                 self.spawn_final_pass(captured, transcriber, incremental);
                 self.update_state("transcribing");
                 return;
@@ -2798,6 +2813,28 @@ impl Daemon {
         if let Some(task) = self.final_pass_task.take() {
             task.abort();
         }
+    }
+
+    /// `[parakeet] streaming_final_pass_skip_when_clean`: the streamed text,
+    /// when it can be delivered instead of the final pass (see
+    /// [`crate::transcribe::stream_is_clean`]).
+    fn clean_streamed_text(&self, transcriber: &dyn Transcriber, captured: &[f32]) -> Option<String> {
+        if !self
+            .config
+            .parakeet
+            .as_ref()
+            .is_some_and(|p| p.streaming_final_pass_skip_when_clean)
+        {
+            return None;
+        }
+        // A stream that took more audio than this take is a stale one.
+        let progress = transcriber
+            .as_streaming()?
+            .stream_progress()
+            .filter(|p| p.fed <= captured.len())?;
+        crate::transcribe::stream_is_clean(&progress, captured, self.config.audio.sample_rate)
+            .then(|| progress.text.trim().to_string())
+            .filter(|t| !t.is_empty())
     }
 
     fn final_pass_enabled(&self) -> bool {
