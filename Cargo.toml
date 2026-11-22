@@ -383,3 +383,7 @@ openvino-genai = { git = "https://github.com/voxtype/openvino-rs", branch = "whi
 [[example]]
 name = "parakeet_bench"
 required-features = ["parakeet"]
+
+[[example]]
+name = "parakeet_eval"
+required-features = ["parakeet"]
