@@ -126,6 +126,13 @@ pub trait Transcriber: Send + Sync {
     /// Input: f32 samples, mono, 16kHz
     fn transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError>;
 
+    /// Transcribe one piece of a longer recording that more audio follows
+    /// (the final pass decodes long takes piece by piece in the background).
+    /// Backends that treat a recording's end specially override this.
+    fn transcribe_piece(&self, samples: &[f32]) -> Result<String, TranscribeError> {
+        self.transcribe(samples)
+    }
+
     /// Transcribe with word-level timestamps.
     /// Default implementation falls back to transcribe() with a single segment.
     fn transcribe_timed(&self, samples: &[f32]) -> Result<Vec<TimedSegment>, TranscribeError> {

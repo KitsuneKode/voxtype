@@ -112,22 +112,6 @@ pub struct StreamHandle {
     pub task: JoinHandle<Result<(), TranscribeError>>,
 }
 
-/// Trait for transcription backends that can stream partial results.
-///
-/// Implementors should:
-///
-/// 1. Accept 16 kHz mono `f32` samples on `samples_rx` (matching
-///    [`crate::audio::AudioCapture`]'s output).
-/// 2. Emit at least one `Final` per committed utterance, plus zero or
-///    more `Partial`s leading up to it.
-/// 3. Emit `Ended` exactly once when the stream closes cleanly. If the
-///    `cancel` signal fires, backends may emit `Ended` immediately
-///    without flushing pending partials.
-/// 4. Treat the `samples_rx` sender being dropped as graceful EOF.
-///
-/// Errors during setup (auth, network, model load) should be returned
-/// from `start_stream` directly. Errors during the session should arrive
-/// as `StreamingEvent::Error` followed by `Ended`.
 /// How far the current stream has got, for backends that track it.
 /// Sample positions count from the start of the stream's audio, which is
 /// also the start of the recording the daemon captures.
@@ -158,7 +142,8 @@ pub fn stream_is_clean(progress: &StreamProgress, audio: &[f32], sample_rate: u3
     if tail.len() < sample_rate as usize * 3 / 10 {
         return false;
     }
-    let db = |c: &[f32]| 10.0 * (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32 + 1e-10).log10();
+    let db =
+        |c: &[f32]| 10.0 * (c.iter().map(|s| s * s).sum::<f32>() / c.len() as f32 + 1e-10).log10();
     let mut levels: Vec<f32> = audio.chunks_exact(frame).map(db).collect();
     levels.sort_by(f32::total_cmp);
     let floor = levels[levels.len() / 10];
@@ -167,6 +152,22 @@ pub fn stream_is_clean(progress: &StreamProgress, audio: &[f32], sample_rate: u3
     tail.chunks_exact(frame).all(|c| db(c) < threshold)
 }
 
+/// Trait for transcription backends that can stream partial results.
+///
+/// Implementors should:
+///
+/// 1. Accept 16 kHz mono `f32` samples on `samples_rx` (matching
+///    [`crate::audio::AudioCapture`]'s output).
+/// 2. Emit at least one `Final` per committed utterance, plus zero or
+///    more `Partial`s leading up to it.
+/// 3. Emit `Ended` exactly once when the stream closes cleanly. If the
+///    `cancel` signal fires, backends may emit `Ended` immediately
+///    without flushing pending partials.
+/// 4. Treat the `samples_rx` sender being dropped as graceful EOF.
+///
+/// Errors during setup (auth, network, model load) should be returned
+/// from `start_stream` directly. Errors during the session should arrive
+/// as `StreamingEvent::Error` followed by `Ended`.
 pub trait StreamingTranscriber: Send + Sync {
     /// Open a streaming session.
     ///
@@ -194,7 +195,13 @@ mod tests {
         let noise = |i: usize| ((i * 7919) % 97) as f32 * 2e-5;
         // 2 s of speech, then 0.6 s of room noise.
         let audio: Vec<f32> = (0..41600)
-            .map(|i| if i < 32000 { speech(i) + noise(i) } else { noise(i) })
+            .map(|i| {
+                if i < 32000 {
+                    speech(i) + noise(i)
+                } else {
+                    noise(i)
+                }
+            })
             .collect();
         let at = |text: &str, through: usize| StreamProgress {
             text: text.into(),

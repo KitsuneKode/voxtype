@@ -2823,7 +2823,12 @@ impl Daemon {
             .config
             .parakeet
             .as_ref()
-            .is_some_and(|p| p.streaming_final_pass_skip_when_clean)
+            .is_some_and(|p| {
+                // The stream's text never got vocabulary rescoring.
+                p.streaming_final_pass_skip_when_clean
+                    && p.vocabulary_file.is_none()
+                    && p.corrections_file.is_none()
+            })
         {
             return None;
         }

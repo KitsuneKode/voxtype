@@ -96,7 +96,7 @@ impl IncrementalFinalPass {
                 let piece = tail[..end].to_vec();
                 let started = std::time::Instant::now();
                 let t2 = t.clone();
-                match tokio::task::spawn_blocking(move || t2.transcribe(&piece)).await {
+                match tokio::task::spawn_blocking(move || t2.transcribe_piece(&piece)).await {
                     Ok(Ok(text)) => {
                         tracing::info!(
                             "Final pass: decoded {:.1}s piece in the background in {}ms",

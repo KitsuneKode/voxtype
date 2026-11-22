@@ -35,10 +35,10 @@
 
 use super::parakeet::{build_execution_config, performance_cores, resolve_model_path};
 use super::streaming::{StreamHandle, StreamProgress, StreamingEvent, StreamingTranscriber};
+use super::vocab_rescore::{self, SpanScorer, TermSource};
 use super::{TimedSegment, Transcriber};
 use crate::config::ParakeetConfig;
 use crate::error::TranscribeError;
-use super::vocab_rescore::{self, SpanScorer, TermSource};
 use parakeet_rs::{
     ExecutionConfig, OfflineDecode, ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig,
 };
@@ -62,8 +62,9 @@ pub struct ParakeetStreamingTranscriber {
     /// Reusable batch instance for `Transcriber::transcribe`. Reset between
     /// calls so no inter-call state leaks.
     batch: Mutex<ParakeetUnified>,
-    /// Progress of the current (or last) stream.
-    progress: Arc<Mutex<StreamProgress>>,
+    /// Progress of the current (or last) stream. Each stream gets its own,
+    /// so a cancelled one still finishing a chunk cannot write into the next.
+    progress: Mutex<Arc<Mutex<StreamProgress>>>,
     /// `[parakeet] streaming_max_pause_secs`, in samples (0 = off).
     max_pause: usize,
     /// `[parakeet] vocabulary_file` / `corrections_file` (None = off).
@@ -119,7 +120,11 @@ impl ParakeetStreamingTranscriber {
         let gpu = build_execution_config(None);
         let on_cpu = gpu.is_none();
         let final_exec = gpu.unwrap_or_else(|| {
-            let threads = config.cpu.threads.or(config.threads).unwrap_or_else(performance_cores);
+            let threads = config
+                .cpu
+                .threads
+                .or(config.threads)
+                .unwrap_or_else(performance_cores);
             tracing::info!("Parakeet on CPU with {} threads", threads);
             super::parakeet::no_spin(ExecutionConfig::new().with_intra_threads(threads))
         });
@@ -138,11 +143,23 @@ impl ParakeetStreamingTranscriber {
         // re-encodes less. The final pass sees the whole recording either
         // way, so the delivered text does not depend on it.
         let cpu = &config.cpu;
-        let pick = |cpu_value: Option<f32>, value: f32| if on_cpu { cpu_value.unwrap_or(value) } else { value };
+        let pick = |cpu_value: Option<f32>, value: f32| {
+            if on_cpu {
+                cpu_value.unwrap_or(value)
+            } else {
+                value
+            }
+        };
         let streaming_config = UnifiedStreamingConfig {
             chunk_secs: pick(cpu.streaming_chunk_secs, config.streaming_chunk_secs),
-            left_context_secs: pick(cpu.streaming_left_context_secs, config.streaming_left_context_secs),
-            right_context_secs: pick(cpu.streaming_right_context_secs, config.streaming_right_context_secs),
+            left_context_secs: pick(
+                cpu.streaming_left_context_secs,
+                config.streaming_left_context_secs,
+            ),
+            right_context_secs: pick(
+                cpu.streaming_right_context_secs,
+                config.streaming_right_context_secs,
+            ),
         }
         .validate()
         .map_err(|e| {
@@ -177,8 +194,13 @@ impl ParakeetStreamingTranscriber {
             pad: (config.pad_secs.max(0.0) * 16000.0) as usize,
             streaming_config,
             batch: Mutex::new(batch),
-            progress: Arc::default(),
-            max_pause: (config.streaming_max_pause_secs.max(0.0) * 16000.0) as usize,
+            progress: Mutex::default(),
+            // Below the left context, or the model still starts over cold.
+            max_pause: (config
+                .streaming_max_pause_secs
+                .max(0.0)
+                .min((streaming_config.left_context_secs - 0.5).max(1.0))
+                * 16000.0) as usize,
             vocabulary: TermSource::new(
                 config.vocabulary_file.as_deref(),
                 config.corrections_file.as_deref(),
@@ -190,45 +212,11 @@ impl ParakeetStreamingTranscriber {
 
 impl Transcriber for ParakeetStreamingTranscriber {
     fn transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
-        if samples.is_empty() {
-            return Err(TranscribeError::AudioFormat(
-                "Empty audio buffer".to_string(),
-            ));
-        }
+        self.decode(samples, true)
+    }
 
-        let mut batch = self.batch.lock().map_err(|e| {
-            TranscribeError::InferenceFailed(format!("Failed to lock ParakeetUnified mutex: {}", e))
-        })?;
-
-        // Long recordings are decoded piece by piece, cut at pauses: see
-        // `segment::plan_segments`. A recording shorter than one piece is a
-        // single full-context decode, exactly as before.
-        let segments = if self.segment_secs > 0.0 {
-            super::segment::plan_segments(samples, 16000, self.segment_secs)
-        } else {
-            vec![(0, samples.len())]
-        };
-        let mut parts = Vec::with_capacity(segments.len());
-        for (start, end) in segments {
-            // transcribe_audio resets the instance first, so no state from
-            // a prior piece or call bleeds in.
-            let piece = &samples[start..end];
-            batch.set_offline_trailing_silence(if ends_in_speech(piece) { self.pad } else { 0 });
-            let terms = self.vocabulary.as_ref().map(|v| v.terms()).filter(|t| !t.is_empty());
-            let piece = match terms {
-                Some(terms) => self.decode_with_vocabulary(&mut batch, piece, &terms),
-                None => batch.transcribe_audio(piece.to_vec(), 16000, 1),
-            }
-            .map_err(|e| {
-                TranscribeError::InferenceFailed(format!("ParakeetUnified inference failed: {}", e))
-            })?;
-            let piece = piece.trim();
-            if !piece.is_empty() {
-                parts.push(piece.to_string());
-            }
-        }
-
-        Ok(parts.join(" "))
+    fn transcribe_piece(&self, samples: &[f32]) -> Result<String, TranscribeError> {
+        self.decode(samples, false)
     }
 
     fn transcribe_timed(&self, _samples: &[f32]) -> Result<Vec<TimedSegment>, TranscribeError> {
@@ -254,6 +242,56 @@ impl Transcriber for ParakeetStreamingTranscriber {
 }
 
 impl ParakeetStreamingTranscriber {
+    /// Offline decode, piece by piece for long recordings. Only the piece
+    /// that ends the recording can be padded: the others end at a pause cut
+    /// (see `segment::plan_segments`), where padding costs punctuation.
+    fn decode(&self, samples: &[f32], ends_recording: bool) -> Result<String, TranscribeError> {
+        if samples.is_empty() {
+            return Err(TranscribeError::AudioFormat(
+                "Empty audio buffer".to_string(),
+            ));
+        }
+
+        let mut batch = self.batch.lock().map_err(|e| {
+            TranscribeError::InferenceFailed(format!("Failed to lock ParakeetUnified mutex: {}", e))
+        })?;
+
+        // Long recordings are decoded piece by piece, cut at pauses: see
+        // `segment::plan_segments`. A recording shorter than one piece is a
+        // single full-context decode, exactly as before.
+        let segments = if self.segment_secs > 0.0 {
+            super::segment::plan_segments(samples, 16000, self.segment_secs)
+        } else {
+            vec![(0, samples.len())]
+        };
+        let mut parts = Vec::with_capacity(segments.len());
+        for (start, end) in segments {
+            // transcribe_audio resets the instance first, so no state from
+            // a prior piece or call bleeds in.
+            let piece = &samples[start..end];
+            let pad = ends_recording && end == samples.len() && ends_in_speech(piece);
+            batch.set_offline_trailing_silence(if pad { self.pad } else { 0 });
+            let terms = self
+                .vocabulary
+                .as_ref()
+                .map(|v| v.terms())
+                .filter(|t| !t.is_empty());
+            let piece = match terms {
+                Some(terms) => self.decode_with_vocabulary(&mut batch, piece, &terms),
+                None => batch.transcribe_audio(piece.to_vec(), 16000, 1),
+            }
+            .map_err(|e| {
+                TranscribeError::InferenceFailed(format!("ParakeetUnified inference failed: {}", e))
+            })?;
+            let piece = piece.trim();
+            if !piece.is_empty() {
+                parts.push(piece.to_string());
+            }
+        }
+
+        Ok(parts.join(" "))
+    }
+
     /// Offline decode of one piece, rescored against `terms`.
     fn decode_with_vocabulary(
         &self,
@@ -263,7 +301,10 @@ impl ParakeetStreamingTranscriber {
     ) -> parakeet_rs::Result<String> {
         let decode = batch.decode_offline(piece.to_vec())?;
         let started = std::time::Instant::now();
-        let scorer = UnifiedScorer { model: batch, decode: &decode };
+        let scorer = UnifiedScorer {
+            model: batch,
+            decode: &decode,
+        };
         let ids = match vocab_rescore::rescore(
             &decode.tokens,
             decode.frame_count,
@@ -337,7 +378,12 @@ fn ends_in_speech(samples: &[f32]) -> bool {
     let mut windows: Vec<f32> = samples.chunks_exact(WINDOW).map(rms).collect();
     let tenth = windows.len() / 10;
     let floor = *windows.select_nth_unstable_by(tenth, f32::total_cmp).1;
-    rms(&samples[samples.len() - TAIL..]) > 4.0 * floor.max(1e-4)
+    // Most of the tail, not its average: a key-release click is one loud window.
+    let loud = samples[samples.len() - TAIL..]
+        .chunks_exact(WINDOW)
+        .filter(|w| rms(w) > 4.0 * floor.max(1e-4))
+        .count();
+    loud * 2 >= TAIL / WINDOW
 }
 
 /// `[parakeet] streaming_max_pause_secs`: keeps at most that much of any
@@ -352,11 +398,25 @@ struct PauseLimiter {
     quiet_run: usize,
     histogram: [u32; 121],
     blocks: u32,
+    /// The latest left-out audio, replayed when speech resumes: a soft word
+    /// start ("h", "th", a breath) can sit below the quiet threshold.
+    held: std::collections::VecDeque<f32>,
 }
+
+/// Left-out audio kept for the replay (250 ms).
+const PAUSE_HOLD: usize = 4000;
+/// A chunk this long is not a capture block but the stop's tail; never left out.
+const PAUSE_MAX_CHUNK: usize = 8000;
 
 impl PauseLimiter {
     fn new(max: usize) -> Self {
-        Self { max, quiet_run: 0, histogram: [0; 121], blocks: 0 }
+        Self {
+            max,
+            quiet_run: 0,
+            histogram: [0; 121],
+            blocks: 0,
+            held: Default::default(),
+        }
     }
 
     fn percentile(&self, fraction: f32) -> f32 {
@@ -371,10 +431,11 @@ impl PauseLimiter {
         0.0
     }
 
-    /// Whether to leave `chunk` out of the stream.
-    fn skip(&mut self, chunk: &[f32]) -> bool {
-        if self.max == 0 {
-            return false;
+    /// The part of `chunk` (plus any replayed audio) the stream decodes.
+    fn feed(&mut self, chunk: &[f32]) -> Vec<f32> {
+        if self.max == 0 || chunk.len() > PAUSE_MAX_CHUNK {
+            self.quiet_run = 0;
+            return self.resume(chunk);
         }
         let power = chunk.iter().map(|s| s * s).sum::<f32>() / chunk.len() as f32;
         let db = (10.0 * (power + 1e-12).log10()).clamp(-120.0, 0.0);
@@ -382,22 +443,34 @@ impl PauseLimiter {
         self.blocks += 1;
         // A second of audio before the levels mean anything.
         if self.blocks < 50 {
-            return false;
+            return chunk.to_vec();
         }
         let floor = self.percentile(0.1);
         let speech = self.percentile(0.9);
         if speech - floor < 10.0 || db >= floor + 0.25 * (speech - floor) {
             self.quiet_run = 0;
-            return false;
+            return self.resume(chunk);
         }
+        let keep = self.max.saturating_sub(self.quiet_run).min(chunk.len());
         self.quiet_run += chunk.len();
-        self.quiet_run > self.max
+        self.held.extend(&chunk[keep..]);
+        let excess = self.held.len().saturating_sub(PAUSE_HOLD);
+        self.held.drain(..excess);
+        chunk[..keep].to_vec()
+    }
+
+    fn resume(&mut self, chunk: &[f32]) -> Vec<f32> {
+        let mut out: Vec<f32> = self.held.drain(..).collect();
+        out.extend_from_slice(chunk);
+        out
     }
 }
 
 impl StreamingTranscriber for ParakeetStreamingTranscriber {
     fn stream_progress(&self) -> Option<StreamProgress> {
-        self.progress.lock().ok().map(|p| p.clone())
+        let current = self.progress.lock().ok()?.clone();
+        let progress = current.lock().ok()?.clone();
+        Some(progress)
     }
 
     fn start_stream(
@@ -414,9 +487,9 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                     ))
                 })?;
 
-        let progress = self.progress.clone();
-        if let Ok(mut p) = progress.lock() {
-            *p = StreamProgress::default();
+        let progress: Arc<Mutex<StreamProgress>> = Arc::default();
+        if let Ok(mut slot) = self.progress.lock() {
+            *slot = progress.clone();
         }
         let right_context = self.streaming_config.right_context_samples();
         let mut pauses = PauseLimiter::new(self.max_pause);
@@ -453,9 +526,11 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 if chunk.is_empty() {
                     continue;
                 }
-                if pauses.skip(&chunk) {
+                let recorded = chunk.len();
+                let chunk = pauses.feed(&chunk);
+                if chunk.is_empty() {
                     if let Ok(mut p) = progress.lock() {
-                        p.fed += chunk.len();
+                        p.fed += recorded;
                     }
                     continue;
                 }
@@ -474,7 +549,7 @@ impl StreamingTranscriber for ParakeetStreamingTranscriber {
                 };
 
                 if let Ok(mut p) = progress.lock() {
-                    p.fed += chunk.len();
+                    p.fed += recorded;
                     if !text.is_empty() {
                         p.text.push_str(&text);
                         p.text_through = p.fed.saturating_sub(right_context);
@@ -579,20 +654,35 @@ mod tests {
     fn pauses_past_the_limit_are_left_out_of_the_stream() {
         let block = |loud: bool| -> Vec<f32> {
             (0..320)
-                .map(|i| if loud { (i as f32 * 0.3).sin() * 0.2 } else { ((i * 31) % 7) as f32 * 1e-4 })
+                .map(|i| {
+                    if loud {
+                        (i as f32 * 0.3).sin() * 0.2
+                    } else {
+                        ((i * 31) % 7) as f32 * 1e-4
+                    }
+                })
                 .collect()
         };
         let mut limiter = PauseLimiter::new(16000);
         // Half a second of room noise, then speech: the levels to judge by.
-        let start: Vec<bool> = (0..125).map(|i| limiter.skip(&block(i >= 25))).collect();
-        assert!(start.iter().all(|s| !s));
-        // 1 s of pause kept, the rest of a 3 s pause skipped.
-        let pause: Vec<bool> = (0..150).map(|_| limiter.skip(&block(false))).collect();
-        assert_eq!(pause.iter().filter(|s| !**s).count(), 50);
-        // Speech resets the run.
-        assert!(!limiter.skip(&block(true)));
-        assert!(!limiter.skip(&block(false)));
-        assert!(!PauseLimiter::new(0).skip(&block(false)));
+        let start: usize = (0..125).map(|i| limiter.feed(&block(i >= 25)).len()).sum();
+        assert_eq!(start, 125 * 320);
+        // 1 s of a 3 s pause is kept, cut mid-block where the limit falls.
+        let pause: usize = (0..150).map(|_| limiter.feed(&block(false)).len()).sum();
+        assert_eq!(pause, 16000);
+        // Speech resumes with the last 250 ms of the pause replayed first.
+        assert_eq!(limiter.feed(&block(true)).len(), PAUSE_HOLD + 320);
+        assert_eq!(limiter.feed(&block(false)).len(), 320);
+        // The stop's long tail chunk is never left out.
+        let mut tail = PauseLimiter::new(16000);
+        for i in 0..125 {
+            let _ = tail.feed(&block(i >= 25));
+        }
+        for _ in 0..150 {
+            let _ = tail.feed(&block(false));
+        }
+        assert_eq!(tail.feed(&vec![0.0; 9600]).len(), PAUSE_HOLD + 9600);
+        assert_eq!(PauseLimiter::new(0).feed(&block(false)).len(), 320);
     }
 
     /// Runs only with `VOXTYPE_TEST_PARAKEET_MODEL` set to a
@@ -603,7 +693,10 @@ mod tests {
             eprintln!("skipped: VOXTYPE_TEST_PARAKEET_MODEL is not set");
             return;
         };
-        let wav = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/parakeet/kaliko_hesitated.wav");
+        let wav = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/parakeet/kaliko_hesitated.wav"
+        );
         let audio: Vec<f32> = hound::WavReader::open(wav)
             .unwrap()
             .samples::<i16>()
@@ -622,12 +715,18 @@ mod tests {
             Err(e) => panic!("load: {e}"),
         };
         let plain = decode(&config);
-        assert!(!plain.contains("Kaliko"), "greedy decode already right: {plain}");
+        assert!(
+            !plain.contains("Kaliko"),
+            "greedy decode already right: {plain}"
+        );
         let rescored = decode(&ParakeetConfig {
             vocabulary_file: Some(vocabulary),
             ..config
         });
-        assert!(rescored.starts_with("Kaliko hesitated"), "{plain} -> {rescored}");
+        assert!(
+            rescored.starts_with("Kaliko hesitated"),
+            "{plain} -> {rescored}"
+        );
     }
 
     /// Same model gate as above. Expected pieces come from Python
@@ -654,9 +753,16 @@ mod tests {
             ("voxtype", &["\u{2581}v", "o", "xt", "y", "pe"]),
             ("Hyprland", &["\u{2581}H", "y", "pr", "land"]),
             ("Kubernetes", &["\u{2581}K", "u", "ber", "n", "et", "es"]),
-            ("Hello, world.", &["\u{2581}He", "ll", "o", ",", "\u{2581}wor", "ld", "."]),
+            (
+                "Hello, world.",
+                &["\u{2581}He", "ll", "o", ",", "\u{2581}wor", "ld", "."],
+            ),
         ] {
-            let got: Vec<&str> = vocab.encode(text).iter().map(|&id| vocab.piece(id).unwrap()).collect();
+            let got: Vec<&str> = vocab
+                .encode(text)
+                .iter()
+                .map(|&id| vocab.piece(id).unwrap())
+                .collect();
             assert_eq!(got, pieces, "{text}");
         }
     }

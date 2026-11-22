@@ -15,6 +15,7 @@
 //! scoring itself lives in the vendored parakeet-rs (`score_pieces`).
 
 use rphonetic::{DoubleMetaphone, Encoder};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,6 +26,15 @@ const MAX_SPAN_WORDS: usize = 4;
 /// comparisons per span, and only the plausible ones reach the model.
 const MAX_TERMS: usize = 128;
 const WORD_MARK: char = '\u{2581}';
+/// One-word spans never rescored unless a corrections row names them: with
+/// "Theo" in the vocabulary, every "the" would otherwise be a candidate.
+const FUNCTION_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "do", "for", "from", "go", "he", "her",
+    "him", "his", "i", "if", "in", "is", "it", "its", "me", "my", "no", "not", "of", "on", "or",
+    "our", "she", "so", "than", "that", "the", "thee", "their", "them", "then", "there", "these",
+    "they", "this", "those", "to", "too", "up", "us", "was", "we", "were", "what", "when", "which",
+    "who", "will", "with", "you", "your",
+];
 
 /// One vocabulary term, prepared for matching.
 #[derive(Debug, Clone, PartialEq)]
@@ -69,11 +79,19 @@ fn key_of(text: &str) -> String {
 /// comments), corrections rows (`heard<TAB>meant<TAB>...`) and extra terms.
 pub fn parse_terms(vocabulary: &str, corrections: &str, extra: &[String]) -> Vec<Term> {
     let mut terms: Vec<Term> = Vec::new();
+    let mut index_of: HashMap<String, usize> = HashMap::new();
+    let mut skipped = 0usize;
     let mut add = |text: &str, alias: Option<&str>| {
-        let Some(term) = Term::new(text) else { return };
-        let index = match terms.iter().position(|t| t.text == term.text) {
-            Some(i) => i,
+        let text = text.trim();
+        let index = match index_of.get(text) {
+            Some(&i) => i,
+            None if terms.len() >= MAX_TERMS => {
+                skipped += 1;
+                return;
+            }
             None => {
+                let Some(term) = Term::new(text) else { return };
+                index_of.insert(term.text.clone(), terms.len());
                 terms.push(term);
                 terms.len() - 1
             }
@@ -103,13 +121,12 @@ pub fn parse_terms(vocabulary: &str, corrections: &str, extra: &[String]) -> Vec
     for term in extra {
         add(term, None);
     }
-    if terms.len() > MAX_TERMS {
+    if skipped > 0 {
         tracing::warn!(
-            "Parakeet vocabulary: {} terms, using the first {}",
-            terms.len(),
+            "Parakeet vocabulary: {} more terms past the first {} ignored",
+            skipped,
             MAX_TERMS
         );
-        terms.truncate(MAX_TERMS);
     }
     terms
 }
@@ -136,10 +153,13 @@ fn modified(path: &Option<PathBuf>) -> Option<SystemTime> {
 
 fn read(path: &Option<PathBuf>) -> String {
     match path {
-        Some(p) => std::fs::read_to_string(p).unwrap_or_else(|e| {
-            tracing::warn!("Parakeet vocabulary: cannot read {}: {}", p.display(), e);
-            String::new()
-        }),
+        Some(p) => match std::fs::read(p) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => {
+                tracing::warn!("Parakeet vocabulary: cannot read {}: {}", p.display(), e);
+                String::new()
+            }
+        },
         None => String::new(),
     }
 }
@@ -246,15 +266,39 @@ fn words(ids: &[usize], scorer: &dyn SpanScorer) -> Vec<Word> {
     words
 }
 
-/// Whether the span (its words' keys) could be a mishearing of `term`.
-fn plausible(words: &[String], term: &Term) -> bool {
-    let span_key = words.concat();
-    let span_key = span_key.as_str();
+/// A span's words' keys, with what matching needs computed once.
+struct Span {
+    words: Vec<String>,
+    key: String,
+    primary: String,
+    alternate: String,
+}
+
+impl Span {
+    fn new(words: Vec<String>) -> Self {
+        let key = words.concat();
+        let encoder = DoubleMetaphone::default();
+        Self {
+            primary: encoder.encode(&key),
+            alternate: encoder.encode_alternate(&key),
+            words,
+            key,
+        }
+    }
+}
+
+/// Whether the span could be a mishearing of `term`.
+fn plausible(span: &Span, term: &Term) -> bool {
+    let words = &span.words;
+    let span_key = span.key.as_str();
     let span_words = words.len();
     if term.aliases.iter().any(|a| a == span_key) {
         return true;
     }
     if span_words + 1 < term.words || span_words > term.words + 1 {
+        return false;
+    }
+    if span_words == 1 && FUNCTION_WORDS.contains(&span_key) {
         return false;
     }
     if span_key == term.key {
@@ -268,6 +312,13 @@ fn plausible(words: &[String], term: &Term) -> bool {
     if span_words > term.words && has_term {
         return false;
     }
+    // An extra word must be (nearly) all spacing, never a real word the term
+    // would delete: "hyper land" -> Hyprland, not "Mana shot" -> Manash.
+    if span_words > term.words
+        && span_key.chars().count() > term.key.chars().count() + (span_words - term.words)
+    {
+        return false;
+    }
     // Double Metaphone codes stop at four letters, so length has to agree
     // too, or "hyper land today" would sound like "Hyprland".
     let (a, b) = (span_key.chars().count(), term.key.chars().count());
@@ -278,12 +329,18 @@ fn plausible(words: &[String], term: &Term) -> bool {
     if similarity >= 0.75 {
         return true;
     }
-    let encoder = DoubleMetaphone::default();
-    let (p, a) = (encoder.encode(span_key), encoder.encode_alternate(span_key));
-    let sounds_alike = [&p, &a]
+    let sounds_alike = [&span.primary, &span.alternate]
         .iter()
         .any(|k| !k.is_empty() && (**k == term.primary || **k == term.alternate));
     similarity >= 0.5 && sounds_alike
+}
+
+/// "Rust", "Linear", "New York": capitals only at word starts.
+fn is_titlecase(text: &str) -> bool {
+    text.split_whitespace().all(|w| {
+        let mut chars = w.chars();
+        chars.next().is_some_and(char::is_uppercase) && chars.all(|c| !c.is_uppercase())
+    })
 }
 
 /// One accepted replacement, for logging and tests.
@@ -326,14 +383,21 @@ pub fn rescore(
                 break;
             }
             let span = words[start].tokens.start..words[start + n - 1].tokens.end;
+            // A word glued to "(" or "-" has no word mark; replacing it
+            // would insert a space.
+            if !scorer.piece(ids[span.start]).starts_with(WORD_MARK) {
+                break;
+            }
             let heard = text_of(&span);
-            let word_keys: Vec<String> = words[start..start + n]
-                .iter()
-                .map(|w| key_of(&text_of(&w.tokens)))
-                .collect();
+            let candidate_span = Span::new(
+                words[start..start + n]
+                    .iter()
+                    .map(|w| key_of(&text_of(&w.tokens)))
+                    .collect(),
+            );
             let picked: Vec<&Term> = terms
                 .iter()
-                .filter(|t| t.text != heard && plausible(&word_keys, t))
+                .filter(|t| t.text != heard && plausible(&candidate_span, t))
                 .collect();
             if picked.is_empty() {
                 continue;
@@ -370,7 +434,17 @@ pub fn rescore(
                 .iter()
                 .enumerate()
                 .map(|(i, term)| {
-                    let boosted = scores[i + 1] + boost * candidates[i + 1].len() as f32;
+                    // A plain capital is no acoustic evidence: "rust" stays
+                    // "rust" unless the model itself prefers "Rust". Brand
+                    // casing (PipeWire, voxtype) is what the file is for.
+                    let term_boost = if heard.to_lowercase() == term.text.to_lowercase()
+                        && is_titlecase(&term.text)
+                    {
+                        0.0
+                    } else {
+                        boost
+                    };
+                    let boosted = scores[i + 1] + term_boost * candidates[i + 1].len() as f32;
                     (term, boosted - heard_score, scores[i + 1])
                 })
                 .max_by(|a, b| a.1.total_cmp(&b.1));
@@ -569,11 +643,38 @@ mod tests {
             run("Quilter is here", "Quilter", &scores),
             "Quilter is here"
         );
+        // "shot" is a real word, not spacing: Manash may not eat it.
         let scores = [("Mana shot", -3.0), ("Manash", -4.0)];
         assert_eq!(
             run("by Mana shot today", "Manash", &scores),
+            "by Mana shot today"
+        );
+        let scores = [("man ash", -3.0), ("Manash", -4.0)];
+        assert_eq!(
+            run("by man ash today", "Manash", &scores),
             "by Manash today"
         );
+    }
+
+    #[test]
+    fn casing_alone_and_function_words_get_no_boost() {
+        // Would win only through the boost.
+        let scores = [("rust", -3.0), ("Rust", -4.0)];
+        assert_eq!(run("written in rust", "Rust", &scores), "written in rust");
+        let scores = [("Pipewire", -3.0), ("PipeWire", -4.0)];
+        assert_eq!(
+            run("so Pipewire works", "PipeWire", &scores),
+            "so PipeWire works"
+        );
+        let scores = [("the", -3.0), ("Theo", -4.0)];
+        assert_eq!(run("ask the about it", "Theo", &scores), "ask the about it");
+    }
+
+    #[test]
+    fn term_list_is_capped() {
+        let vocab: String = (0..20_000).map(|i| format!("Term{i}\n")).collect();
+        let terms = parse_terms(&vocab, "", &[]);
+        assert_eq!(terms.len(), MAX_TERMS);
     }
 
     #[test]
@@ -582,7 +683,10 @@ mod tests {
         assert_eq!(terms.len(), 1);
         assert_eq!(terms[0].text, "voxtype");
         assert_eq!(terms[0].aliases, vec!["boxtype".to_string()]);
-        assert!(plausible(&["box".into(), "type".into()], &terms[0]));
+        assert!(plausible(
+            &Span::new(vec!["box".into(), "type".into()]),
+            &terms[0]
+        ));
     }
 
     #[test]
