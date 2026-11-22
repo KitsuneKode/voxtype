@@ -379,6 +379,11 @@ required-features = ["cohere"]
 # if needed) once that PR merges and ships in a crates.io release.
 [patch.crates-io]
 openvino-genai = { git = "https://github.com/voxtype/openvino-rs", branch = "whisper-pipeline-with-properties" }
+# Fork-only: parakeet-rs 0.3.5 vendored so the unified (RNN-T) offline decode
+# can expose its predictor states and decoder_joint session for vocabulary
+# rescoring. Every change against the crates.io release is in the commit
+# after "vendor parakeet-rs 0.3.5"; diff crates/parakeet-rs against it.
+parakeet-rs = { path = "crates/parakeet-rs" }
 
 [[example]]
 name = "parakeet_bench"
