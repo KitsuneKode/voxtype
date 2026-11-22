@@ -50,6 +50,8 @@ pub struct ParakeetStreamingTranscriber {
     /// Longest piece the batch/final pass decodes at once
     /// (`final_pass_segment_secs`); 0 = whole recording.
     segment_secs: f32,
+    /// `[parakeet] pad_secs`, in samples.
+    pad: usize,
     /// Streaming-config snapshot used both for batch (so the handle's
     /// `from_shared_with_streaming_config` succeeds) and for spawning each
     /// streaming task.
@@ -162,6 +164,7 @@ impl ParakeetStreamingTranscriber {
         Ok(Self {
             handle,
             segment_secs: config.final_pass_segment_secs,
+            pad: (config.pad_secs.max(0.0) * 16000.0) as usize,
             streaming_config,
             batch: Mutex::new(batch),
         })
@@ -192,8 +195,10 @@ impl Transcriber for ParakeetStreamingTranscriber {
         for (start, end) in segments {
             // transcribe_audio resets the instance first, so no state from
             // a prior piece or call bleeds in.
+            let piece = &samples[start..end];
+            batch.set_offline_trailing_silence(if ends_in_speech(piece) { self.pad } else { 0 });
             let piece = batch
-                .transcribe_audio(samples[start..end].to_vec(), 16000, 1)
+                .transcribe_audio(piece.to_vec(), 16000, 1)
                 .map_err(|e| {
                     TranscribeError::InferenceFailed(format!("ParakeetUnified inference failed: {}", e))
                 })?;
@@ -220,6 +225,27 @@ impl Transcriber for ParakeetStreamingTranscriber {
     fn as_streaming(&self) -> Option<&dyn StreamingTranscriber> {
         Some(self)
     }
+}
+
+/// Whether `samples` stop mid-word: their last 200 ms are well above the
+/// recording's noise floor (its quietest tenth of 20 ms windows). A key
+/// released right after the last word leaves the decoder no audio past it,
+/// and it drops or clips that word ("said Shaggy" -> "said Sh"); `pad_secs`
+/// of silence brings it back. A recording that already ends in a pause is
+/// decoded as it is: padding those costs sentence-final punctuation.
+/// Measured on LibriSpeech clips: natural endings sit at 0.4-2.3x the
+/// floor (three outliers up to 46x), endings cut mid-decay at 6-305x.
+fn ends_in_speech(samples: &[f32]) -> bool {
+    const WINDOW: usize = 320;
+    const TAIL: usize = 3200;
+    if samples.len() < TAIL * 2 {
+        return true;
+    }
+    let rms = |w: &[f32]| (w.iter().map(|v| v * v).sum::<f32>() / w.len() as f32).sqrt();
+    let mut windows: Vec<f32> = samples.chunks_exact(WINDOW).map(rms).collect();
+    let tenth = windows.len() / 10;
+    let floor = *windows.select_nth_unstable_by(tenth, f32::total_cmp).1;
+    rms(&samples[samples.len() - TAIL..]) > 4.0 * floor.max(1e-4)
 }
 
 impl StreamingTranscriber for ParakeetStreamingTranscriber {
@@ -363,6 +389,18 @@ mod tests {
             right_context_secs: config.streaming_right_context_secs,
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn only_audio_cut_off_mid_speech_counts_as_ending_in_speech() {
+        let speech = |i: usize| (i as f32 * 0.05).sin() * 0.2;
+        let noise = |i: usize| ((i * 7919) % 97) as f32 * 2e-5;
+        let mut paused: Vec<f32> = (0..32000).map(|i| speech(i) + noise(i)).collect();
+        paused.extend((0..8000).map(noise));
+        assert!(!ends_in_speech(&paused));
+        let mut cut: Vec<f32> = (0..8000).map(noise).collect();
+        cut.extend((0..32000).map(|i| speech(i) + noise(i)));
+        assert!(ends_in_speech(&cut));
     }
 
     #[test]

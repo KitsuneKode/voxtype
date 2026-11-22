@@ -138,6 +138,7 @@ pub struct ParakeetUnified {
     next_chunk_start_sample: usize,
     accumulated_tokens: Vec<usize>,
     accumulated_timed_tokens: Vec<TimedToken>,
+    offline_trailing_silence: usize,
 }
 
 impl ParakeetUnifiedHandle {
@@ -241,6 +242,7 @@ impl ParakeetUnified {
             next_chunk_start_sample: 0,
             accumulated_tokens: Vec::new(),
             accumulated_timed_tokens: Vec::new(),
+            offline_trailing_silence: 0,
         })
     }
 
@@ -250,6 +252,13 @@ impl ParakeetUnified {
 
     pub fn preprocessor_config(&self) -> &PreprocessorConfig {
         &self.preprocessor_config
+    }
+
+    /// Samples of silence the next offline decodes append to their audio
+    /// (normalized with the statistics of the audio alone). Streaming is
+    /// unaffected.
+    pub fn set_offline_trailing_silence(&mut self, samples: usize) {
+        self.offline_trailing_silence = samples;
     }
 
     pub fn reset(&mut self) {
@@ -523,7 +532,13 @@ impl ParakeetUnified {
     ) -> Result<TranscriptionResult> {
         self.reset();
 
-        let features = audio::extract_features_raw(audio, sample_rate, channels, &self.preprocessor_config)?;
+        let features = audio::extract_features_padded(
+            audio,
+            sample_rate,
+            channels,
+            &self.preprocessor_config,
+            self.offline_trailing_silence,
+        )?;
         let (encoded, encoded_len) = {
             let mut model = self
                 .model

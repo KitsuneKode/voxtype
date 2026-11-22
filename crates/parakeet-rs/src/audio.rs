@@ -167,10 +167,26 @@ pub fn create_mel_filterbank(n_fft: usize, n_mels: usize, sample_rate: usize) ->
 ///
 /// 2D array of mel spectrogram features (time_steps x feature_size)
 pub fn extract_features_raw(
+    audio: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+    config: &PreprocessorConfig,
+) -> Result<Array2<f32>> {
+    extract_features_padded(audio, sample_rate, channels, config, 0)
+}
+
+/// [`extract_features_raw`] of `audio` followed by `trailing_silence`
+/// (mono) samples of silence, normalized with the statistics of the audio
+/// alone. Digital silence sits far below any recording's noise floor, so
+/// letting it into the per-feature mean and variance shifts every real
+/// frame; the model then drops sentence-final punctuation and misspells
+/// names.
+pub fn extract_features_padded(
     mut audio: Vec<f32>,
     sample_rate: u32,
     channels: u16,
     config: &PreprocessorConfig,
+    trailing_silence: usize,
 ) -> Result<Array2<f32>> {
     if sample_rate != config.sampling_rate as u32 {
         return Err(Error::Audio(format!(
@@ -187,6 +203,12 @@ pub fn extract_features_raw(
         audio = mono;
     }
 
+    // Frames whose window ends inside the audio (the frame centred on the
+    // last sample already sees the silence, through pre-emphasis).
+    let real_frames = (audio.len().saturating_sub(config.win_length - config.n_fft / 2))
+        / config.hop_length
+        + 1;
+    audio.resize(audio.len() + trailing_silence, 0.0);
     audio = apply_preemphasis(&audio, config.preemphasis);
 
     let spectrogram = stft(&audio, config.n_fft, config.hop_length, config.win_length)?;
@@ -208,11 +230,17 @@ pub fn extract_features_raw(
         return Ok(mel_spectrogram);
     }
 
+    let stat_frames = if trailing_silence == 0 {
+        num_frames
+    } else {
+        real_frames.clamp(2, num_frames)
+    };
     for feat_idx in 0..num_features {
         let mut column = mel_spectrogram.column_mut(feat_idx);
-        let mean: f32 = column.iter().sum::<f32>() / num_frames as f32;
+        let real = || column.iter().take(stat_frames);
+        let mean: f32 = real().sum::<f32>() / stat_frames as f32;
         let variance: f32 =
-            column.iter().map(|&x| (x - mean).powi(2)).sum::<f32>() / (num_frames as f32 - 1.0);
+            real().map(|&x| (x - mean).powi(2)).sum::<f32>() / (stat_frames as f32 - 1.0);
         let std = variance.sqrt() + 1e-5;
 
         for val in column.iter_mut() {
@@ -232,6 +260,42 @@ mod tests {
         (0..num_samples)
             .map(|i| (2.0 * PI * freq_hz * i as f32 / sample_rate as f32).sin())
             .collect()
+    }
+
+    #[test]
+    fn trailing_silence_leaves_the_real_frames_unchanged() {
+        let config = PreprocessorConfig {
+            feature_extractor_type: String::new(),
+            feature_size: 128,
+            hop_length: 160,
+            n_fft: 512,
+            padding_side: "right".into(),
+            padding_value: 0.0,
+            preemphasis: 0.97,
+            processor_class: String::new(),
+            return_attention_mask: true,
+            sampling_rate: 16000,
+            win_length: 400,
+        };
+        let audio: Vec<f32> = (0..16000)
+            .map(|i| (i as f32 * 0.07).sin() * 0.3 + ((i * 7919) % 101) as f32 * 1e-4)
+            .collect();
+        let short = extract_features_padded(audio.clone(), 16000, 1, &config, 1600).unwrap();
+        let long = extract_features_padded(audio.clone(), 16000, 1, &config, 16000).unwrap();
+        assert_eq!(long.shape()[0], short.shape()[0] + 90);
+        // However much silence follows, the audio's own frames come out the
+        // same: the silence does not enter the normalization.
+        for t in 0..16000 / 160 {
+            for f in 0..128 {
+                let (a, b) = (short[[t, f]], long[[t, f]]);
+                assert!((a - b).abs() < 1e-3, "frame {t} feature {f}: {a} vs {b}");
+            }
+        }
+        // No padding is exactly the unpadded extractor.
+        assert_eq!(
+            extract_features_padded(audio.clone(), 16000, 1, &config, 0).unwrap(),
+            extract_features_raw(audio, 16000, 1, &config).unwrap()
+        );
     }
 
     #[test]
