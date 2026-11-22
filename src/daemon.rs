@@ -1252,6 +1252,14 @@ type TranscriberLoadTask = tokio::task::JoinHandle<
     std::result::Result<Arc<dyn Transcriber>, crate::error::TranscribeError>,
 >;
 
+/// In-flight on-demand load of the streaming transcriber after `idle_unload_secs`
+/// evicted it. Audio capture is already running and buffering into `samples_rx`
+/// while the OSD and start beep have already fired.
+struct PendingStreamingLoad {
+    samples_rx: Option<tokio::sync::mpsc::Receiver<Vec<f32>>>,
+    task: TranscriberLoadTask,
+}
+
 /// Main daemon that orchestrates all components
 pub struct Daemon {
     config: Config,
@@ -1303,6 +1311,10 @@ pub struct Daemon {
     /// Set only when that option is on; taken by `end_streaming` and
     /// dropped by every cut, so it never outlives its session.
     streaming_final_audio: Option<Vec<f32>>,
+    /// Background model load for a cold streaming start (`idle_unload_secs > 0`).
+    /// Keeps the OSD, start sound, and audio level meter instant while the
+    /// model loads onto CUDA in parallel with mic capture.
+    streaming_load_task: Option<PendingStreamingLoad>,
     /// Background decode of the pieces of an on_stop streaming session that
     /// are already complete (see `transcribe::incremental`). Started with
     /// the capture when the final pass is on; consumed at stop.
@@ -1528,6 +1540,7 @@ impl Daemon {
             streaming_preview: None,
             streaming_feed: None,
             streaming_final_audio: None,
+            streaming_load_task: None,
             incremental_final_pass: None,
             final_pass_task: None,
             osd_supervisor_task: None,
@@ -1582,6 +1595,7 @@ impl Daemon {
             || self.incremental_final_pass.is_some()
             || self.meeting_daemon.is_some()
             || self.model_load_task.is_some()
+            || self.streaming_load_task.is_some()
         {
             return false;
         }
@@ -1719,6 +1733,9 @@ impl Daemon {
         // including resident workers and per-record overrides, uses this snapshot.
         if let Some(task) = self.model_load_task.take() {
             task.abort();
+        }
+        if let Some(pending) = self.streaming_load_task.take() {
+            pending.task.abort();
         }
         if let Some((_, task)) = self.override_load_task.take() {
             task.abort();
@@ -2093,60 +2110,40 @@ impl Daemon {
             Err(()) => return false,
         };
 
-        let transcriber = match preloaded {
-            Some(t) => t,
-            None => {
-                tracing::info!(
-                    "Loading transcription model on demand (idle_unload_secs={})",
-                    self.config.idle_unload_secs()
-                );
-                let config = self.config.clone();
-                let created = tokio::task::spawn_blocking(move || {
-                    crate::transcribe::create_transcriber(&config)
-                })
-                .await;
-                match created {
-                    Ok(Ok(t)) => {
-                        let t: Arc<dyn Transcriber> = Arc::from(t);
-                        if t.as_streaming().is_none() {
-                            let mut c = capture;
-                            let _ = c.stop().await;
-                            self.transcriber_preloaded = Some(t);
-                            self.touch_transcriber_used();
-                            return false;
-                        }
-                        self.transcriber_preloaded = Some(t.clone());
-                        t
-                    }
-                    Ok(Err(e)) => {
-                        tracing::error!("Failed to load streaming transcriber: {}", e);
-                        self.play_feedback(SoundEvent::Error);
-                        let mut c = capture;
-                        let _ = c.stop().await;
-                        return false;
-                    }
+        let handle = match preloaded {
+            Some(transcriber) => {
+                self.touch_transcriber_used();
+                let streaming = transcriber.as_streaming().expect("checked above");
+                match streaming.start_stream(samples_rx) {
+                    Ok(h) => Some(h),
                     Err(e) => {
-                        tracing::error!("Streaming transcriber load task panicked: {}", e);
+                        tracing::error!("Failed to start streaming session: {}", e);
                         self.play_feedback(SoundEvent::Error);
+                        // Drop the capture cleanly; ignore final samples.
                         let mut c = capture;
                         let _ = c.stop().await;
                         return false;
                     }
                 }
             }
-        };
-        self.touch_transcriber_used();
-
-        let streaming = transcriber.as_streaming().expect("checked above");
-        let handle = match streaming.start_stream(samples_rx) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!("Failed to start streaming session: {}", e);
-                self.play_feedback(SoundEvent::Error);
-                // Drop the capture cleanly; ignore final samples.
-                let mut c = capture;
-                let _ = c.stop().await;
-                return false;
+            None => {
+                // Keep the OSD, start beep, and live audio meter instant while
+                // the model loads onto CUDA in the background. `samples_rx`
+                // buffers mic chunks (2048-slot channel) until the load finishes
+                // and `complete_streaming_load` attaches the streaming backend.
+                tracing::info!(
+                    "Loading transcription model in background (idle_unload_secs={})",
+                    self.config.idle_unload_secs()
+                );
+                let config = self.config.clone();
+                let task = tokio::task::spawn_blocking(move || {
+                    crate::transcribe::create_transcriber(&config).map(Arc::from)
+                });
+                self.streaming_load_task = Some(PendingStreamingLoad {
+                    samples_rx: Some(samples_rx),
+                    task,
+                });
+                None
             }
         };
 
@@ -2170,7 +2167,7 @@ impl Daemon {
             .map(PreviewFile::new);
 
         *audio_capture = Some(capture);
-        *streaming_handle = Some(handle);
+        *streaming_handle = handle;
         self.streaming_feed = Some(feed);
         *streaming_session = Some(StreamingSession::new());
         *streaming_chain = Some(output::create_output_chain(&self.config.output));
@@ -2205,6 +2202,233 @@ impl Daemon {
         }
 
         true
+    }
+
+    /// Finish a cold-start background model load for a streaming session.
+    /// Attaches the streaming backend if capture is still active, or runs the
+    /// deferred final pass if the user already pressed stop during the load.
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_streaming_load(
+        &mut self,
+        mut pending: PendingStreamingLoad,
+        loaded: std::result::Result<
+            std::result::Result<Arc<dyn Transcriber>, crate::error::TranscribeError>,
+            tokio::task::JoinError,
+        >,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+    ) {
+        let transcriber = match loaded {
+            Ok(Ok(t)) => {
+                self.transcriber_preloaded = Some(t.clone());
+                self.touch_transcriber_used();
+                t
+            }
+            Ok(Err(e)) => {
+                tracing::error!("Failed to load streaming transcriber: {}", e);
+                self.fail_streaming_load(
+                    state,
+                    audio_capture,
+                    streaming_session,
+                    streaming_chain,
+                )
+                .await;
+                return;
+            }
+            Err(e) => {
+                tracing::error!("Streaming transcriber load task panicked: {}", e);
+                self.fail_streaming_load(
+                    state,
+                    audio_capture,
+                    streaming_session,
+                    streaming_chain,
+                )
+                .await;
+                return;
+            }
+        };
+
+        if !state.is_streaming() {
+            return;
+        }
+
+        if audio_capture.is_some() {
+            let Some(streaming) = transcriber.as_streaming() else {
+                tracing::error!("Loaded model does not support streaming");
+                self.fail_streaming_load(
+                    state,
+                    audio_capture,
+                    streaming_session,
+                    streaming_chain,
+                )
+                .await;
+                return;
+            };
+            if let Some(samples_rx) = pending.samples_rx.take() {
+                match streaming.start_stream(samples_rx) {
+                    Ok(h) => {
+                        *streaming_handle = Some(h);
+                        tracing::info!("Streaming backend attached after background model load");
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to start streaming session after load: {}", e);
+                        self.fail_streaming_load(
+                            state,
+                            audio_capture,
+                            streaming_session,
+                            streaming_chain,
+                        )
+                        .await;
+                    }
+                }
+            }
+            return;
+        }
+
+        // User pressed stop while the model was still loading.
+        if let Some(captured) = self.streaming_final_audio.take() {
+            let incremental = self.incremental_final_pass.take();
+            self.spawn_final_pass(captured, transcriber, incremental);
+            self.end_streaming(
+                state,
+                audio_capture,
+                streaming_handle,
+                streaming_session,
+                streaming_chain,
+            )
+            .await;
+        } else if streaming_session.is_some() {
+            if let (Some(streaming), Some(samples_rx)) =
+                (transcriber.as_streaming(), pending.samples_rx.take())
+            {
+                match streaming.start_stream(samples_rx) {
+                    Ok(h) => {
+                        *streaming_handle = Some(h);
+                        return;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to drain stopped streaming session after load: {}", e);
+                    }
+                }
+            }
+            self.end_streaming(
+                state,
+                audio_capture,
+                streaming_handle,
+                streaming_session,
+                streaming_chain,
+            )
+            .await;
+        } else {
+            self.end_streaming(
+                state,
+                audio_capture,
+                streaming_handle,
+                streaming_session,
+                streaming_chain,
+            )
+            .await;
+        }
+    }
+
+    async fn fail_streaming_load(
+        &mut self,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+    ) {
+        if !state.is_streaming() {
+            return;
+        }
+        self.cut_streaming_audio();
+        self.abandon_final_pass();
+        self.streaming_final_audio = None;
+        self.stop_streaming_drain_pump();
+        if let Some(mut c) = audio_capture.take() {
+            let _ = c.stop().await;
+        }
+        self.restore_recording_media();
+        if let Some(mut preview) = self.streaming_preview.take() {
+            preview.clear();
+        }
+        *streaming_session = None;
+        *streaming_chain = None;
+        self.end_external_session(true).await;
+        discard_recording_overrides();
+        self.publish_osd_outcome(osd::session::OutcomeKind::Error, 0);
+        *state = State::Idle;
+        self.update_state("idle");
+        self.play_feedback(SoundEvent::Error);
+    }
+
+    /// Spawn the offline full-context final pass for an `on_stop` streaming recording.
+    fn spawn_final_pass(
+        &mut self,
+        captured: Vec<f32>,
+        transcriber: Arc<dyn Transcriber>,
+        incremental: Option<crate::transcribe::incremental::IncrementalFinalPass>,
+    ) {
+        let secs = captured.len() as f32 / self.config.audio.sample_rate as f32;
+        let captured = Arc::new(captured);
+        let wav = Arc::clone(&captured);
+        let rate = self.config.audio.sample_rate;
+        tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
+        let transcriber_retry = transcriber.clone();
+        self.final_pass_task = Some(tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let first = match incremental {
+                Some(pass) => pass.finish(captured.clone()).await,
+                None => {
+                    let audio = captured.clone();
+                    let worker = transcriber.clone();
+                    tokio::task::spawn_blocking(move || worker.transcribe(&audio))
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(crate::error::TranscribeError::InferenceFailed(e.to_string()))
+                        })
+                }
+            };
+            // One failure retries the whole recording once. The streamed
+            // text is the fallback only when that retry fails too. An
+            // empty success is silence, not a failure, so it is not retried.
+            let result = match first {
+                Ok(text) => Ok(text),
+                Err(e) => {
+                    tracing::warn!(
+                        "Final pass failed, retrying the whole take once: {}",
+                        e
+                    );
+                    let audio = captured.clone();
+                    tokio::task::spawn_blocking(move || {
+                        transcriber_retry.transcribe(&audio)
+                    })
+                    .await
+                    .unwrap_or_else(|err| {
+                        Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
+                    })
+                }
+            };
+            let text = match result {
+                Ok(text) if !text.trim().is_empty() => {
+                    tracing::info!(
+                        "Final pass decoded {:.1}s in {}ms after stop",
+                        secs,
+                        started.elapsed().as_millis()
+                    );
+                    Some(text.trim().to_string())
+                }
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("Final pass retry failed, keeping streamed text: {}", e);
+                    None
+                }
+            };
+            (text, captured)
+        }));
     }
 
     /// End an external-trigger (SIGUSR1 / `record start`) session that is
@@ -2492,62 +2716,15 @@ impl Daemon {
                 }
                 drop(feed);
                 let incremental = self.incremental_final_pass.take();
-                let captured = Arc::new(captured);
-                let wav = Arc::clone(&captured);
-                let rate = self.config.audio.sample_rate;
-                tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
-                let transcriber_retry = transcriber.clone();
-                self.final_pass_task = Some(tokio::spawn(async move {
-                    let started = std::time::Instant::now();
-                    let first = match incremental {
-                        Some(pass) => pass.finish(captured.clone()).await,
-                        None => {
-                            let audio = captured.clone();
-                            let worker = transcriber.clone();
-                            tokio::task::spawn_blocking(move || worker.transcribe(&audio))
-                                .await
-                                .unwrap_or_else(|e| {
-                                    Err(crate::error::TranscribeError::InferenceFailed(e.to_string()))
-                                })
-                        }
-                    };
-                    // One failure retries the whole recording once. The streamed
-                    // text is the fallback only when that retry fails too. An
-                    // empty success is silence, not a failure, so it is not retried.
-                    let result = match first {
-                        Ok(text) => Ok(text),
-                        Err(e) => {
-                            tracing::warn!(
-                                "Final pass failed, retrying the whole take once: {}",
-                                e
-                            );
-                            let audio = captured.clone();
-                            tokio::task::spawn_blocking(move || {
-                                transcriber_retry.transcribe(&audio)
-                            })
-                            .await
-                            .unwrap_or_else(|err| {
-                                Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
-                            })
-                        }
-                    };
-                    let text = match result {
-                        Ok(text) if !text.trim().is_empty() => {
-                            tracing::info!(
-                                "Final pass decoded {:.1}s in {}ms after stop",
-                                secs,
-                                started.elapsed().as_millis()
-                            );
-                            Some(text.trim().to_string())
-                        }
-                        Ok(_) => None,
-                        Err(e) => {
-                            tracing::warn!("Final pass retry failed, keeping streamed text: {}", e);
-                            None
-                        }
-                    };
-                    (text, captured)
-                }));
+                self.spawn_final_pass(captured, transcriber, incremental);
+                self.update_state("transcribing");
+                return;
+            } else if self.streaming_load_task.is_some() {
+                // Model is still loading in the background; hold the recording
+                // so `complete_streaming_load` runs the final pass as soon as
+                // the model is ready.
+                drop(feed);
+                self.streaming_final_audio = Some(captured);
                 self.update_state("transcribing");
                 return;
             }
@@ -3067,6 +3244,10 @@ impl Daemon {
         });
         self.cut_streaming_audio();
         self.abandon_final_pass();
+        if let Some(pending) = self.streaming_load_task.take() {
+            pending.task.abort();
+        }
+        self.streaming_final_audio = None;
         // Show the cancel right away: the OSD and the cancel sound should
         // not wait for the mic to close or the backend to wind down.
         self.publish_osd_outcome(osd::session::OutcomeKind::Cancelled, 0);
@@ -6109,6 +6290,26 @@ impl Daemon {
                     self.handle_transcription_result(&mut state, result).await;
                 }
 
+                // Handle background streaming model load completion (cold start with idle_unload_secs)
+                loaded = async {
+                    match self.streaming_load_task.as_mut() {
+                        Some(pending) => (&mut pending.task).await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.streaming_load_task.is_some() => {
+                    if let Some(pending) = self.streaming_load_task.take() {
+                        self.complete_streaming_load(
+                            pending,
+                            loaded,
+                            &mut state,
+                            &mut audio_capture,
+                            &mut streaming_handle,
+                            &mut streaming_session,
+                            &mut streaming_chain,
+                        ).await;
+                    }
+                }
+
                 // Streaming event pump (active only while State::Streaming).
                 event = async {
                     match streaming_handle.as_mut() {
@@ -6428,6 +6629,9 @@ impl Daemon {
         // Abort any pending transcription task
         if let Some(task) = self.transcription_task.take() {
             task.abort();
+        }
+        if let Some(pending) = self.streaming_load_task.take() {
+            pending.task.abort();
         }
         self.active_transcriber = None;
 
@@ -6812,6 +7016,42 @@ while True:
 
         assert!(!daemon.maybe_evict_idle_preloaded(&State::Idle));
         assert!(daemon.transcriber_preloaded.is_some());
+    }
+
+    #[tokio::test]
+    async fn cold_streaming_load_caches_model_when_session_cancelled() {
+        let mut daemon = parakeet_daemon(false);
+        daemon.config.parakeet.as_mut().unwrap().idle_unload_secs = 120;
+        let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<f32>>(8);
+        let task = tokio::spawn(async {
+            Ok::<Arc<dyn Transcriber>, crate::error::TranscribeError>(Arc::new(FixedTranscriber("ok")))
+        });
+        let loaded = Ok(Ok(Arc::new(FixedTranscriber("ok")) as Arc<dyn Transcriber>));
+        let pending = PendingStreamingLoad {
+            samples_rx: Some(rx),
+            task,
+        };
+        let mut state = State::Idle;
+        let mut audio_capture = None;
+        let mut streaming_handle = None;
+        let mut streaming_session = None;
+        let mut streaming_chain = None;
+
+        daemon
+            .complete_streaming_load(
+                pending,
+                loaded,
+                &mut state,
+                &mut audio_capture,
+                &mut streaming_handle,
+                &mut streaming_session,
+                &mut streaming_chain,
+            )
+            .await;
+
+        assert!(daemon.transcriber_preloaded.is_some());
+        assert!(daemon.transcriber_last_used.is_some());
+        assert!(matches!(state, State::Idle));
     }
 
     #[test]
