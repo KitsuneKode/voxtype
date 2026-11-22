@@ -2237,6 +2237,39 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
     .for_engine("parakeet")
     .gated("parakeet"),
     spec(
+        "parakeet.vocabulary_file",
+        "parakeet",
+        "vocabulary_file",
+        KeyType::String,
+        "Advanced",
+        "Vocabulary file",
+        "One term per line; final-pass transcripts are rescored acoustically against these terms.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.corrections_file",
+        "parakeet",
+        "corrections_file",
+        KeyType::String,
+        "Advanced",
+        "Corrections file",
+        "heard<TAB>meant lines; each meant term joins the rescoring vocabulary.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
+        "parakeet.vocabulary_boost",
+        "parakeet",
+        "vocabulary_boost",
+        KeyType::Float { min: 0.0, max: 20.0 },
+        "Advanced",
+        "Vocabulary boost",
+        "Nats per piece a vocabulary term gets when competing with what was heard.",
+    )
+    .for_engine("parakeet")
+    .gated("parakeet"),
+    spec(
         "parakeet.idle_unload_secs",
         "parakeet",
         "idle_unload_secs",
@@ -3159,6 +3192,15 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.streaming_final_pass_skip_when_clean" => json!(pk().streaming_final_pass_skip_when_clean),
         "parakeet.final_pass_segment_secs" => json!(pk().final_pass_segment_secs),
         "parakeet.pad_secs" => json!(pk().pad_secs),
+        "parakeet.vocabulary_file" => match &pk().vocabulary_file {
+            Some(p) => json!(p.to_string_lossy()),
+            None => Json::Null,
+        },
+        "parakeet.corrections_file" => match &pk().corrections_file {
+            Some(p) => json!(p.to_string_lossy()),
+            None => Json::Null,
+        },
+        "parakeet.vocabulary_boost" => json!(pk().vocabulary_boost),
         "parakeet.idle_unload_secs" => json!(pk().idle_unload_secs),
         "parakeet.cpu.threads" => pk().cpu.threads.map_or(Json::Null, |n| json!(n)),
         "parakeet.cpu.streaming_chunk_secs" => pk().cpu.streaming_chunk_secs.map_or(Json::Null, |v| f32_json(v)),

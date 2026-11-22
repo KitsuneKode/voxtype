@@ -448,6 +448,20 @@ impl ParakeetUnified {
         end_frame: usize,
         absolute_frame_offset: usize,
     ) -> Result<Vec<(usize, usize)>> {
+        self.decode_encoder_frames_recording(encoder_out, start_frame, end_frame, absolute_frame_offset, None)
+    }
+
+    /// Greedy decode of `start_frame..end_frame`. With `record`, also keeps
+    /// the predictor input (previous token and LSTM state) that emitted
+    /// each token, in token order.
+    fn decode_encoder_frames_recording(
+        &mut self,
+        encoder_out: &Array3<f32>,
+        start_frame: usize,
+        end_frame: usize,
+        absolute_frame_offset: usize,
+        mut record: Option<&mut Vec<PredictorState>>,
+    ) -> Result<Vec<(usize, usize)>> {
         let mut tokens = Vec::new();
         let hidden_dim = encoder_out.shape()[1];
         let end_frame = end_frame.min(encoder_out.shape()[2]);
@@ -488,6 +502,13 @@ impl ParakeetUnified {
                 }
 
                 tokens.push((token_id, absolute_frame));
+                if let Some(record) = record.as_deref_mut() {
+                    record.push(PredictorState {
+                        last_token: self.last_token,
+                        state_1: self.state_1.clone(),
+                        state_2: self.state_2.clone(),
+                    });
+                }
                 self.last_token = token_id as i32;
                 self.state_1 = new_state_1;
                 self.state_2 = new_state_2;
@@ -564,6 +585,159 @@ impl ParakeetUnified {
     }
 }
 
+/// Predictor (decoder LSTM) input at one point of a greedy decode.
+#[derive(Clone)]
+pub struct PredictorState {
+    last_token: i32,
+    state_1: Array3<f32>,
+    state_2: Array3<f32>,
+}
+
+/// A full-context greedy decode that can be rescored afterwards: the
+/// emitted tokens with their encoder frames, the predictor input that
+/// emitted each one, and the encoder output itself.
+pub struct OfflineDecode {
+    /// `(token id, encoder frame)` in emission order, blanks excluded.
+    pub tokens: Vec<(usize, usize)>,
+    /// Predictor input that emitted `tokens[i]`; one extra entry at the end
+    /// holds the state after the last token.
+    states: Vec<PredictorState>,
+    encoded: Array3<f32>,
+    /// Encoder frames that carry audio (80 ms each).
+    pub frame_count: usize,
+}
+
+impl ParakeetUnified {
+    /// Like [`Self::transcribe_audio`] (16 kHz mono), but keeps what
+    /// [`Self::score_pieces`] needs to rescore spans of the result.
+    pub fn decode_offline(&mut self, audio: Vec<f32>) -> Result<OfflineDecode> {
+        self.reset();
+        let features = audio::extract_features_padded(
+            audio,
+            SAMPLE_RATE as u32,
+            1,
+            &self.preprocessor_config,
+            self.offline_trailing_silence,
+        )?;
+        let (encoded, encoded_len) = {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
+            model.run_encoder(&features)?
+        };
+        let frame_count = (encoded_len as usize).min(encoded.shape()[2]);
+        let mut states = Vec::new();
+        let tokens: Vec<(usize, usize)> = self
+            .decode_encoder_frames_recording(&encoded, 0, frame_count, 0, Some(&mut states))?
+            .into_iter()
+            .filter(|(id, _)| *id < self.blank_id)
+            .collect();
+        states.push(PredictorState {
+            last_token: self.last_token,
+            state_1: self.state_1.clone(),
+            state_2: self.state_2.clone(),
+        });
+        Ok(OfflineDecode { tokens, states, encoded, frame_count })
+    }
+
+    /// Log-probability (nats) of each candidate in `candidates` being
+    /// exactly what the model emits over encoder `frames`, starting from
+    /// the predictor state before `decode.tokens[from]` (or after the last
+    /// token when `from == decode.tokens.len()`): the RNN-T forward
+    /// algorithm over all alignments, ending in a blank on the last frame.
+    /// All candidates share one decoder_joint run.
+    pub fn score_pieces(
+        &self,
+        decode: &OfflineDecode,
+        from: usize,
+        frames: std::ops::Range<usize>,
+        candidates: &[Vec<usize>],
+    ) -> Result<Vec<f32>> {
+        let state = decode
+            .states
+            .get(from)
+            .ok_or_else(|| Error::Model(format!("score_pieces: no predictor state at token {from}")))?;
+        let end = frames.end.min(decode.frame_count);
+        if frames.start >= end || candidates.is_empty() {
+            return Err(Error::Model("score_pieces: empty frame range or no candidates".into()));
+        }
+        let span = decode.encoded.slice(ndarray::s![.., .., frames.start..end]).to_owned();
+        let targets: Vec<Vec<i32>> = candidates
+            .iter()
+            .map(|c| std::iter::once(state.last_token).chain(c.iter().map(|&t| t as i32)).collect())
+            .collect();
+        let (logits, [batch, time, max_u, vocab]) = {
+            let mut model = self
+                .model
+                .lock()
+                .map_err(|e| Error::Model(format!("Failed to acquire model lock: {e}")))?;
+            model.run_joint_batch(&span, &targets, &state.state_1, &state.state_2)?
+        };
+        if batch != candidates.len() || vocab <= self.blank_id {
+            return Err(Error::Model(format!(
+                "score_pieces: unexpected joint output [{batch}, {time}, {max_u}, {vocab}]"
+            )));
+        }
+        Ok(candidates
+            .iter()
+            .enumerate()
+            .map(|(b, pieces)| {
+                let at = |t: usize, u: usize| &logits[((b * time + t) * max_u + u) * vocab..][..vocab];
+                rnnt_log_likelihood(time, pieces, self.blank_id, at)
+            })
+            .collect())
+    }
+
+    /// The tokenizer, to encode candidate text and read pieces back.
+    pub fn vocab(&self) -> &SentencePieceVocab {
+        &self.vocab
+    }
+}
+
+/// RNN-T forward algorithm: log P(`pieces` | `time` frames), where `logits(t, u)`
+/// is the joint output at frame `t` after the predictor has consumed the
+/// first `u` pieces.
+fn rnnt_log_likelihood<'a>(
+    time: usize,
+    pieces: &[usize],
+    blank: usize,
+    logits: impl Fn(usize, usize) -> &'a [f32],
+) -> f32 {
+    let log_softmax = |row: &[f32], id: usize| {
+        let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f32 = row.iter().map(|v| (v - max).exp()).sum();
+        row[id] - max - sum.ln()
+    };
+    let log_add = |a: f32, b: f32| {
+        if a == f32::NEG_INFINITY {
+            return b;
+        }
+        if b == f32::NEG_INFINITY {
+            return a;
+        }
+        let m = a.max(b);
+        m + ((a - m).exp() + (b - m).exp()).ln()
+    };
+    let u_len = pieces.len();
+    // alpha[u]: log P(first u pieces emitted, now at frame t, not yet past it)
+    let mut alpha = vec![f32::NEG_INFINITY; u_len + 1];
+    alpha[0] = 0.0;
+    for t in 0..time {
+        // alpha holds arrivals at frame t (a blank on t-1); add emissions on t.
+        for u in 1..=u_len {
+            let emit = alpha[u - 1] + log_softmax(logits(t, u - 1), pieces[u - 1]);
+            alpha[u] = log_add(alpha[u], emit);
+        }
+        if t + 1 < time {
+            for u in 0..=u_len {
+                alpha[u] += log_softmax(logits(t, u), blank);
+            }
+        }
+    }
+    alpha[u_len] + log_softmax(logits(time - 1, u_len), blank)
+}
+
 impl Transcriber for ParakeetUnified {
     fn transcribe_samples(
         &mut self,
@@ -578,7 +752,42 @@ impl Transcriber for ParakeetUnified {
 
 #[cfg(test)]
 mod tests {
-    use super::UnifiedStreamingConfig;
+    use super::{rnnt_log_likelihood, UnifiedStreamingConfig};
+
+    /// Sum of P over every RNN-T alignment, enumerated explicitly.
+    fn brute_force(time: usize, pieces: &[usize], blank: usize, logits: &dyn Fn(usize, usize) -> Vec<f32>) -> f64 {
+        let p = |t: usize, u: usize, id: usize| {
+            let row = logits(t, u);
+            let z: f64 = row.iter().map(|v| (*v as f64).exp()).sum();
+            (row[id] as f64).exp() / z
+        };
+        fn walk(t: usize, u: usize, time: usize, pieces: &[usize], blank: usize, p: &dyn Fn(usize, usize, usize) -> f64) -> f64 {
+            let mut total = 0.0;
+            if u < pieces.len() {
+                total += p(t, u, pieces[u]) * walk(t, u + 1, time, pieces, blank, p);
+            }
+            let b = p(t, u, blank);
+            if t + 1 < time {
+                total += b * walk(t + 1, u, time, pieces, blank, p);
+            } else if u == pieces.len() {
+                total += b;
+            }
+            total
+        }
+        walk(0, 0, time, pieces, blank, &p)
+    }
+
+    #[test]
+    fn forward_algorithm_matches_enumerating_alignments() {
+        let (vocab, blank) = (5usize, 4usize);
+        let rows: Vec<f32> = (0..4 * 3 * vocab).map(|i| ((i * 37 % 11) as f32 - 5.0) * 0.3).collect();
+        let logits = |t: usize, u: usize| rows[(t * 3 + u) * vocab..][..vocab].to_vec();
+        for (time, pieces) in [(1, vec![]), (1, vec![2]), (3, vec![1, 0]), (4, vec![3]), (4, vec![0, 2])] {
+            let fast = rnnt_log_likelihood(time, &pieces, blank, |t, u| &rows[(t * 3 + u) * vocab..][..vocab]);
+            let slow = brute_force(time, &pieces, blank, &logits).ln();
+            assert!((fast as f64 - slow).abs() < 1e-4, "T={time} {pieces:?}: {fast} vs {slow}");
+        }
+    }
 
     #[test]
     fn default_streaming_profile_aligns_to_subsampling() {

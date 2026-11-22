@@ -50,6 +50,12 @@ impl ParakeetTranscriber {
     /// Create a new Parakeet transcriber
     pub fn new(config: &ParakeetConfig) -> Result<Self, TranscribeError> {
         let model_path = resolve_model_path(&config.model)?;
+        if config.vocabulary_file.is_some() || config.corrections_file.is_some() {
+            tracing::warn!(
+                "[parakeet] vocabulary_file/corrections_file rescore only the streaming \
+                 (cache-aware) models; ignored with streaming = false"
+            );
+        }
 
         // Determine model type: use config override or auto-detect from directory
         let model_type = config

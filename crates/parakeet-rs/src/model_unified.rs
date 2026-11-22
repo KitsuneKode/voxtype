@@ -131,6 +131,60 @@ impl ParakeetUnifiedModel {
         Ok((encoder_out, lens_data[0]))
     }
 
+    /// One decoder_joint run over encoder `frames` `(1, hidden, T)` for each
+    /// target sequence in `targets`, all starting from the same predictor
+    /// state. Each sequence starts with the token the predictor consumes
+    /// first (the previous token, or blank at the start). Returns the joint
+    /// logits, laid out `[batch][frame][target position][vocab]`, and their
+    /// shape.
+    pub fn run_joint_batch(
+        &mut self,
+        frames: &Array3<f32>,
+        targets: &[Vec<i32>],
+        state_1: &Array3<f32>,
+        state_2: &Array3<f32>,
+    ) -> Result<(Vec<f32>, [usize; 4])> {
+        let batch = targets.len();
+        let (hidden, time) = (frames.shape()[1], frames.shape()[2]);
+        let max_len = targets.iter().map(Vec::len).max().unwrap_or(0);
+        if batch == 0 || max_len == 0 || time == 0 {
+            return Err(Error::Model("run_joint_batch: empty input".into()));
+        }
+        let encoder = frames
+            .broadcast((batch, hidden, time))
+            .ok_or_else(|| Error::Model("run_joint_batch: bad frame shape".into()))?
+            .to_owned();
+        let pad = self.config.blank_id as i32;
+        let padded = Array2::from_shape_fn((batch, max_len), |(b, u)| {
+            targets[b].get(u).copied().unwrap_or(pad)
+        });
+        let lengths = Array1::from_iter(targets.iter().map(|t| t.len() as i32));
+        let repeat = |state: &Array3<f32>| -> Result<Array3<f32>> {
+            let (layers, dim) = (state.shape()[0], state.shape()[2]);
+            Ok(state
+                .broadcast((layers, batch, dim))
+                .ok_or_else(|| Error::Model("run_joint_batch: bad state shape".into()))?
+                .to_owned())
+        };
+
+        let outputs = self.decoder_joint.run(ort::inputs![
+            "encoder_outputs" => ort::value::Value::from_array(encoder)?,
+            "targets" => ort::value::Value::from_array(padded)?,
+            "target_length" => ort::value::Value::from_array(lengths)?,
+            "input_states_1" => ort::value::Value::from_array(repeat(state_1)?)?,
+            "input_states_2" => ort::value::Value::from_array(repeat(state_2)?)?
+        ])?;
+        let (shape, data) = outputs["outputs"]
+            .try_extract_tensor::<f32>()
+            .map_err(|e| Error::Model(format!("Failed to extract logits: {e}")))?;
+        let dims = shape.as_ref();
+        if dims.len() != 4 {
+            return Err(Error::Model(format!("Expected 4D joint output, got {dims:?}")));
+        }
+        let dims = [dims[0] as usize, dims[1] as usize, dims[2] as usize, dims[3] as usize];
+        Ok((data.to_vec(), dims))
+    }
+
     pub fn run_decoder(
         &mut self,
         encoder_frame: &Array3<f32>,

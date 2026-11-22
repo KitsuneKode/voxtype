@@ -157,6 +157,28 @@ pub struct ParakeetConfig {
     #[serde(default = "default_pad_secs")]
     pub pad_secs: f32,
 
+    /// Vocabulary terms (names, products, jargon), one per line, `#` for
+    /// comments. When set, every final-pass decode is rescored against
+    /// them: a span of one to four words that looks or sounds like a term
+    /// is replaced by it when the model, scoring both over that span's
+    /// audio, finds the term about as likely (within `vocabulary_boost`
+    /// nats per piece of the term). Re-read when the file changes. Streaming
+    /// (cache-aware) models only. Unset (default): no rescoring.
+    #[serde(default)]
+    pub vocabulary_file: Option<std::path::PathBuf>,
+
+    /// Learned mishearings, `heard<TAB>meant[<TAB>...]` per line: each
+    /// `meant` joins the vocabulary, and its `heard` form always counts as
+    /// a lookalike. Also enables rescoring on its own.
+    #[serde(default)]
+    pub corrections_file: Option<std::path::PathBuf>,
+
+    /// Bonus in nats per SentencePiece piece of a vocabulary term when it
+    /// competes with what was heard. Higher accepts more replacements.
+    /// Default: 2.5.
+    #[serde(default = "default_vocabulary_boost")]
+    pub vocabulary_boost: f32,
+
     /// Settings that apply only when the model runs on the CPU (no GPU
     /// execution provider). The final transcript comes from the same model
     /// either way; these trade nothing in it for speed. See
@@ -235,6 +257,11 @@ fn default_streaming_max_pause_secs() -> f32 {
     2.5
 }
 
+/// Hex's value.
+fn default_vocabulary_boost() -> f32 {
+    2.5
+}
+
 fn default_pad_secs() -> f32 {
     0.5
 }
@@ -258,6 +285,9 @@ impl Default for ParakeetConfig {
             streaming_final_pass_max_secs: default_streaming_final_pass_max_secs(),
             streaming_final_pass_skip_when_clean: false,
             streaming_max_pause_secs: default_streaming_max_pause_secs(),
+            vocabulary_file: None,
+            corrections_file: None,
+            vocabulary_boost: default_vocabulary_boost(),
             final_pass_segment_secs: default_final_pass_segment_secs(),
             pad_secs: default_pad_secs(),
             cpu: ParakeetCpuConfig::default(),

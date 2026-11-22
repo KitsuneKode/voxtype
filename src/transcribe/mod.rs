@@ -17,6 +17,8 @@
 pub mod cli;
 #[cfg(feature = "parakeet")]
 pub mod parakeet_streaming;
+#[cfg(feature = "parakeet")]
+pub mod vocab_rescore;
 pub mod incremental;
 pub mod segment;
 pub mod remote;

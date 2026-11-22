@@ -40,6 +40,9 @@ const PRE_ENCODE_CACHE: usize = 9;
 /// Note that, our vocab.rs cannot parse protobuf format. I haven't test it with digit spacing yet, at least for this initial impl.
 pub struct SentencePieceVocab {
     pieces: Vec<String>,
+    /// Piece scores from the model file; for a BPE model, the merge priority.
+    scores: Vec<f32>,
+    ids: std::collections::HashMap<String, usize>,
 }
 
 impl SentencePieceVocab {
@@ -50,11 +53,13 @@ impl SentencePieceVocab {
         file.read_to_end(&mut data)
             .map_err(|e| Error::Tokenizer(format!("Failed to read tokenizer.model: {e}")))?;
 
-        let pieces = Self::parse_sentencepiece_model(&data)?;
-        Ok(Self { pieces })
+        let (pieces, scores): (Vec<String>, Vec<f32>) =
+            Self::parse_sentencepiece_model(&data)?.into_iter().unzip();
+        let ids = pieces.iter().enumerate().map(|(i, p)| (p.clone(), i)).collect();
+        Ok(Self { pieces, scores, ids })
     }
 
-    fn parse_sentencepiece_model(data: &[u8]) -> Result<Vec<String>> {
+    fn parse_sentencepiece_model(data: &[u8]) -> Result<Vec<(String, f32)>> {
         let mut pieces = Vec::new();
         let mut pos = 0;
 
@@ -102,9 +107,10 @@ impl SentencePieceVocab {
         Ok(pieces)
     }
 
-    fn parse_piece_message(data: &[u8]) -> Result<String> {
+    fn parse_piece_message(data: &[u8]) -> Result<(String, f32)> {
         let mut pos = 0;
         let mut piece = String::new();
+        let mut score = 0.0f32;
 
         while pos < data.len() {
             let (field_header, bytes_read) = Self::read_varint(&data[pos..])?;
@@ -123,6 +129,10 @@ impl SentencePieceVocab {
                     }
                     pos += len as usize;
                 }
+                (2, 5) if pos + 4 <= data.len() => {
+                    score = f32::from_le_bytes([data[pos], data[pos + 1], data[pos + 2], data[pos + 3]]);
+                    pos += 4;
+                }
                 (_, 0) => {
                     let (_, bytes_read) = Self::read_varint(&data[pos..])?;
                     pos += bytes_read;
@@ -137,7 +147,7 @@ impl SentencePieceVocab {
             }
         }
 
-        Ok(piece)
+        Ok((piece, score))
     }
 
     fn read_varint(data: &[u8]) -> Result<(u64, usize)> {
@@ -181,6 +191,45 @@ impl SentencePieceVocab {
 
     pub fn size(&self) -> usize {
         self.pieces.len()
+    }
+
+    /// The raw piece string for `id` (with `\u{2581}` word markers).
+    pub fn piece(&self, id: usize) -> Option<&str> {
+        self.pieces.get(id).map(String::as_str)
+    }
+
+    /// Encode `text` the way SentencePiece's BPE model does: each
+    /// whitespace-separated word gets a leading `\u{2581}`, starts as single
+    /// characters, and the adjacent pair whose merge is a piece with the
+    /// highest score is merged until none is left. Characters with no piece
+    /// map to id 0 (`<unk>`).
+    pub fn encode(&self, text: &str) -> Vec<usize> {
+        let mut out = Vec::new();
+        for word in text.split_whitespace() {
+            let mut parts: Vec<String> = std::iter::once('\u{2581}')
+                .chain(word.chars())
+                .map(String::from)
+                .collect();
+            // "▁" alone is a piece; merge it into the first character's piece
+            // only through the normal pair search below.
+            loop {
+                let mut best: Option<(usize, f32)> = None;
+                for i in 0..parts.len().saturating_sub(1) {
+                    let merged = format!("{}{}", parts[i], parts[i + 1]);
+                    if let Some(&id) = self.ids.get(&merged) {
+                        let score = self.scores.get(id).copied().unwrap_or(f32::MIN);
+                        if best.is_none_or(|(_, s)| score > s) {
+                            best = Some((i, score));
+                        }
+                    }
+                }
+                let Some((i, _)) = best else { break };
+                let right = parts.remove(i + 1);
+                parts[i].push_str(&right);
+            }
+            out.extend(parts.iter().map(|p| self.ids.get(p).copied().unwrap_or(0)));
+        }
+        out
     }
 }
 

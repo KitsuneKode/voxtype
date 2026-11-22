@@ -36,6 +36,11 @@ fn main() {
         eprintln!("usage: parakeet_eval PARAKEET.toml FILE.wav...");
         std::process::exit(2);
     }
+    // RUST_LOG=voxtype=debug shows the backend's own timings.
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .init();
     let toml_text = std::fs::read_to_string(&args[1]).expect("read config");
     let config: ParakeetConfig = toml::from_str(&toml_text).expect("parse [parakeet] table");
 

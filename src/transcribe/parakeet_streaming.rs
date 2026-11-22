@@ -38,7 +38,10 @@ use super::streaming::{StreamHandle, StreamProgress, StreamingEvent, StreamingTr
 use super::{TimedSegment, Transcriber};
 use crate::config::ParakeetConfig;
 use crate::error::TranscribeError;
-use parakeet_rs::{ExecutionConfig, ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig};
+use super::vocab_rescore::{self, SpanScorer, TermSource};
+use parakeet_rs::{
+    ExecutionConfig, OfflineDecode, ParakeetUnified, ParakeetUnifiedHandle, UnifiedStreamingConfig,
+};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 
@@ -63,6 +66,9 @@ pub struct ParakeetStreamingTranscriber {
     progress: Arc<Mutex<StreamProgress>>,
     /// `[parakeet] streaming_max_pause_secs`, in samples (0 = off).
     max_pause: usize,
+    /// `[parakeet] vocabulary_file` / `corrections_file` (None = off).
+    vocabulary: Option<TermSource>,
+    vocabulary_boost: f32,
 }
 
 impl ParakeetStreamingTranscriber {
@@ -173,6 +179,11 @@ impl ParakeetStreamingTranscriber {
             batch: Mutex::new(batch),
             progress: Arc::default(),
             max_pause: (config.streaming_max_pause_secs.max(0.0) * 16000.0) as usize,
+            vocabulary: TermSource::new(
+                config.vocabulary_file.as_deref(),
+                config.corrections_file.as_deref(),
+            ),
+            vocabulary_boost: config.vocabulary_boost,
         })
     }
 }
@@ -203,11 +214,14 @@ impl Transcriber for ParakeetStreamingTranscriber {
             // a prior piece or call bleeds in.
             let piece = &samples[start..end];
             batch.set_offline_trailing_silence(if ends_in_speech(piece) { self.pad } else { 0 });
-            let piece = batch
-                .transcribe_audio(piece.to_vec(), 16000, 1)
-                .map_err(|e| {
-                    TranscribeError::InferenceFailed(format!("ParakeetUnified inference failed: {}", e))
-                })?;
+            let terms = self.vocabulary.as_ref().map(|v| v.terms()).filter(|t| !t.is_empty());
+            let piece = match terms {
+                Some(terms) => self.decode_with_vocabulary(&mut batch, piece, &terms),
+                None => batch.transcribe_audio(piece.to_vec(), 16000, 1),
+            }
+            .map_err(|e| {
+                TranscribeError::InferenceFailed(format!("ParakeetUnified inference failed: {}", e))
+            })?;
             let piece = piece.trim();
             if !piece.is_empty() {
                 parts.push(piece.to_string());
@@ -230,6 +244,78 @@ impl Transcriber for ParakeetStreamingTranscriber {
 
     fn as_streaming(&self) -> Option<&dyn StreamingTranscriber> {
         Some(self)
+    }
+
+    fn set_vocabulary(&self, terms: &[String]) {
+        if let Some(vocabulary) = &self.vocabulary {
+            vocabulary.set_profile_terms(terms);
+        }
+    }
+}
+
+impl ParakeetStreamingTranscriber {
+    /// Offline decode of one piece, rescored against `terms`.
+    fn decode_with_vocabulary(
+        &self,
+        batch: &mut ParakeetUnified,
+        piece: &[f32],
+        terms: &[vocab_rescore::Term],
+    ) -> parakeet_rs::Result<String> {
+        let decode = batch.decode_offline(piece.to_vec())?;
+        let started = std::time::Instant::now();
+        let scorer = UnifiedScorer { model: batch, decode: &decode };
+        let ids = match vocab_rescore::rescore(
+            &decode.tokens,
+            decode.frame_count,
+            terms,
+            self.vocabulary_boost,
+            &scorer,
+        ) {
+            Some((ids, replacements)) => {
+                for r in &replacements {
+                    tracing::info!(
+                        "Parakeet vocabulary: {:?} -> {:?} ({:+.1} nats)",
+                        r.heard,
+                        r.term,
+                        r.margin
+                    );
+                }
+                ids
+            }
+            None => decode.tokens.iter().map(|t| t.0).collect(),
+        };
+        tracing::debug!(
+            "Parakeet vocabulary rescoring took {}ms",
+            started.elapsed().as_millis()
+        );
+        Ok(batch.vocab().decode(&ids))
+    }
+}
+
+/// The unified model's decoder_joint, scoring spans of one decode.
+struct UnifiedScorer<'a> {
+    model: &'a ParakeetUnified,
+    decode: &'a OfflineDecode,
+}
+
+impl SpanScorer for UnifiedScorer<'_> {
+    fn piece(&self, id: usize) -> &str {
+        self.model.vocab().piece(id).unwrap_or("")
+    }
+
+    fn encode(&self, text: &str) -> Vec<usize> {
+        self.model.vocab().encode(text)
+    }
+
+    fn score(
+        &self,
+        from: usize,
+        frames: std::ops::Range<usize>,
+        candidates: &[Vec<usize>],
+    ) -> Result<Vec<f32>, String> {
+        self.model
+            .score_pieces(self.decode, from, frames, candidates)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -507,6 +593,72 @@ mod tests {
         assert!(!limiter.skip(&block(true)));
         assert!(!limiter.skip(&block(false)));
         assert!(!PauseLimiter::new(0).skip(&block(false)));
+    }
+
+    /// Runs only with `VOXTYPE_TEST_PARAKEET_MODEL` set to a
+    /// parakeet-unified-en-0.6b directory (the model is not in the repo).
+    #[test]
+    fn vocabulary_rescoring_fixes_a_name_greedy_decoding_misspells() {
+        let Some(model) = std::env::var_os("VOXTYPE_TEST_PARAKEET_MODEL") else {
+            eprintln!("skipped: VOXTYPE_TEST_PARAKEET_MODEL is not set");
+            return;
+        };
+        let wav = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/parakeet/kaliko_hesitated.wav");
+        let audio: Vec<f32> = hound::WavReader::open(wav)
+            .unwrap()
+            .samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect();
+        let dir = tempfile::tempdir().unwrap();
+        let vocabulary = dir.path().join("vocabulary.txt");
+        std::fs::write(&vocabulary, "# names\nKaliko\n").unwrap();
+        let config = ParakeetConfig {
+            model: model.to_string_lossy().into_owned(),
+            streaming: true,
+            ..ParakeetConfig::default()
+        };
+        let decode = |config: &ParakeetConfig| match ParakeetStreamingTranscriber::new(config) {
+            Ok(t) => t.transcribe(&audio).unwrap(),
+            Err(e) => panic!("load: {e}"),
+        };
+        let plain = decode(&config);
+        assert!(!plain.contains("Kaliko"), "greedy decode already right: {plain}");
+        let rescored = decode(&ParakeetConfig {
+            vocabulary_file: Some(vocabulary),
+            ..config
+        });
+        assert!(rescored.starts_with("Kaliko hesitated"), "{plain} -> {rescored}");
+    }
+
+    /// Same model gate as above. Expected pieces come from Python
+    /// `sentencepiece` on the model's tokenizer.model.
+    #[test]
+    fn vocabulary_terms_encode_like_sentencepiece() {
+        let Some(model) = std::env::var_os("VOXTYPE_TEST_PARAKEET_MODEL") else {
+            eprintln!("skipped: VOXTYPE_TEST_PARAKEET_MODEL is not set");
+            return;
+        };
+        let config = ParakeetConfig {
+            model: model.to_string_lossy().into_owned(),
+            streaming: true,
+            ..ParakeetConfig::default()
+        };
+        let Ok(t) = ParakeetStreamingTranscriber::new(&config) else {
+            panic!("load failed")
+        };
+        let batch = t.batch.lock().unwrap();
+        let vocab = batch.vocab();
+        for (text, pieces) in [
+            ("Kaliko", &["\u{2581}K", "al", "i", "k", "o"][..]),
+            ("Shaggy", &["\u{2581}Sh", "ag", "gy"]),
+            ("voxtype", &["\u{2581}v", "o", "xt", "y", "pe"]),
+            ("Hyprland", &["\u{2581}H", "y", "pr", "land"]),
+            ("Kubernetes", &["\u{2581}K", "u", "ber", "n", "et", "es"]),
+            ("Hello, world.", &["\u{2581}He", "ll", "o", ",", "\u{2581}wor", "ld", "."]),
+        ] {
+            let got: Vec<&str> = vocab.encode(text).iter().map(|&id| vocab.piece(id).unwrap()).collect();
+            assert_eq!(got, pieces, "{text}");
+        }
     }
 
     #[test]
