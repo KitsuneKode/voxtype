@@ -39,6 +39,9 @@ pub enum Cmd {
     Commit(String, oneshot::Sender<CommitOutcome>),
     /// Clear the preedit and release the input method.
     End,
+    /// Change nothing; the ack fires once everything sent before has reached
+    /// the compositor.
+    Flush(oneshot::Sender<()>),
 }
 
 /// One running backend: a thread that owns the input method binding.
@@ -185,7 +188,15 @@ impl PreeditHandle {
     /// [`end`](Self::end), waiting until the compositor has it (shutdown).
     pub async fn end_now(&self) {
         self.end();
-        self.clear_now().await;
+        self.flush().await;
+    }
+
+    /// Wait until every command sent so far has reached the compositor.
+    pub async fn flush(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.send(Cmd::Flush(tx)) {
+            let _ = rx.await;
+        }
     }
 
     /// Whether the focused field currently listens to the input method.
@@ -275,6 +286,7 @@ impl Driver {
                 }
                 Ack::None
             }
+            Cmd::Flush(ack) => Ack::Cleared(ack),
         };
         self.publish();
         ack
@@ -360,7 +372,10 @@ impl TextOutput for PreeditOutput {
         // point, or the next driver would type it a second time.
         if self.auto_submit {
             if let Err(e) = super::wtype::send_enter_key().await {
-                tracing::warn!("Auto-submit Enter after the input method commit failed: {}", e);
+                tracing::warn!(
+                    "Auto-submit Enter after the input method commit failed: {}",
+                    e
+                );
             }
         }
         Ok(())
@@ -485,7 +500,7 @@ mod tests {
 
         /// Wait for the backend to drain the commands sent so far.
         async fn settle(&self) {
-            self.handle.clear_now().await;
+            self.handle.flush().await;
         }
 
         fn log(&self) -> Vec<String> {
@@ -582,7 +597,10 @@ mod tests {
         fake.handle.set("hello");
         fake.settle().await;
         assert!(!fake.handle.text_input_active());
-        assert_eq!(deliver(&fake, &Default::default(), "Hello.").await, ["Hello."]);
+        assert_eq!(
+            deliver(&fake, &Default::default(), "Hello.").await,
+            ["Hello."]
+        );
         assert!(!fake.log().iter().any(|l| l.starts_with("commit_string")));
     }
 
@@ -597,7 +615,11 @@ mod tests {
         fake.log();
         let typed = deliver(&fake, &Default::default(), "Line one.\nLine two.").await;
         assert_eq!(typed, ["Line one.\nLine two."]);
-        assert_eq!(fake.log(), ["preedit:", "commit:1"], "cleared, nothing committed");
+        assert_eq!(
+            fake.log(),
+            ["preedit:", "commit:1"],
+            "cleared, nothing committed"
+        );
     }
 
     #[tokio::test]
@@ -611,7 +633,14 @@ mod tests {
         fake.settle().await;
         assert_eq!(
             fake.log(),
-            ["bind:true", "preedit:never mind", "commit:1", "preedit:", "commit:1", "unbind"]
+            [
+                "bind:true",
+                "preedit:never mind",
+                "commit:1",
+                "preedit:",
+                "commit:1",
+                "unbind"
+            ]
         );
         assert!(!fake.handle.text_input_active());
         // Commands after the end go nowhere.
@@ -624,7 +653,10 @@ mod tests {
         fake.handle.begin();
         fake.settle().await;
         fake.event(Event::Unavailable);
-        assert_eq!(deliver(&fake, &Default::default(), "Hello.").await, ["Hello."]);
+        assert_eq!(
+            deliver(&fake, &Default::default(), "Hello.").await,
+            ["Hello."]
+        );
         assert_eq!(fake.log(), ["bind:true", "unbind"]);
         // The next take tries again.
         fake.handle.begin();
@@ -650,7 +682,13 @@ mod tests {
         let log = fake.log();
         assert_eq!(
             &log[log.len() - 5..],
-            ["preedit:hello there", "commit:3", "preedit:", "commit_string:Hello there.", "commit:3"]
+            [
+                "preedit:hello there",
+                "commit:3",
+                "preedit:",
+                "commit_string:Hello there.",
+                "commit:3"
+            ]
         );
     }
 
@@ -663,7 +701,10 @@ mod tests {
         fake.handle.set("hello");
         fake.settle().await;
         fake.unfocus();
-        assert_eq!(deliver(&fake, &Default::default(), "Hello.").await, ["Hello."]);
+        assert_eq!(
+            deliver(&fake, &Default::default(), "Hello.").await,
+            ["Hello."]
+        );
     }
 
     #[tokio::test]
@@ -674,7 +715,10 @@ mod tests {
         fake.handle.begin();
         assert_eq!(*fake.spawns.lock().unwrap(), 1);
         assert!(!fake.handle.text_input_active());
-        assert_eq!(deliver(&fake, &Default::default(), "Hello.").await, ["Hello."]);
+        assert_eq!(
+            deliver(&fake, &Default::default(), "Hello.").await,
+            ["Hello."]
+        );
     }
 
     #[test]

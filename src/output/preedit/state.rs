@@ -154,7 +154,10 @@ impl Ime {
             return Vec::new();
         }
         self.shown = want.to_string();
-        vec![Request::Preedit(self.shown.clone()), Request::Commit(self.serial)]
+        vec![
+            Request::Preedit(self.shown.clone()),
+            Request::Commit(self.serial),
+        ]
     }
 }
 
@@ -210,7 +213,10 @@ mod tests {
         assert!(ime.set("hello").is_empty());
         assert!(!ime.active());
         // Activation shows what was asked for meanwhile.
-        assert!(ime.on_event(Event::Activate).is_empty(), "applies only at done");
+        assert!(
+            ime.on_event(Event::Activate).is_empty(),
+            "applies only at done"
+        );
         assert_eq!(ime.on_event(Event::Done), preedit("hello", 1));
     }
 

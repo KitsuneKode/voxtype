@@ -114,11 +114,17 @@ delegate_noop!(App: ZwpInputMethodManagerV2);
 /// Connect, check the compositor speaks input-method-v2, and start the thread.
 pub fn spawn() -> Result<Backend, SpawnError> {
     let conn = Connection::connect_to_env().map_err(|e| {
-        tracing::warn!("Dictation preedit: no Wayland connection ({}); typing instead", e);
+        tracing::warn!(
+            "Dictation preedit: no Wayland connection ({}); typing instead",
+            e
+        );
         SpawnError::Failed
     })?;
     let (globals, queue) = registry_queue_init::<App>(&conn).map_err(|e| {
-        tracing::warn!("Dictation preedit: Wayland registry failed ({}); typing instead", e);
+        tracing::warn!(
+            "Dictation preedit: Wayland registry failed ({}); typing instead",
+            e
+        );
         SpawnError::Failed
     })?;
     let qh = queue.handle();
@@ -135,8 +141,12 @@ pub fn spawn() -> Result<Backend, SpawnError> {
     })?;
 
     let (wake_rx, wake_tx) = UnixStream::pair().map_err(|_| SpawnError::Failed)?;
-    wake_rx.set_nonblocking(true).map_err(|_| SpawnError::Failed)?;
-    wake_tx.set_nonblocking(true).map_err(|_| SpawnError::Failed)?;
+    wake_rx
+        .set_nonblocking(true)
+        .map_err(|_| SpawnError::Failed)?;
+    wake_tx
+        .set_nonblocking(true)
+        .map_err(|_| SpawnError::Failed)?;
 
     let shared = Arc::new(Shared::default());
     shared.alive.store(true, Ordering::Release);
