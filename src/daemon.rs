@@ -1654,9 +1654,11 @@ impl Daemon {
             if let Some(task) = self.media_fade_task.take() {
                 let _ = task.await;
             }
+            let paused_apps = audio::media::player_apps(&self.paused_media_players).await;
             let (streams, fade) = audio::media::duck_playing_audio(
                 self.config.audio.duck_media_volume_percent,
                 self.config.audio.duck_media_fade_ms,
+                &paused_apps,
             )
             .await;
             self.ducked_media_streams = streams;
