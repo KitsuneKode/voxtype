@@ -4782,6 +4782,16 @@ impl Daemon {
                         );
                     }
 
+                    // Only fillers ("um", "uh") were heard: nothing to clean or
+                    // type, so the pill should not say "Polishing". A bare
+                    // "submit" still presses Enter.
+                    if processed_text.trim().is_empty() && !smart_submit {
+                        tracing::debug!("Transcription was only filler words");
+                        self.publish_osd_outcome(osd::session::OutcomeKind::Empty, 0);
+                        self.reset_to_idle(state).await;
+                        return;
+                    }
+
                     // Get context from last dictation if within 60 seconds
                     let recent_context = self.last_dictation.as_ref().and_then(|(text, when)| {
                         if when.elapsed() < Duration::from_secs(60) {
