@@ -406,8 +406,9 @@ async fn stream_post_process(
     text: &str,
     context: Option<&str>,
     output_config: &crate::config::OutputConfig,
+    preedit: Option<&output::preedit::PreeditHandle>,
 ) -> StreamedDelivery {
-    use crate::output::incremental::{chain_factory, IncrementalOutput};
+    use crate::output::incremental::{chain_factory, ChainFactory, IncrementalOutput, Position};
     use crate::output::post_process::StreamEnd;
 
     let options = output::OutputOptions {
@@ -416,7 +417,31 @@ async fn stream_post_process(
         wait_for_modifier_release: output_config.wait_for_modifier_release,
         modifier_release_timeout: Duration::from_millis(output_config.modifier_release_timeout_ms),
     };
-    let mut out = IncrementalOutput::new(chain_factory(output_config), options, processor.trims());
+    // With a preedit, the cleaned text replaces it as it streams in and is
+    // committed once at the end (the preedit driver collects the pieces).
+    let chain_for: ChainFactory = match preedit {
+        None => chain_factory(output_config),
+        Some(preedit) => {
+            let base = chain_factory(output_config);
+            let preedit = preedit.clone();
+            let config = output_config.clone();
+            Box::new(move |pos: Position| {
+                let mut chain = base(pos);
+                let mut c = config.clone();
+                if !pos.last {
+                    c.auto_submit = false;
+                    c.append_text = None;
+                }
+                chain.insert(
+                    0,
+                    Box::new(output::preedit::PreeditOutput::new(preedit.clone(), &c)),
+                );
+                chain
+            })
+        }
+    };
+    let mut shown = String::new();
+    let mut out = IncrementalOutput::new(chain_for, options, processor.trims());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let run = processor.process_streaming(text, context, tx);
     tokio::pin!(run);
@@ -448,6 +473,12 @@ async fn stream_post_process(
                     if !piece.trim().is_empty() {
                         printed = true;
                         first_piece_ms.get_or_insert_with(|| started.elapsed().as_millis());
+                    }
+                    if let Some(preedit) = preedit {
+                        shown.push_str(&piece);
+                        if !shown.trim().is_empty() {
+                            preedit.set(shown.trim());
+                        }
                     }
                     out.push(&piece).await;
                 }
@@ -1301,6 +1332,10 @@ pub struct Daemon {
     /// (`[output] streaming_preview_file`). `None` when not configured or
     /// no session is running.
     streaming_preview: Option<PreviewFile>,
+    /// Input-method preedit backend (`[output] preedit`), `None` when off.
+    preedit: Option<output::preedit::PreeditHandle>,
+    /// The current take shows a preedit: deliver through it, end it after.
+    preedit_take: bool,
     /// The daemon's own handle on the active streaming session's audio
     /// input. Lets a stop hand the backend the tail of the recording it never
     /// saw (see `stop_streaming_capture`). Dropped on every stop, cancel and
@@ -1413,6 +1448,11 @@ impl Daemon {
     /// Create a new daemon with the given configuration
     pub fn new(config: Config, config_path: Option<PathBuf>) -> Self {
         let state_file_path = config.resolve_state_file();
+        let preedit = config
+            .output
+            .preedit
+            .then(output::preedit::PreeditHandle::wayland)
+            .flatten();
 
         // Initialize audio feedback if enabled
         let audio_feedback = if config.audio.feedback.enabled {
@@ -1538,6 +1578,8 @@ impl Daemon {
             is_external_trigger: false,
             streaming_drain_pump: None,
             streaming_preview: None,
+            preedit,
+            preedit_take: false,
             streaming_feed: None,
             streaming_final_audio: None,
             streaming_load_task: None,
@@ -2165,6 +2207,17 @@ impl Daemon {
             .output
             .resolve_streaming_preview_file()
             .map(PreviewFile::new);
+        let typed = !matches!(&output_override, Some(OutputOverride::Mode(m)) if *m != OutputMode::Type)
+            && self.config.output.mode == OutputMode::Type;
+        self.preedit_take = false;
+        if let Some(preedit) = &self.preedit {
+            // Live sessions type finalized text mid-take, which the preedit
+            // would sit on top of; only deferred delivery uses it.
+            if defer_commit && file_output_path.is_none() && typed {
+                preedit.begin();
+                self.preedit_take = true;
+            }
+        }
 
         *audio_capture = Some(capture);
         *streaming_handle = handle;
@@ -2355,6 +2408,7 @@ impl Daemon {
         if let Some(mut preview) = self.streaming_preview.take() {
             preview.clear();
         }
+        self.end_preedit();
         *streaming_session = None;
         *streaming_chain = None;
         self.end_external_session(true).await;
@@ -2904,6 +2958,43 @@ impl Daemon {
         }
     }
 
+    /// Show `text` as this take's preedit, if it has one.
+    fn show_preedit(&self, text: &str) {
+        if self.preedit_take {
+            if let Some(preedit) = &self.preedit {
+                preedit.set(text);
+            }
+        }
+    }
+
+    /// Clear this take's preedit and release the input method.
+    fn end_preedit(&mut self) {
+        if std::mem::take(&mut self.preedit_take) {
+            if let Some(preedit) = &self.preedit {
+                preedit.end();
+            }
+        }
+    }
+
+    /// The preedit to deliver this take's text through, when the focused
+    /// field takes input-method commits. Otherwise the preedit is cleared
+    /// first, so text typed or pasted next cannot land inside it.
+    async fn preedit_for_delivery(
+        &self,
+        output_config: &crate::config::OutputConfig,
+        file_output: bool,
+    ) -> Option<output::preedit::PreeditHandle> {
+        if !self.preedit_take {
+            return None;
+        }
+        let preedit = self.preedit.as_ref()?;
+        if !file_output && output_config.mode == OutputMode::Type && preedit.text_input_active() {
+            return Some(preedit.clone());
+        }
+        preedit.clear_now().await;
+        None
+    }
+
     async fn end_streaming(
         &mut self,
         state: &mut State,
@@ -2990,12 +3081,16 @@ impl Daemon {
                             if let Some(mut p) = preview {
                                 p.clear();
                             }
+                            self.end_preedit();
                             self.publish_empty_outcome();
                             self.reset_to_idle(state).await;
                             return;
                         }
                     }
                     text = final_text;
+                    // The field shows the full-context text while it is
+                    // post-processed.
+                    self.show_preedit(&text);
                 }
             }
 
@@ -3004,6 +3099,7 @@ impl Daemon {
                 if let Some(mut p) = preview {
                     p.clear();
                 }
+                self.end_preedit();
                 self.publish_empty_outcome();
                 self.reset_to_idle(state).await;
                 return;
@@ -3022,11 +3118,13 @@ impl Daemon {
             if let Some(mut p) = preview {
                 p.clear();
             }
+            self.end_preedit();
             return;
         }
         if let Some(mut p) = preview {
             p.clear();
         }
+        self.end_preedit();
         self.abandon_final_pass();
 
         // File-output sessions (`--file=path`) never typed anything as
@@ -3311,6 +3409,7 @@ impl Daemon {
         if let Some(mut preview) = self.streaming_preview.take() {
             preview.clear();
         }
+        self.end_preedit();
         *streaming_session = None;
         *streaming_chain = None;
 
@@ -4925,6 +5024,13 @@ impl Daemon {
                         }
                     }
 
+                    let preedit = self
+                        .preedit_for_delivery(&output_config, file_output_path.is_some())
+                        .await;
+                    if let Some(preedit) = &preedit {
+                        preedit.set(&processed_text);
+                    }
+
                     let final_text = match processor {
                         None => processed_text,
                         Some(processor)
@@ -4942,6 +5048,7 @@ impl Daemon {
                                 &processed_text,
                                 recent_context.as_deref(),
                                 &output_config,
+                                preedit.as_ref(),
                             )
                             .await;
                             match delivery {
@@ -5081,7 +5188,13 @@ impl Daemon {
                         return;
                     }
 
-                    let output_chain = output::create_output_chain(&output_config);
+                    let mut output_chain = output::create_output_chain(&output_config);
+                    if let Some(preedit) = preedit {
+                        output_chain.insert(
+                            0,
+                            Box::new(output::preedit::PreeditOutput::new(preedit, &output_config)),
+                        );
+                    }
 
                     // Output the text
                     *state = State::Outputting {
@@ -5276,6 +5389,14 @@ impl Daemon {
                  Update your config to set [hotkey] mode = \"toggle\" to silence this warning."
             );
             self.config.hotkey.mode = crate::config::ActivationMode::Toggle;
+        }
+
+        if self.preedit.is_some() && self.config.output.streaming_commit != StreamingCommit::OnStop
+        {
+            tracing::warn!(
+                "[output] preedit only applies to streaming_commit = \"on_stop\" sessions; \
+                 it is ignored with the current settings"
+            );
         }
 
         // Clean up any stale cancel and profile override files from previous runs
@@ -6484,6 +6605,9 @@ impl Daemon {
                         {
                             preview.update(&s.live_text());
                         }
+                        if let Some(s) = streaming_session.as_ref() {
+                            self.show_preedit(&s.live_text());
+                        }
                     }
                 }
 
@@ -6655,6 +6779,9 @@ impl Daemon {
             let _ = capture.stop().await;
         }
         self.restore_recording_media();
+        if let Some(preedit) = &self.preedit {
+            preedit.end_now().await;
+        }
         notification::close_persistent().await;
         if let Some(task) = streaming_task {
             let _ = task.await;

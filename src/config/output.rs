@@ -207,6 +207,15 @@ pub struct OutputConfig {
     /// "auto" = $XDG_RUNTIME_DIR/voxtype/live_text. Default: unset (off).
     #[serde(default)]
     pub streaming_preview_file: Option<String>,
+
+    /// Show the live transcript of an `on_stop` streaming session as preedit
+    /// (underlined, uncommitted text) in the focused text field, then commit
+    /// the final text through the Wayland input method instead of typing it.
+    /// Fields without text-input-v3 fall back to the normal output chain.
+    /// Needs a build with the `preedit` feature and a compositor with
+    /// input-method-v2 (Hyprland, Sway, other wlroots compositors).
+    #[serde(default)]
+    pub preedit: bool,
 }
 
 impl OutputConfig {
@@ -258,6 +267,7 @@ impl Default for OutputConfig {
             modifier_release_timeout_ms: default_modifier_release_timeout_ms(),
             streaming_commit: StreamingCommit::default(),
             streaming_preview_file: None,
+            preedit: false,
         }
     }
 }

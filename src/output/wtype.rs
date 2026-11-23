@@ -129,20 +129,7 @@ impl WtypeOutput {
 
     /// Send Enter key using wtype
     async fn send_enter(&self) -> Result<(), OutputError> {
-        let output = Command::new("wtype")
-            .args(["-k", "Return"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|e| OutputError::InjectionFailed(format!("wtype Enter failed: {}", e)))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!("Failed to send Enter key: {}", stderr);
-        }
-
-        Ok(())
+        send_enter_key().await
     }
 
     /// Output text with newlines converted to Shift+Enter
@@ -163,6 +150,24 @@ impl WtypeOutput {
 
         Ok(())
     }
+}
+
+/// Press Enter with wtype (auto-submit after text that went in some other way).
+pub async fn send_enter_key() -> Result<(), OutputError> {
+    let output = Command::new("wtype")
+        .args(["-k", "Return"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| OutputError::InjectionFailed(format!("wtype Enter failed: {}", e)))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        tracing::warn!("Failed to send Enter key: {}", stderr);
+    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]

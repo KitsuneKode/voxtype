@@ -1202,6 +1202,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "File that mirrors the live transcript during a streaming session, for bars and OSDs. \"auto\" uses the runtime directory's live_text.",
     ),
     spec(
+        "output.preedit",
+        "output",
+        "preedit",
+        KeyType::Bool,
+        "Output",
+        "Live preedit",
+        "Show the live transcript of an on_stop streaming session as uncommitted text in the focused field, then commit the result through the Wayland input method. Fields without text-input-v3 are typed into as before.",
+    ),
+    spec(
         "output.post_process.command",
         "output.post_process",
         "command",
@@ -3053,6 +3062,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.append_text" => opt_str(cfg.output.append_text.as_ref()),
         "output.streaming_commit" => serde_json::to_value(cfg.output.streaming_commit).ok()?,
         "output.streaming_preview_file" => opt_str(cfg.output.streaming_preview_file.as_ref()),
+        "output.preedit" => json!(cfg.output.preedit),
         "output.post_process_enabled" => json!(cfg.output.post_process_enabled),
         "output.post_process.command" => match &cfg.output.post_process {
             Some(p) => json!(p.command),

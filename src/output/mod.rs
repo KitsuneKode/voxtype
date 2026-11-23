@@ -34,6 +34,7 @@ pub mod paste;
 #[cfg(target_os = "macos")]
 pub mod pbcopy;
 pub mod post_process;
+pub mod preedit;
 pub mod preview;
 pub mod session;
 pub mod streaming;
@@ -501,8 +502,11 @@ pub struct OutputOptions<'a> {
 /// Output methods that synthesize keystrokes the compositor can interpret as
 /// keybindings when modifiers are held. Used to filter the chain when the
 /// modifier-release wait times out.
-fn is_keystroke_method(name: &str) -> bool {
-    matches!(name, "wtype" | "eitype" | "dotool" | "ydotool") || name.starts_with("paste")
+pub(crate) fn is_keystroke_method(name: &str) -> bool {
+    matches!(
+        name,
+        "wtype" | "eitype" | "dotool" | "ydotool" | "preedit+submit"
+    ) || name.starts_with("paste")
 }
 
 /// True when any method in the chain synthesizes keystrokes, so the

@@ -2712,6 +2712,34 @@ The preview shows raw engine text. Replacements, spoken punctuation, and `post_p
 **CLI override:** `voxtype --streaming-preview-file auto daemon`
 **Environment variable:** `VOXTYPE_STREAMING_PREVIEW_FILE=auto`
 
+### preedit
+
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+Show the live transcript of a `streaming_commit = "on_stop"` session inside the focused text field as preedit: underlined text that is not part of the field's content yet. It follows the words as you speak, switches to the full-context final pass and then to the `post_process` result as they arrive, and is replaced by the final text when the take is delivered. Cancelling, or a take that ends up empty, removes it and leaves the field as it was.
+
+The final text is inserted through the Wayland input method in one step, without simulated key presses, so the keyboard layout does not matter. When the input method cannot express the delivery, the take goes through the normal output chain (`wtype` and its fallbacks) instead, after the preedit is removed:
+
+- The focused window has no text-input-v3 support: XWayland apps, Chromium/Electron without `--enable-wayland-ime`, and some terminals.
+- The text contains newlines or other control characters (so `shift_enter_newlines` behaves as before).
+- Another input method (fcitx5, IBus) is running: the compositor allows only one.
+- The output mode is not `type`, or the take writes to a file.
+
+`auto_submit` and smart auto-submit still press Enter, with `wtype`, after the text is inserted. Password fields never show the preedit.
+
+Voxtype binds as the input method only while a take is recording and delivering, and never grabs the keyboard. It needs a compositor with input-method-v2 (Hyprland, Sway and other wlroots compositors); elsewhere (GNOME, KDE) it logs once and types as usual. Live streaming (`streaming_commit = "live"`) ignores it. Requires a build with the `preedit` cargo feature.
+
+**Example:**
+```toml
+[output]
+streaming_commit = "on_stop"
+preedit = true
+```
+
+**Environment variable:** `VOXTYPE_PREEDIT=true`
+
 ---
 
 ## [output.notification]

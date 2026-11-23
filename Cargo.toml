@@ -133,6 +133,8 @@ wayland-client = { version = "0.31", optional = true, features = ["system"] }
 wayland-backend = { version = "0.3", optional = true, features = ["client_system"] }
 wayland-protocols = { version = "0.32", optional = true, features = ["client", "staging"] }
 wayland-protocols-wlr = { version = "0.3", optional = true, features = ["client"] }
+# Live preedit in the focused text field (`preedit` feature).
+wayland-protocols-misc = { version = "0.3", optional = true, features = ["client"] }
 wgpu = { version = "29", optional = true, default-features = false, features = ["vulkan", "gles", "wgsl", "std"] }
 egui = { version = "0.34", optional = true }
 egui-wgpu = { version = "0.34", optional = true, default-features = false }
@@ -195,6 +197,9 @@ osd-native = [
     "dep:pollster",
     "dep:bytemuck",
 ]
+# Live dictation preedit in the focused text field through the Wayland
+# input-method-v2 protocol (`[output] preedit = true`). Linux/Wayland only.
+preedit = ["dep:wayland-client", "dep:wayland-protocols", "dep:wayland-protocols-misc"]
 osd-gtk4 = ["dep:gtk4", "dep:gtk4-layer-shell", "dep:cairo-rs", "dep:glib"]
 gpu-vulkan = [
     "whisper-rs/vulkan",
@@ -392,3 +397,7 @@ required-features = ["parakeet"]
 [[example]]
 name = "parakeet_eval"
 required-features = ["parakeet"]
+
+[[example]]
+name = "preedit_probe"
+required-features = ["preedit"]
