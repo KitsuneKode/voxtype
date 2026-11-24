@@ -1763,7 +1763,12 @@ impl Daemon {
             );
         }
 
-        if config.streaming_enabled() && config.output.post_process.is_some() {
+        // `streaming_commit = "on_stop"` hands the whole transcript to the
+        // batch path, post_process included.
+        if config.streaming_enabled()
+            && config.output.streaming_commit != StreamingCommit::OnStop
+            && config.output.post_process.is_some()
+        {
             // [text] rules no longer belong in this warning: since the #669
             // fix they are applied when a streaming segment is committed, and
             // warning that a working setting is ignored is worse than not
