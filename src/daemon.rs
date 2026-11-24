@@ -777,6 +777,14 @@ fn parse_output_mode_override(content: &str) -> Option<OutputOverride> {
 
 /// Fold a per-recording output override into the configuration used to build
 /// a streaming session's output chain.
+/// Whether the post-process command marked this take private (Shuush writes
+/// `pp_private` for password fields, password managers and sign-in pages).
+fn post_process_marked_private(since: std::time::SystemTime) -> bool {
+    std::fs::metadata(Config::runtime_dir().join("pp_private"))
+        .and_then(|m| m.modified())
+        .is_ok_and(|modified| modified >= since)
+}
+
 fn apply_output_override(
     base: &OutputConfig,
     override_mode: Option<OutputOverride>,
@@ -2055,6 +2063,14 @@ impl Daemon {
             p
         });
         *self.dictation.lock().unwrap_or_else(|e| e.into_inner()) = pending;
+    }
+
+    /// Drop the dictation in flight from history (a private take).
+    fn history_forget(&self) {
+        self.dictation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 
     /// The dictation is over: write it in the background.
@@ -6965,6 +6981,7 @@ impl Daemon {
                         preedit.set(&processed_text);
                     }
 
+                    let post_process_started = std::time::SystemTime::now();
                     let final_text = match processor {
                         None => processed_text,
                         Some(processor)
@@ -6990,6 +7007,10 @@ impl Daemon {
                             let language = active_transcriber
                                 .as_ref()
                                 .and_then(|t| t.last_detected_language());
+                            let private = post_process_marked_private(post_process_started);
+                            if private {
+                                self.history_forget();
+                            }
                             match delivery {
                                 StreamedDelivery::Delivered(delivered) => {
                                     use crate::history::OutputInfo;
@@ -7013,10 +7034,12 @@ impl Daemon {
                                     });
                                     let text = delivered.text;
                                     self.publish_osd_text_outcome(&text);
-                                    self.last_dictation = Some((text.clone(), Instant::now()));
+                                    self.last_dictation =
+                                        (!private).then(|| (text.clone(), Instant::now()));
                                     write_output_done(text.chars().count());
                                     self.play_feedback(SoundEvent::TranscriptionComplete);
-                                    if self.config.output.notification.on_transcription {
+                                    if self.config.output.notification.on_transcription && !private
+                                    {
                                         output::send_transcription_notification(
                                             &text,
                                             self.config
@@ -7055,7 +7078,7 @@ impl Daemon {
                                         &output::fallback::OutputReport::default(),
                                         &e,
                                         &processed_text,
-                                        self.config.output.keep_undelivered_text,
+                                        self.config.output.keep_undelivered_text && !private,
                                     )
                                     .await;
                                 }
@@ -7134,8 +7157,14 @@ impl Daemon {
                         }
                     };
 
+                    // A private take (see `post_process_marked_private`) leaves
+                    // no history, context, notification or undelivered copy.
+                    let private = post_process_marked_private(post_process_started);
+                    if private {
+                        self.history_forget();
+                    }
                     // Track last dictation for context in subsequent post-processing
-                    self.last_dictation = Some((final_text.clone(), Instant::now()));
+                    self.last_dictation = (!private).then(|| (final_text.clone(), Instant::now()));
 
                     if smart_submit {
                         tracing::debug!(
@@ -7293,7 +7322,7 @@ impl Daemon {
                             }
                         });
                     }
-                    if let Err(e) = delivery {
+                    if let Err(e) = &delivery {
                         tracing::error!("Output failed: {}", e);
                         self.publish_osd_outcome(osd::session::OutcomeKind::OutputFailed, 0);
                         // Nothing typed or copied: keep the text recoverable,
@@ -7302,15 +7331,17 @@ impl Daemon {
                             &report,
                             &e,
                             &final_text,
-                            self.config.output.keep_undelivered_text,
+                            self.config.output.keep_undelivered_text && !private,
                         )
                         .await;
                     } else {
                         write_output_done(final_text.chars().count());
                         self.publish_osd_text_outcome(&final_text);
                         self.play_feedback(SoundEvent::TranscriptionComplete);
-                        // Says "copied to clipboard" (and why, once) when
-                        // typing fell back to the clipboard.
+                    }
+                    // Says "copied to clipboard" (and why, once) when typing
+                    // fell back to the clipboard; never with a private take's text.
+                    if delivery.is_ok() && !private {
                         output::fallback::notify_delivered(
                             &report,
                             &final_text,
@@ -10252,6 +10283,84 @@ while True:
         pending.delivered_text("Plain 'text'.");
         assert_eq!(pending.entry.text, "Plain 'text'.");
         assert_eq!(pending.entry.raw_text, "um plain text");
+    }
+
+    /// A take the post-process command marked private (Shuush's `pp_private`,
+    /// written for password fields and sign-in pages) is typed, then leaves
+    /// no history entry and is not handed to the next take as context.
+    #[tokio::test]
+    async fn a_take_marked_private_by_post_processing_is_typed_and_forgotten() {
+        const PROBE: &str = "private-take";
+        if std::env::var("VOXTYPE_HISTORY_METADATA_PROBE").as_deref() != Ok(PROBE) {
+            let fixture = tempfile::tempdir().unwrap();
+            let runtime = fixture.path().join("runtime");
+            std::fs::create_dir(&runtime).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "daemon::tests::a_take_marked_private_by_post_processing_is_typed_and_forgotten",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", fixture.path())
+                .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+                .env("XDG_DATA_HOME", fixture.path().join("data"))
+                .env("XDG_RUNTIME_DIR", runtime)
+                .env("TMPDIR", fixture.path())
+                .env("RUST_MIN_STACK", "16777216")
+                .env("VOXTYPE_HISTORY_METADATA_PROBE", PROBE)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let mut daemon = history_daemon(fixture.path());
+        daemon.config.engine = crate::config::TranscriptionEngine::Whisper;
+        daemon.config.output.wait_for_modifier_release = false;
+        daemon.config.output.notification.on_transcription = false;
+        let marker = Config::runtime_dir().join("pp_private");
+        std::fs::create_dir_all(Config::runtime_dir()).unwrap();
+        daemon.post_processor = Some(PostProcessor::new(&crate::config::PostProcessConfig {
+            command: format!("date +%s > '{}'; cat", marker.display()),
+            timeout_ms: 5000,
+            ..Default::default()
+        }));
+        let got = Arc::new(std::sync::Mutex::new(None));
+        daemon.history_test_output_chain = Some(vec![Box::new(RecordingOutput {
+            got: got.clone(),
+            succeed: true,
+        })]);
+        daemon.begin_osd_session(&State::Recording {
+            started_at: std::time::Instant::now(),
+            model_override: None,
+        });
+        let mut state = State::Transcribing { audio: Vec::new() };
+        daemon
+            .handle_transcription_result(&mut state, Ok(Ok("hunter two".into())))
+            .await;
+
+        assert!(
+            got.lock().unwrap().is_some(),
+            "a private take is still typed"
+        );
+        assert!(
+            daemon.last_dictation.is_none(),
+            "kept as the next take's context"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let store = crate::history::HistoryStore::at(fixture.path().join("history"));
+        assert!(
+            store.all().unwrap_or_default().is_empty(),
+            "recorded to history"
+        );
     }
 
     #[tokio::test]
