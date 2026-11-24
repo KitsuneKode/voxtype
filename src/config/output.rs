@@ -232,6 +232,14 @@ pub struct OutputConfig {
     /// input-method-v2 (Hyprland, Sway, other wlroots compositors).
     #[serde(default)]
     pub preedit: bool,
+
+    /// Bind the Wayland input method during a take only to read the focused
+    /// field's text (`$XDG_RUNTIME_DIR/voxtype/field_text.json`, for a
+    /// post-processor that learns from edits), never showing or committing
+    /// anything in it; the text is delivered by the normal output chain.
+    /// `preedit` reads the field too, so this only matters without it.
+    #[serde(default)]
+    pub read_field: bool,
 }
 
 impl OutputConfig {
@@ -286,6 +294,7 @@ impl Default for OutputConfig {
             streaming_commit: StreamingCommit::default(),
             streaming_preview_file: None,
             preedit: false,
+            read_field: false,
         }
     }
 }

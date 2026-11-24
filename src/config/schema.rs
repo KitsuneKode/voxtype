@@ -1256,6 +1256,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Show the live transcript of an on_stop streaming session as uncommitted text in the focused field, then commit the result through the Wayland input method. Fields without text-input-v3 are typed into as before.",
     ),
     spec(
+        "output.read_field",
+        "output",
+        "read_field",
+        KeyType::Bool,
+        "Output",
+        "Read the focused field",
+        "Bind the Wayland input method during a take only to read the focused field's text (field_text.json), never showing or committing anything in it. Text is delivered by the normal output chain.",
+    ),
+    spec(
         "output.post_process.command",
         "output.post_process",
         "command",
@@ -3585,6 +3594,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.streaming_commit" => serde_json::to_value(cfg.output.streaming_commit).ok()?,
         "output.streaming_preview_file" => opt_str(cfg.output.streaming_preview_file.as_ref()),
         "output.preedit" => json!(cfg.output.preedit),
+        "output.read_field" => json!(cfg.output.read_field),
         "output.post_process_enabled" => json!(cfg.output.post_process_enabled),
         "output.post_process.command" => match &cfg.output.post_process {
             Some(p) => json!(p.command),
@@ -3726,7 +3736,9 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.streaming_max_pause_secs" => json!(pk().streaming_max_pause_secs),
         "parakeet.streaming_final_pass" => json!(pk().streaming_final_pass),
         "parakeet.streaming_final_pass_max_secs" => json!(pk().streaming_final_pass_max_secs),
-        "parakeet.streaming_final_pass_skip_when_clean" => json!(pk().streaming_final_pass_skip_when_clean),
+        "parakeet.streaming_final_pass_skip_when_clean" => {
+            json!(pk().streaming_final_pass_skip_when_clean)
+        }
         "parakeet.final_pass_segment_secs" => json!(pk().final_pass_segment_secs),
         "parakeet.pad_secs" => json!(pk().pad_secs),
         "parakeet.vocabulary_file" => match &pk().vocabulary_file {
@@ -3740,9 +3752,18 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "parakeet.vocabulary_boost" => json!(pk().vocabulary_boost),
         "parakeet.idle_unload_secs" => json!(pk().idle_unload_secs),
         "parakeet.cpu.threads" => pk().cpu.threads.map_or(Json::Null, |n| json!(n)),
-        "parakeet.cpu.streaming_chunk_secs" => pk().cpu.streaming_chunk_secs.map_or(Json::Null, |v| f32_json(v)),
-        "parakeet.cpu.streaming_left_context_secs" => pk().cpu.streaming_left_context_secs.map_or(Json::Null, |v| f32_json(v)),
-        "parakeet.cpu.streaming_right_context_secs" => pk().cpu.streaming_right_context_secs.map_or(Json::Null, |v| f32_json(v)),
+        "parakeet.cpu.streaming_chunk_secs" => pk()
+            .cpu
+            .streaming_chunk_secs
+            .map_or(Json::Null, |v| f32_json(v)),
+        "parakeet.cpu.streaming_left_context_secs" => pk()
+            .cpu
+            .streaming_left_context_secs
+            .map_or(Json::Null, |v| f32_json(v)),
+        "parakeet.cpu.streaming_right_context_secs" => pk()
+            .cpu
+            .streaming_right_context_secs
+            .map_or(Json::Null, |v| f32_json(v)),
         "streaming.interval_secs" => json!(cfg.streaming.unwrap_or_default().interval_secs),
         "streaming.max_buffer_secs" => json!(cfg.streaming.unwrap_or_default().max_buffer_secs),
         "streaming.min_speech_rms" => json!(cfg.streaming.unwrap_or_default().min_speech_rms),

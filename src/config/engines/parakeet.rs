@@ -216,7 +216,6 @@ pub struct ParakeetCpuConfig {
     #[serde(default)]
     pub threads: Option<usize>,
 
-
     /// Preview chunk length on CPU (overrides `streaming_chunk_secs`).
     #[serde(default)]
     pub streaming_chunk_secs: Option<f32>,

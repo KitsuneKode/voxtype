@@ -400,6 +400,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     if let Ok(val) = std::env::var("VOXTYPE_PREEDIT") {
         config.output.preedit = parse_bool_env(&val);
     }
+    if let Ok(val) = std::env::var("VOXTYPE_READ_FIELD") {
+        config.output.read_field = parse_bool_env(&val);
+    }
     if let Ok(val) = std::env::var("VOXTYPE_RESTORE_CLIPBOARD_DELAY_MS") {
         if let Ok(ms) = val.parse::<u32>() {
             config.output.restore_clipboard_delay_ms = ms;

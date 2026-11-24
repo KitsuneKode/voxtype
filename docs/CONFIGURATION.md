@@ -2849,6 +2849,21 @@ streaming_commit = "on_stop"
 preedit = true
 ```
 
+### read_field
+
+**Type:** Boolean
+**Default:** `false`
+**Required:** No
+
+Bind the Wayland input method during a take only to read the focused field's text around the cursor, without `preedit`'s live text: nothing is shown in the field and nothing is committed through the input method, so the take is typed by the normal output chain. The text is written to `$XDG_RUNTIME_DIR/voxtype/field_text.json` (mode 600) while the take records and for two minutes after it, then removed. A post-processor can read it to join a dictation onto the text before the cursor or to learn from words you correct by hand, including in Electron apps that hide their text from accessibility tools. Password fields are never read.
+
+`preedit` reads the field as well, so this only matters with `preedit = false`. Same requirements as `preedit`: the `preedit` cargo feature and a compositor with input-method-v2.
+
+```toml
+[output]
+read_field = true
+```
+
 **Environment variable:** `VOXTYPE_PREEDIT=true`
 
 ---

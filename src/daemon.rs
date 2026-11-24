@@ -1511,6 +1511,9 @@ pub struct Daemon {
     preedit: Option<output::preedit::PreeditHandle>,
     /// The current take shows a preedit: deliver through it, end it after.
     preedit_take: bool,
+    /// The current take binds the input method only to read the field
+    /// (`[output] read_field`): nothing is shown or committed through it.
+    field_take: bool,
     /// The daemon's own handle on the active streaming session's audio
     /// input. Lets a stop hand the backend the tail of the recording it never
     /// saw (see `stop_streaming_capture`). Dropped on every stop, cancel and
@@ -1710,9 +1713,7 @@ impl Daemon {
 
     pub fn new(config: Config, config_path: Option<PathBuf>) -> Self {
         let state_file_path = config.resolve_state_file();
-        let preedit = config
-            .output
-            .preedit
+        let preedit = (config.output.preedit || config.output.read_field)
             .then(output::preedit::PreeditHandle::wayland)
             .flatten();
         let history = Arc::new(std::sync::Mutex::new(
@@ -1860,6 +1861,7 @@ impl Daemon {
             streaming_preview: None,
             preedit,
             preedit_take: false,
+            field_take: false,
             streaming_feed: None,
             streaming_final_audio: None,
             streaming_load_task: None,
@@ -2746,12 +2748,16 @@ impl Daemon {
         let output_config = apply_output_override(&self.config.output, output_override);
         let typed = output_config.mode == OutputMode::Type;
         self.preedit_take = false;
+        self.field_take = false;
         if let Some(preedit) = &self.preedit {
             // Live sessions type finalized text mid-take, which the preedit
             // would sit on top of; only deferred delivery uses it.
-            if defer_commit && file_output_path.is_none() && typed {
+            if self.config.output.preedit && defer_commit && file_output_path.is_none() && typed {
                 preedit.begin();
                 self.preedit_take = true;
+            } else if self.config.output.read_field && file_output_path.is_none() && typed {
+                preedit.begin();
+                self.field_take = true;
             }
         }
 
@@ -3525,7 +3531,7 @@ impl Daemon {
     /// Clear this take's preedit; the binding stays on the field a while
     /// for edit learning (see `output::preedit::LINGER`).
     fn end_preedit(&mut self) {
-        if std::mem::take(&mut self.preedit_take) {
+        if std::mem::take(&mut self.preedit_take) | std::mem::take(&mut self.field_take) {
             if let Some(preedit) = &self.preedit {
                 preedit.end();
             }
@@ -3534,7 +3540,7 @@ impl Daemon {
 
     /// A cancelled take: clear the preedit and release the input method now.
     fn release_preedit(&mut self) {
-        if std::mem::take(&mut self.preedit_take) {
+        if std::mem::take(&mut self.preedit_take) | std::mem::take(&mut self.field_take) {
             if let Some(preedit) = &self.preedit {
                 preedit.release();
             }

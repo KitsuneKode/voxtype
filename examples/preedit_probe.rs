@@ -52,11 +52,15 @@ async fn main() {
             Ok(body) => {
                 let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
                 let len = |k: &str| v[k].as_str().map_or(0, |s| s.chars().count());
-                println!("PREEDIT_FIELD before={} after={}", len("before"), len("after"));
+                println!(
+                    "PREEDIT_FIELD before={} after={}",
+                    len("before"),
+                    len("after")
+                );
             }
             Err(_) => println!("PREEDIT_FIELD none (the field sent no surrounding text)"),
         }
     }
-    preedit.end_now().await;
+    preedit.release_now().await;
     println!("PREEDIT_RELEASED");
 }
