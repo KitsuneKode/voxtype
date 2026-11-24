@@ -264,7 +264,13 @@ pub struct Driver {
     /// The field text last handed out by [`field_update`](Self::field_update).
     field: Option<(String, String)>,
     field_dirty: bool,
+    /// When to next ask the field for its text (see [`Ime::ask_field`]).
+    next_ask: Option<Instant>,
 }
+
+/// How often a bound field is asked for its text, so edits made after a
+/// take are seen by a field that reports only when asked.
+const FIELD_ASK: Duration = Duration::from_millis(500);
 
 impl Driver {
     pub fn new(shared: Arc<Shared>) -> Self {
@@ -274,7 +280,16 @@ impl Driver {
             linger_until: None,
             field: None,
             field_dirty: false,
+            next_ask: None,
         }
+    }
+
+    /// When the Wayland thread must wake for [`tick`](Self::tick).
+    pub fn wake_deadline(&self) -> Option<Instant> {
+        [self.linger_until, self.next_ask]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// When the binding kept after a take must be released.
@@ -287,6 +302,15 @@ impl Driver {
         if self.linger_until.is_some_and(|t| now >= t) {
             self.release(sink);
             self.publish();
+        }
+        match self.ime.as_ref().filter(|ime| ime.active()) {
+            Some(ime) => {
+                if self.next_ask.is_none_or(|t| now >= t) {
+                    sink.send(ime.ask_field());
+                    self.next_ask = Some(now + FIELD_ASK);
+                }
+            }
+            None => self.next_ask = None,
         }
     }
 

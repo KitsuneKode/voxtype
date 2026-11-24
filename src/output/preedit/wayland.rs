@@ -296,7 +296,7 @@ fn run(
             queue.flush()?;
             let wake_at = [
                 pending_field.as_ref().map(|(due, _)| *due),
-                app.driver.linger_deadline(),
+                app.driver.wake_deadline(),
             ]
             .into_iter()
             .flatten()

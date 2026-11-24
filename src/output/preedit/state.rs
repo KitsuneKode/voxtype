@@ -177,6 +177,17 @@ impl Ime {
         self.sync()
     }
 
+    /// An empty commit, for a field that reports its text only in answer to
+    /// one (Chromium flushes surrounding text when it receives a `done`).
+    /// Nothing while a preedit is shown: its own commits do the asking.
+    pub fn ask_field(&self) -> Vec<Request> {
+        if self.active() && !self.hidden && self.shown.is_empty() && !self.awaiting_field {
+            vec![Request::Commit(self.serial)]
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Remove the preedit.
     pub fn clear(&mut self) -> Vec<Request> {
         self.text.clear();
@@ -501,6 +512,19 @@ mod tests {
         let mut ime = showing("Done. ", LIVE);
         ime.on_event(surrounding(&format!("Done. {LIVE}")));
         assert_eq!(ime.on_event(Event::Done), removes_and_reshows(2));
+    }
+
+    // Chromium 152 sends its text only in answer to a commit: with no preedit
+    // (`read_field`), an empty one asks for it.
+    #[test]
+    fn a_field_is_asked_for_its_text_only_while_nothing_is_shown() {
+        let mut ime = activated();
+        assert_eq!(ime.ask_field(), vec![Request::Commit(1)]);
+        ime.set("hello");
+        assert!(ime.ask_field().is_empty(), "the preedit's own commits ask");
+        ime.on_event(Event::Deactivate);
+        ime.on_event(Event::Done);
+        assert!(ime.ask_field().is_empty(), "no field");
     }
 
     #[test]
