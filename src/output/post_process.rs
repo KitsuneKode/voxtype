@@ -271,8 +271,15 @@ impl PostProcessor {
         pieces: mpsc::UnboundedSender<String>,
     ) -> StreamEnd {
         match self.stream_command(text, context, &pieces).await {
-            Ok(()) => StreamEnd::Done,
-            Err(e) => StreamEnd::Failed(e),
+            Ok(()) => {
+                self.succeeded();
+                StreamEnd::Done
+            }
+            Err(e) => {
+                let (kind, notice) = self.failure_notice(&e);
+                self.report(kind, notice);
+                StreamEnd::Failed(e)
+            }
         }
     }
 
@@ -283,7 +290,7 @@ impl PostProcessor {
         pieces: &mpsc::UnboundedSender<String>,
     ) -> Result<(), PostProcessError> {
         let deadline = tokio::time::Instant::now() + self.timeout;
-        let timed_out = || PostProcessError::Timeout(self.timeout.as_secs());
+        let timed_out = || PostProcessError::Timeout(self.timeout.as_millis() as u64);
         let mut cmd = self.command(context);
         cmd.env("VOXTYPE_STREAM_OUTPUT", "1");
         let mut child = cmd
@@ -1276,7 +1283,10 @@ mod tests {
         let (got, end) = collect_stream("printf 'Part.'; sleep 5; printf 'never'", 400).await;
         let text: String = got.into_iter().map(|(p, _)| p).collect();
         assert_eq!(text, "Part.");
-        assert!(matches!(end, super::StreamEnd::Failed(PostProcessError::Timeout(_))));
+        assert!(matches!(
+            end,
+            super::StreamEnd::Failed(PostProcessError::Timeout(_))
+        ));
     }
 
     #[tokio::test]
@@ -1285,5 +1295,4 @@ mod tests {
         let processor = PostProcessor::new(&config);
         assert_eq!(processor.process("x").await, "unset");
     }
-
 }

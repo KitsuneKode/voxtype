@@ -222,6 +222,11 @@ mod imp {
         fade_ms: u32,
         paused_apps: &[String],
     ) -> (Vec<DuckedMediaStream>, Option<JoinHandle<()>>) {
+        // A watch from the last restore must not see this duck's levels, nor
+        // fix a stream while its originals are being read here.
+        if let Some(watch) = RESPAWN_WATCH.lock().ok().and_then(|mut w| w.take()) {
+            watch.abort();
+        }
         let streams = match list_active_sink_inputs().await {
             Ok(streams) => streams,
             Err(e) => {
@@ -237,10 +242,6 @@ mod imp {
             .into_iter()
             .filter(|s| !same_app(&s.app, paused_apps))
             .collect();
-        // A watch from the last restore must not see this duck's levels.
-        if let Some(watch) = RESPAWN_WATCH.lock().ok().and_then(|mut w| w.take()) {
-            watch.abort();
-        }
 
         if streams.is_empty() {
             debug!("No active audio streams found for media ducking");
@@ -299,7 +300,9 @@ mod imp {
         let watch =
             tokio::spawn(async move { restore_recreated_streams(&streams_snapshot, pct).await });
         if let Ok(mut slot) = RESPAWN_WATCH.lock() {
-            *slot = Some(watch.abort_handle());
+            if let Some(previous) = slot.replace(watch.abort_handle()) {
+                previous.abort();
+            }
         }
     }
 
@@ -382,6 +385,9 @@ mod imp {
     /// Identities of the apps behind MPRIS players (process binary and the
     /// player's Identity / DesktopEntry), for leaving their streams alone.
     pub async fn player_apps(players: &[String]) -> Vec<String> {
+        if players.is_empty() {
+            return Vec::new();
+        }
         let Ok(conn) = Connection::session().await else {
             return Vec::new();
         };
@@ -917,6 +923,8 @@ mod imp {
             assert_eq!(all[0].app, vec!["spotify".to_string()]);
             assert!(same_app(&all[0].app, &["spotify".into()]));
             assert!(!same_app(&all[0].app, &["mpv".into()]));
+            // Too short to name an app on its own.
+            assert!(!same_app(&["vl".into()], &["vl".into()]));
         }
 
         #[test]

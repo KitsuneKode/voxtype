@@ -401,8 +401,8 @@ async fn wait_for_post_process(run: impl std::future::Future<Output = String>) -
 
 /// How a streamed post-process delivery ([`stream_post_process`]) ended.
 enum StreamedDelivery {
-    /// Delivered; the whole text.
-    Delivered(String),
+    /// Delivered; the whole text and the driver that took it.
+    Delivered(output::Delivered),
     /// No output method took the text.
     Failed(crate::error::OutputError),
     /// `record cancel` arrived. What was already typed stays typed.
@@ -529,7 +529,9 @@ async fn stream_post_process(
         match end {
             Some(StreamEnd::Done) | None => {
                 if !printed && processor.falls_back_on_empty() {
-                    tracing::warn!("Post-process command returned empty output, using original text");
+                    tracing::warn!(
+                        "Post-process command returned empty output, using original text"
+                    );
                     out.push(text).await;
                 }
             }
@@ -550,7 +552,7 @@ async fn stream_post_process(
         Ok(delivered) => {
             tracing::info!(
                 "Post-processed (streamed): changed: {}, first text after {}ms, done after {}ms",
-                delivered != text,
+                delivered.text != text,
                 first_piece_ms.map_or_else(|| "-".to_string(), |ms| ms.to_string()),
                 started.elapsed().as_millis()
             );
@@ -2696,8 +2698,8 @@ impl Daemon {
             .output
             .resolve_streaming_preview_file()
             .map(PreviewFile::new);
-        let typed = !matches!(&output_override, Some(OutputOverride::Mode(m)) if *m != OutputMode::Type)
-            && self.config.output.mode == OutputMode::Type;
+        let output_config = apply_output_override(&self.config.output, output_override);
+        let typed = output_config.mode == OutputMode::Type;
         self.preedit_take = false;
         if let Some(preedit) = &self.preedit {
             // Live sessions type finalized text mid-take, which the preedit
@@ -2707,7 +2709,6 @@ impl Daemon {
                 self.preedit_take = true;
             }
         }
-        let output_config = apply_output_override(&self.config.output, output_override);
 
         *audio_capture = Some(capture);
         *streaming_handle = handle;
@@ -2774,28 +2775,21 @@ impl Daemon {
             Ok(Ok(t)) => {
                 self.transcriber_preloaded = Some(t.clone());
                 self.touch_transcriber_used();
+                if state.is_streaming() {
+                    self.active_transcriber = Some(t.clone());
+                }
                 t
             }
             Ok(Err(e)) => {
                 tracing::error!("Failed to load streaming transcriber: {}", e);
-                self.fail_streaming_load(
-                    state,
-                    audio_capture,
-                    streaming_session,
-                    streaming_chain,
-                )
-                .await;
+                self.fail_streaming_load(state, audio_capture, streaming_session, streaming_chain)
+                    .await;
                 return;
             }
             Err(e) => {
                 tracing::error!("Streaming transcriber load task panicked: {}", e);
-                self.fail_streaming_load(
-                    state,
-                    audio_capture,
-                    streaming_session,
-                    streaming_chain,
-                )
-                .await;
+                self.fail_streaming_load(state, audio_capture, streaming_session, streaming_chain)
+                    .await;
                 return;
             }
         };
@@ -2807,13 +2801,8 @@ impl Daemon {
         if audio_capture.is_some() {
             let Some(streaming) = transcriber.as_streaming() else {
                 tracing::error!("Loaded model does not support streaming");
-                self.fail_streaming_load(
-                    state,
-                    audio_capture,
-                    streaming_session,
-                    streaming_chain,
-                )
-                .await;
+                self.fail_streaming_load(state, audio_capture, streaming_session, streaming_chain)
+                    .await;
                 return;
             };
             if let Some(samples_rx) = pending.samples_rx.take() {
@@ -2859,7 +2848,10 @@ impl Daemon {
                         return;
                     }
                     Err(e) => {
-                        tracing::error!("Failed to drain stopped streaming session after load: {}", e);
+                        tracing::error!(
+                            "Failed to drain stopped streaming session after load: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -2893,6 +2885,7 @@ impl Daemon {
         if !state.is_streaming() {
             return;
         }
+        self.active_transcriber = None;
         self.cut_streaming_audio();
         self.abandon_final_pass();
         self.streaming_final_audio = None;
@@ -2938,7 +2931,9 @@ impl Daemon {
                     tokio::task::spawn_blocking(move || worker.transcribe(&audio))
                         .await
                         .unwrap_or_else(|e| {
-                            Err(crate::error::TranscribeError::InferenceFailed(e.to_string()))
+                            Err(crate::error::TranscribeError::InferenceFailed(
+                                e.to_string(),
+                            ))
                         })
                 }
             };
@@ -2948,18 +2943,15 @@ impl Daemon {
             let result = match first {
                 Ok(text) => Ok(text),
                 Err(e) => {
-                    tracing::warn!(
-                        "Final pass failed, retrying the whole take once: {}",
-                        e
-                    );
+                    tracing::warn!("Final pass failed, retrying the whole take once: {}", e);
                     let audio = captured.clone();
-                    tokio::task::spawn_blocking(move || {
-                        transcriber_retry.transcribe(&audio)
-                    })
-                    .await
-                    .unwrap_or_else(|err| {
-                        Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
-                    })
+                    tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio))
+                        .await
+                        .unwrap_or_else(|err| {
+                            Err(crate::error::TranscribeError::InferenceFailed(
+                                err.to_string(),
+                            ))
+                        })
                 }
             };
             let text = match result {
@@ -3048,7 +3040,8 @@ impl Daemon {
             } else {
                 tracing::info!("Stopping streaming session; closing capture and disowning session");
             }
-            self.stop_streaming_capture(audio_capture, streaming_handle, silent).await;
+            self.stop_streaming_capture(audio_capture, streaming_handle, silent)
+                .await;
             if !silent {
                 // Drop the typing surface synchronously so any
                 // Final/Partial events the backend emits while
@@ -3268,7 +3261,8 @@ impl Daemon {
             .as_ref()
             .map_or(0.0, |p| p.streaming_final_pass_max_secs);
         let on_stop = self.config.output.streaming_commit == StreamingCommit::OnStop;
-        if drain && on_stop && self.final_pass_enabled() && !captured.is_empty() && secs <= max_secs {
+        if drain && on_stop && self.final_pass_enabled() && !captured.is_empty() && secs <= max_secs
+        {
             if let Some(transcriber) = self.transcriber_preloaded.clone() {
                 // Read before the cancel: the stream's progress stops there.
                 let clean = self.clean_streamed_text(transcriber.as_ref(), &captured);
@@ -3282,12 +3276,16 @@ impl Daemon {
                     if let Some(pass) = incremental {
                         pass.abandon();
                     }
-                    tracing::info!("Streamed text ends cleanly; final pass skipped for {:.1}s take", secs);
+                    tracing::info!(
+                        "Streamed text ends cleanly; final pass skipped for {:.1}s take",
+                        secs
+                    );
                     let captured = Arc::new(captured);
                     let wav = Arc::clone(&captured);
                     let rate = self.config.audio.sample_rate;
                     tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
-                    self.final_pass_task = Some(tokio::spawn(async move { (Some(text), captured) }));
+                    self.final_pass_task =
+                        Some(tokio::spawn(async move { (Some(text), captured) }));
                     self.update_state("transcribing");
                     return;
                 }
@@ -3378,18 +3376,17 @@ impl Daemon {
     /// `[parakeet] streaming_final_pass_skip_when_clean`: the streamed text,
     /// when it can be delivered instead of the final pass (see
     /// [`crate::transcribe::stream_is_clean`]).
-    fn clean_streamed_text(&self, transcriber: &dyn Transcriber, captured: &[f32]) -> Option<String> {
-        if !self
-            .config
-            .parakeet
-            .as_ref()
-            .is_some_and(|p| {
-                // The stream's text never got vocabulary rescoring.
-                p.streaming_final_pass_skip_when_clean
-                    && p.vocabulary_file.is_none()
-                    && p.corrections_file.is_none()
-            })
-        {
+    fn clean_streamed_text(
+        &self,
+        transcriber: &dyn Transcriber,
+        captured: &[f32],
+    ) -> Option<String> {
+        if !self.config.parakeet.as_ref().is_some_and(|p| {
+            // The stream's text never got vocabulary rescoring.
+            p.streaming_final_pass_skip_when_clean
+                && p.vocabulary_file.is_none()
+                && p.corrections_file.is_none()
+        }) {
             return None;
         }
         // A stream that took more audio than this take is a stale one.
@@ -3435,15 +3432,22 @@ impl Daemon {
                 tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio_retry))
                     .await
                     .unwrap_or_else(|err| {
-                        Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
+                        Err(crate::error::TranscribeError::InferenceFailed(
+                            err.to_string(),
+                        ))
                     })
             }
             Err(e) => {
-                tracing::warn!("Final pass task failed, retrying the whole take once: {}", e);
+                tracing::warn!(
+                    "Final pass task failed, retrying the whole take once: {}",
+                    e
+                );
                 tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio_retry))
                     .await
                     .unwrap_or_else(|err| {
-                        Err(crate::error::TranscribeError::InferenceFailed(err.to_string()))
+                        Err(crate::error::TranscribeError::InferenceFailed(
+                            err.to_string(),
+                        ))
                     })
             }
         };
@@ -3522,6 +3526,31 @@ impl Daemon {
         streaming_session: &mut Option<StreamingSession>,
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
     ) {
+        // With a deferred commit the final pass decodes the whole recording
+        // again, so a failed live stream only cost the preview.
+        let recoverable = matches!(
+            &state,
+            State::Streaming {
+                defer_commit: true,
+                ..
+            }
+        ) && (self.final_pass_task.is_some()
+            || self.streaming_final_audio.is_some());
+        if recoverable {
+            tracing::warn!(
+                "Streaming backend error: {}; the final pass decides the text",
+                error
+            );
+            self.end_streaming(
+                state,
+                audio_capture,
+                streaming_handle,
+                streaming_session,
+                streaming_chain,
+            )
+            .await;
+            return;
+        }
         tracing::error!("Streaming backend error: {}", error);
         self.history_note(|pending| {
             pending.outcome(
@@ -3617,14 +3646,16 @@ impl Daemon {
             // recording does, so a stray tap still never becomes text.
             let mut text = streamed;
             if let Some(task) = self.final_pass_task.take() {
-                let (final_text, audio) = task.await.unwrap_or_else(|_| (None, Arc::new(Vec::new())));
+                let (final_text, audio) =
+                    task.await.unwrap_or_else(|_| (None, Arc::new(Vec::new())));
                 if let Some(final_text) = final_text {
                     if text.is_empty() {
                         let no_speech = match &self.vad {
                             Some(vad) => {
                                 let vad = vad.clone();
                                 let audio = audio.clone();
-                                match tokio::task::spawn_blocking(move || vad.detect(&audio)).await {
+                                match tokio::task::spawn_blocking(move || vad.detect(&audio)).await
+                                {
                                     Ok(Ok(r)) if !r.has_speech => Some(r),
                                     _ => None,
                                 }
@@ -3632,6 +3663,7 @@ impl Daemon {
                             None => None,
                         };
                         if let Some(result) = no_speech {
+                            self.history_transcribed();
                             self.report_no_speech(&result).await;
                             if let Some(mut p) = preview {
                                 p.clear();
@@ -3655,6 +3687,8 @@ impl Daemon {
                     p.clear();
                 }
                 self.end_preedit();
+                self.history_transcribed();
+                self.publish_osd_outcome(osd::session::OutcomeKind::Empty, 0);
                 self.publish_empty_outcome();
                 self.reset_to_idle(state).await;
                 return;
@@ -3682,10 +3716,7 @@ impl Daemon {
         self.end_preedit();
         self.abandon_final_pass();
 
-        if let Some(engine) = self.active_transcriber.take() {
-            self.history_transcriber_metadata(engine.as_ref());
-        }
-        self.history_note(|pending| pending.transcribed());
+        self.history_transcribed();
 
         // File-output sessions (`--file=path`) never typed anything as
         // they went — see the event pump's `file_output` branch — so the
@@ -3796,7 +3827,6 @@ impl Daemon {
             *state = State::Idle;
             self.touch_transcriber_used();
             self.update_state("idle");
-            self.discard_recording_overrides();
             return;
         }
 
@@ -4036,11 +4066,8 @@ impl Daemon {
         // Show the cancel right away: the OSD and the cancel sound should
         // not wait for the mic to close or the backend to wind down.
         self.publish_osd_outcome(osd::session::OutcomeKind::Cancelled, 0);
+        self.history_transcribed();
         // Going idle writes the history entry: what it records goes first.
-        if let Some(engine) = self.active_transcriber.take() {
-            self.history_transcriber_metadata(engine.as_ref());
-        }
-        self.history_note(|pending| pending.transcribed());
         self.update_state("idle");
         self.play_feedback(SoundEvent::Cancelled);
         if let Some(mut c) = audio_capture.take() {
@@ -6159,6 +6186,15 @@ impl Daemon {
     ///
     /// Only fires when the transcript would have gone to a file; interactive
     /// output modes have the OSD and sounds to say the same thing.
+    /// Note the engine that transcribed this take and when it finished, for
+    /// a take that ends without reaching `handle_transcription_result`.
+    fn history_transcribed(&mut self) {
+        if let Some(engine) = self.active_transcriber.take() {
+            self.history_transcriber_metadata(engine.as_ref());
+        }
+        self.history_note(|pending| pending.transcribed());
+    }
+
     fn publish_empty_outcome(&self) {
         if let Some(path) = peek_file_output_path(&self.config) {
             write_result_sidecar(&path, &TranscriptOutcome::empty());
@@ -6926,14 +6962,32 @@ impl Daemon {
                                 history_context.as_ref(),
                             )
                             .await;
+                            let language = active_transcriber
+                                .as_ref()
+                                .and_then(|t| t.last_detected_language());
                             match delivery {
                                 StreamedDelivery::Delivered(delivered) => {
+                                    use crate::history::OutputInfo;
                                     let profile = profile_override.clone();
+                                    let auto_submit = output_config.auto_submit;
+                                    let delivered_text =
+                                        output::delivered_form(&delivered.text).into_owned();
                                     self.history_note(|p| {
-                                        p.texts(&text, &delivered);
+                                        p.texts(&text, &delivered.text);
+                                        p.delivered_text(&delivered_text);
+                                        if language.is_some() {
+                                            p.entry.language = language;
+                                        }
                                         p.entry.profile = profile;
+                                        p.entry.output = Some(OutputInfo {
+                                            mode: "type".into(),
+                                            driver: Some(delivered.driver.clone()),
+                                            fell_back: delivered.fell_back,
+                                        });
+                                        p.entry.auto_submit = auto_submit;
                                     });
-                                    let text = delivered;
+                                    let text = delivered.text;
+                                    self.publish_osd_text_outcome(&text);
                                     self.last_dictation = Some((text.clone(), Instant::now()));
                                     write_output_done(text.chars().count());
                                     self.play_feedback(SoundEvent::TranscriptionComplete);
@@ -6954,10 +7008,39 @@ impl Daemon {
                                 }
                                 StreamedDelivery::Failed(e) => {
                                     tracing::error!("Output failed: {}", e);
+                                    let profile = profile_override.clone();
+                                    let error = e.to_string();
+                                    self.history_note(|p| {
+                                        p.texts(&text, &processed_text);
+                                        if language.is_some() {
+                                            p.entry.language = language;
+                                        }
+                                        p.entry.profile = profile;
+                                        p.outcome(
+                                            crate::history::Outcome::OutputFailed,
+                                            Some(error),
+                                        );
+                                    });
+                                    self.publish_osd_outcome(
+                                        osd::session::OutcomeKind::OutputFailed,
+                                        0,
+                                    );
+                                    self.play_feedback(SoundEvent::Error);
+                                    output::fallback::notify_failed(
+                                        &output::fallback::OutputReport::default(),
+                                        &e,
+                                        &processed_text,
+                                        self.config.output.keep_undelivered_text,
+                                    )
+                                    .await;
                                 }
                                 StreamedDelivery::Cancelled => {
                                     self.release_preedit();
                                     self.publish_empty_outcome();
+                                    self.publish_osd_outcome(
+                                        osd::session::OutcomeKind::Cancelled,
+                                        0,
+                                    );
                                     self.play_feedback(SoundEvent::Cancelled);
                                     self.reset_to_idle(state).await;
                                     end_recording_notification(
@@ -6970,6 +7053,7 @@ impl Daemon {
                                     return;
                                 }
                             }
+                            output::deferred_notice::flush().await;
                             *state = State::Idle;
                             self.update_state("idle");
                             return;
@@ -7006,6 +7090,10 @@ impl Daemon {
                                     tracing::info!("Post-processing cancelled");
                                     self.release_preedit();
                                     self.publish_empty_outcome();
+                                    self.publish_osd_outcome(
+                                        osd::session::OutcomeKind::Cancelled,
+                                        0,
+                                    );
                                     self.play_feedback(SoundEvent::Cancelled);
                                     self.reset_to_idle(state).await;
                                     end_recording_notification(
@@ -10505,7 +10593,9 @@ while True:
         daemon.config.parakeet.as_mut().unwrap().idle_unload_secs = 120;
         let (_tx, rx) = tokio::sync::mpsc::channel::<Vec<f32>>(8);
         let task = tokio::spawn(async {
-            Ok::<Arc<dyn Transcriber>, crate::error::TranscribeError>(Arc::new(FixedTranscriber("ok")))
+            Ok::<Arc<dyn Transcriber>, crate::error::TranscribeError>(Arc::new(FixedTranscriber(
+                "ok",
+            )))
         });
         let loaded = Ok(Ok(Arc::new(FixedTranscriber("ok")) as Arc<dyn Transcriber>));
         let pending = PendingStreamingLoad {

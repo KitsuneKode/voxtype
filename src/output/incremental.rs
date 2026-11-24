@@ -23,7 +23,7 @@
 //! fails partway, what was typed stays typed and the rest goes to the
 //! clipboard, with a notification saying so.
 
-use super::{normalize_quotes, run_hook, OutputOptions, TextOutput};
+use super::{normalize_quotes, run_hook, Delivered, OutputOptions, TextOutput};
 use crate::error::OutputError;
 
 /// Where a piece sits in the delivery; decides which per-delivery extras
@@ -91,6 +91,9 @@ pub struct IncrementalOutput<'a> {
     typed: String,
     /// Text left for the delivery at the end.
     collected: String,
+    /// The driver that delivered the most recent text, and whether it was
+    /// not the first method of the chain.
+    driver: Option<(&'static str, bool)>,
 }
 
 impl<'a> IncrementalOutput<'a> {
@@ -108,6 +111,7 @@ impl<'a> IncrementalOutput<'a> {
             typed_any: false,
             typed: String::new(),
             collected: String::new(),
+            driver: None,
         }
     }
 
@@ -118,7 +122,10 @@ impl<'a> IncrementalOutput<'a> {
             return;
         }
         self.begun = true;
-        let chain = (self.chain_for)(Position { first: true, last: true });
+        let chain = (self.chain_for)(Position {
+            first: true,
+            last: true,
+        });
         #[cfg(target_os = "linux")]
         if self.options.wait_for_modifier_release
             && super::chain_synthesizes_keystrokes(chain.iter().map(|o| o.name()))
@@ -177,7 +184,7 @@ impl<'a> IncrementalOutput<'a> {
 
     /// Deliver the last piece and anything collected, run the post-output
     /// hook, and return the whole delivered text.
-    pub async fn finish(mut self) -> Result<String, OutputError> {
+    pub async fn finish(mut self) -> Result<Delivered, OutputError> {
         self.begin().await;
         if let Some(mut last) = self.held.take() {
             if !self.trim {
@@ -192,9 +199,14 @@ impl<'a> IncrementalOutput<'a> {
             }
         }
         result.map(|()| {
-            let mut all = self.typed;
-            all.push_str(&self.collected);
-            all
+            let mut text = self.typed;
+            text.push_str(&self.collected);
+            let (driver, fell_back) = self.driver.unwrap_or(("none", false));
+            Delivered {
+                driver: driver.to_string(),
+                fell_back,
+                text,
+            }
         })
     }
 
@@ -228,9 +240,10 @@ impl<'a> IncrementalOutput<'a> {
                         tracing::debug!("{} not available, trying next", out.name());
                         continue;
                     }
-                    match out.output(&normalized).await {
+                    match self.attempt(out.as_ref(), &normalized).await {
                         Ok(()) => {
                             tracing::debug!("Typing streamed text via {}", out.name());
+                            self.driver = Some((out.name(), i > 0));
                             self.method = Method::Typing(i);
                             self.typed_any = true;
                             self.typed.push_str(&text);
@@ -245,7 +258,7 @@ impl<'a> IncrementalOutput<'a> {
             Method::Typing(i) => {
                 let chain = (self.chain_for)(pos);
                 let result = match chain.get(i) {
-                    Some(out) => out.output(&normalized).await,
+                    Some(out) => self.attempt(out.as_ref(), &normalized).await,
                     None => Err(OutputError::AllMethodsFailed),
                 };
                 match result {
@@ -254,13 +267,29 @@ impl<'a> IncrementalOutput<'a> {
                         self.typed.push_str(&text);
                     }
                     Err(e) => {
-                        tracing::warn!("Typing failed partway ({}); the rest goes to the clipboard", e);
+                        tracing::warn!(
+                            "Typing failed partway ({}); the rest goes to the clipboard",
+                            e
+                        );
                         self.method = Method::Collect;
                         self.collected.push_str(&text);
                     }
                 }
             }
         }
+    }
+
+    /// One output call, with the focused window noted before and after it
+    /// when the dictation's history is being collected.
+    async fn attempt(&self, out: &dyn TextOutput, text: &str) -> Result<(), OutputError> {
+        if let Some(context) = self.options.history_context {
+            context.capture().await;
+        }
+        let result = out.output(text).await;
+        if let Some(context) = self.options.history_context {
+            context.capture().await;
+        }
+        result
     }
 
     async fn deliver_collected(&mut self) -> Result<(), OutputError> {
@@ -277,7 +306,7 @@ impl<'a> IncrementalOutput<'a> {
             first: !partial,
             last: true,
         });
-        for out in &chain {
+        for (i, out) in chain.iter().enumerate() {
             // After a partial typing run, only a method that does not type
             // can take the rest without mixing it into the typed text.
             if (partial || self.skip_keystrokes) && super::is_keystroke_method(out.name()) {
@@ -286,8 +315,9 @@ impl<'a> IncrementalOutput<'a> {
             if !out.is_available().await {
                 continue;
             }
-            match out.output(&normalized).await {
+            match self.attempt(out.as_ref(), &normalized).await {
                 Ok(()) => {
+                    self.driver = Some((out.name(), partial || i > 0));
                     if partial {
                         tracing::warn!("Rest of the text delivered via {}", out.name());
                         crate::notification::send(
@@ -343,11 +373,24 @@ mod tests {
         }
     }
 
-    fn factory(log: Arc<Mutex<Vec<String>>>, typer_fails_after: Option<usize>) -> ChainFactory<'static> {
+    fn factory(
+        log: Arc<Mutex<Vec<String>>>,
+        typer_fails_after: Option<usize>,
+    ) -> ChainFactory<'static> {
         Box::new(move |pos| {
             let v: Vec<Box<dyn TextOutput>> = vec![
-                Box::new(Mock { name: "wtype", log: log.clone(), fail_after: typer_fails_after, pos }),
-                Box::new(Mock { name: "clipboard", log: log.clone(), fail_after: None, pos }),
+                Box::new(Mock {
+                    name: "wtype",
+                    log: log.clone(),
+                    fail_after: typer_fails_after,
+                    pos,
+                }),
+                Box::new(Mock {
+                    name: "clipboard",
+                    log: log.clone(),
+                    fail_after: None,
+                    pos,
+                }),
             ];
             v
         })
@@ -364,23 +407,42 @@ mod tests {
     }
 
     async fn run(pieces: &[&str], trim: bool, fail_after: Option<usize>) -> (Vec<String>, String) {
+        let (log, delivered) = run_delivered(pieces, trim, fail_after).await;
+        (log, delivered.map(|d| d.text).unwrap_or_default())
+    }
+
+    async fn run_delivered(
+        pieces: &[&str],
+        trim: bool,
+        fail_after: Option<usize>,
+    ) -> (Vec<String>, Result<Delivered, OutputError>) {
         let log = Arc::new(Mutex::new(Vec::new()));
         let mut out = IncrementalOutput::new(factory(log.clone(), fail_after), opts(), trim);
         out.begin().await;
         for p in pieces {
             out.push(p).await;
         }
-        let text = out.finish().await.unwrap_or_default();
+        let delivered = out.finish().await;
         let log = log.lock().unwrap().clone();
-        (log, text)
+        (log, delivered)
     }
 
     #[tokio::test]
     async fn pieces_are_typed_in_order_with_extras_on_the_ends() {
-        let (log, text) = run(&["One.", " Two.", " Three."], true, None).await;
+        let (log, delivered) = run_delivered(&["One.", " Two.", " Three."], true, None).await;
+        let delivered = delivered.unwrap();
+        assert_eq!(
+            (delivered.driver.as_str(), delivered.fell_back),
+            ("wtype", false)
+        );
+        let text = delivered.text;
         assert_eq!(
             log,
-            vec!["wtype[first]:One.", "wtype[mid]: Two.", "wtype[last]: Three."]
+            vec![
+                "wtype[first]:One.",
+                "wtype[mid]: Two.",
+                "wtype[last]: Three."
+            ]
         );
         assert_eq!(text, "One. Two. Three.");
     }
@@ -393,7 +455,12 @@ mod tests {
 
     #[tokio::test]
     async fn surrounding_whitespace_is_trimmed_and_inner_kept() {
-        let (log, text) = run(&["\n  Lead-in:", "\n", "1. Item.\n", "2. Item.\n\n"], true, None).await;
+        let (log, text) = run(
+            &["\n  Lead-in:", "\n", "1. Item.\n", "2. Item.\n\n"],
+            true,
+            None,
+        )
+        .await;
         assert_eq!(text, "Lead-in:\n1. Item.\n2. Item.");
         assert_eq!(log.last().unwrap(), "wtype[last]:\n2. Item.");
     }
@@ -413,8 +480,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_typing_failure_sends_the_rest_to_the_clipboard() {
-        let (log, text) = run(&["One.", " Two.", " Three."], true, Some(1)).await;
-        assert_eq!(log, vec!["wtype[first]:One.", "clipboard[last]: Two. Three."]);
+        let (log, delivered) = run_delivered(&["One.", " Two.", " Three."], true, Some(1)).await;
+        let delivered = delivered.unwrap();
+        assert_eq!(
+            (delivered.driver.as_str(), delivered.fell_back),
+            ("clipboard", true)
+        );
+        let text = delivered.text;
+        assert_eq!(
+            log,
+            vec!["wtype[first]:One.", "clipboard[last]: Two. Three."]
+        );
         assert_eq!(text, "One. Two. Three.");
     }
 
