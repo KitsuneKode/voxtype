@@ -30,6 +30,8 @@
 !tests/fixtures/vad/*.wav
 !tests/fixtures/sensevoice/*.wav
 !tests/fixtures/parakeet/*.wav
+# The built-in recording announcement ships in the binary
+!assets/sounds/*.wav
 
 # Claude Code
 .claude/settings.local.json

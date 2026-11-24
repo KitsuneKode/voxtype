@@ -1,9 +1,10 @@
 //! `voxtype-osd-quickshell` — a tiny launcher that finds voxtype's Quickshell
 //! shell directory (containing `shell.qml`) and execs `qs -d -p <dir>`.
 //!
-//! Quickshell (`qs`) treats the directory as a config root and loads
-//! `shell.qml` from it. We pass the directory rather than the file so that
-//! sibling QML imports (`import "voxtype-shared" as VT`) resolve through
+//! Quickshell (`qs`, or `quickshell` where only that name is installed)
+//! treats the directory as a config root and loads `shell.qml` from it.
+//! We pass the directory rather than the file so that sibling QML imports
+//! (`import "voxtype-shared" as VT`) resolve through
 //! Quickshell's virtual filesystem; passing the file directly traps `..`
 //! traversals in `qrc:/qs-blackhole`.
 //!
@@ -52,7 +53,7 @@
 //! old restart-to-retheme behavior; it never blocks the OSD launch.
 //!
 //! Exit codes:
-//! - 2: Quickshell (`qs`) not found on PATH.
+//! - 2: Quickshell (`qs` or `quickshell`) not found on PATH.
 //! - 3: No `shell.qml` found in any of the resolved directories.
 //! - 1: exec of `qs` failed for some other reason.
 
@@ -67,19 +68,16 @@ use std::sync::{Arc, Mutex};
 
 use voxtype::config;
 use voxtype::osd::config::{OsdConfig, OsdPaletteSource};
+use voxtype::osd::frontend::find_quickshell_program;
 use voxtype::osd::style::{self, RuntimeOsdStyle};
 use voxtype::osd::theme;
 
-const QS_BIN: &str = "qs";
 const SHELL_FILE: &str = "shell.qml";
 const SHELL_SUBDIR: &str = "voxtype/quickshell";
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
+        .with_env_filter(voxtype::logging::env_filter("info"))
         .init();
 
     let raw_args: Vec<String> = env::args().skip(1).collect();
@@ -121,9 +119,9 @@ fn main() -> ExitCode {
         }
     };
 
-    if which::which(QS_BIN).is_err() {
+    let Some(qs_bin) = find_quickshell_program(|name| which::which(name).ok()) else {
         eprintln!(
-            "voxtype-osd-quickshell: '{QS_BIN}' (Quickshell) is not installed on PATH.\n\
+            "voxtype-osd-quickshell: Quickshell ('qs' or 'quickshell') is not installed on PATH.\n\
              \n\
              Install it from your distro's package manager:\n    \
                  sudo pacman -S quickshell        # Arch / Omarchy\n    \
@@ -133,7 +131,7 @@ fn main() -> ExitCode {
                  voxtype config set osd.frontend gtk4"
         );
         return ExitCode::from(2);
-    }
+    };
 
     tracing::info!(
         shell_dir = %shell_dir.display(),
@@ -180,7 +178,7 @@ fn main() -> ExitCode {
         tracing::warn!("external OSD host gone; launching the Quickshell OSD");
     }
 
-    let mut cmd = Command::new(QS_BIN);
+    let mut cmd = Command::new(&qs_bin);
     if daemonize {
         cmd.arg("-d");
     }
@@ -188,7 +186,8 @@ fn main() -> ExitCode {
     cmd.arg("-p").arg(&shell_dir).args(&rest);
     let err = cmd.exec();
     eprintln!(
-        "voxtype-osd-quickshell: failed to exec '{QS_BIN}' with shell dir '{}': {err}",
+        "voxtype-osd-quickshell: failed to exec '{}' with shell dir '{}': {err}",
+        qs_bin.display(),
         shell_dir.display()
     );
     ExitCode::from(1)

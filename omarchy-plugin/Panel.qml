@@ -19,6 +19,11 @@ import "components"
 //   omarchy-shell io.voxtype.settings toggle
 //   omarchy-shell io.voxtype.settings section Hotkey
 //
+// The live meeting view is the same plugin with {"view":"meetings"} (plus an
+// optional "tab" and "meeting_id"), or the `meetings` verb; it also opens by
+// itself when a meeting starts (components/OmarchyMeetingsHost.qml, around the
+// view shared with the standalone shell in quickshell/voxtype-meetings).
+//
 // The panel owns no settings model of its own: `voxtype config schema --json`
 // is the whole source of truth, re-read on every summon and after every write,
 // and each control writes straight back through `voxtype config set`. That
@@ -35,6 +40,10 @@ Item {
   property string omarchyPath: ""
 
   property bool opened: false
+  // The selected application view; each history config keeps its own client.
+  property string view: "settings"
+  property var historyHosts: ({})
+  property var activeHistoryHost: null
 
   // ---------------------------------------------------------------- state
 
@@ -81,7 +90,17 @@ Item {
   property string accelEvidence: ""
 
   property bool restartNeeded: false
+  property string restartFileState: ""
   property string restartError: ""
+  // The daemon that was running when the banner went up, by main pid. It read
+  // the config before the change, so a different pid means a restart happened
+  // (systemctl, `voxtype setup model`, anything outside the panel) and the
+  // banner's claim is no longer true. Pending until the first unit read after
+  // the change, so a pid from before the change is never taken as the new one.
+  property string restartBaselinePid: ""
+  property bool restartBaselinePending: false
+  // When the config file last changed on disk, for the file watcher's banner.
+  property real configChangedAt: 0
 
   // model name → message from the download that failed on it.
   property var downloadErrors: ({})
@@ -116,6 +135,61 @@ Item {
     && String(root.pluginLink.packaged_dir || "") !== ""
     && root.pluginLink.copy_dismissed !== true
     && !root.copyDismissedHere
+
+  // The `setup osd --status --json` object, or null (including a CLI that
+  // predates --status, which means no offer).
+  property var osdStatus: null
+  // The schema's `secrets` (values kept outside config.toml, such as the
+  // calendar's iCal link), and per secret key: its status_command answer, the
+  // last Set/Clear failure, what the last one reported, and a count of saves
+  // (each empties the row's field).
+  property var secrets: []
+  property var secretStatus: ({})
+  property var secretErrors: ({})
+  property var secretNotices: ({})
+  property var secretSaves: ({})
+
+  function withEntry(map, key, value) {
+    var next = ({})
+    for (var k in map) next[k] = map[k]
+    next[key] = value
+    return next
+  }
+  // "Not now" whose recording failed: hidden for as long as the shell keeps
+  // this panel loaded, as for the plugin copy banner.
+  property bool osdDismissedHere: false
+  property string osdOfferError: ""
+  // What the panel did (or refused to do) about the last style pick.
+  property string osdStyleNotice: ""
+  // A style pick asked for `osd.frontend = auto`; its write result says so.
+  property bool osdFrontendSwitchPending: false
+
+  readonly property bool offerQuickshellOsd: root.osdStatus !== null
+    && root.osdStatus.offer === true
+    && !root.osdDismissedHere
+
+  function osdFrontendLabel(name) {
+    if (name === "quickshell") return "the Quickshell OSD"
+    if (name === "gtk4") return "the GTK4 OSD"
+    if (name === "native") return "the native OSD"
+    return ""
+  }
+
+  // The Style row's help: which frontend its styles belong to, and what a pick
+  // will do given the frontend in use.
+  readonly property string osdStyleHelp: {
+    var s = root.osdStatus
+    if (!s) return "Styles belong to the Quickshell OSD."
+    var active = String(s.active || "")
+    if (active === "quickshell") return "Styles belong to the Quickshell OSD, which is the OSD in use."
+    var inUse = root.osdFrontendLabel(active)
+    var now = inUse !== "" ? " The OSD in use is " + inUse + "." : " No OSD is available to run."
+    if (s.quickshell_available === true)
+      return "Styles belong to the Quickshell OSD." + now
+        + " Picking a style also sets the OSD frontend to auto, which picks Quickshell."
+    return "Styles belong to the Quickshell OSD, which is not available on this system." + now
+      + " Picking a style changes nothing."
+  }
 
   readonly property string replacementsSectionName: "Replacements"
   readonly property bool degraded: schemaError !== "" || cliMissing !== ""
@@ -164,16 +238,29 @@ Item {
   // Resolved here rather than in the form because the runtime facts line needs
   // the same answer, and two copies of this loop would be two chances to
   // disagree about what is loaded.
-  readonly property string modelKey: {
+  readonly property string modelKey: modelKeyFor(root.engine)
+
+  function modelKeyFor(engine) {
     for (var i = 0; i < root.keys.length; i++) {
       var spec = root.keys[i]
       if (!spec || String(spec.type) !== "dynamic_enum") continue
       if (String(spec.source || "") !== "models") continue
       if (spec.engine !== undefined && spec.engine !== null && spec.engine !== ""
-          && String(spec.engine) !== root.engine) continue
+          && String(spec.engine) !== engine) continue
       return String(spec.key)
     }
     return ""
+  }
+
+  // The key the catalog card's Use writes, or "" when the browsed engine's
+  // models cannot be selected from here. Every engine whose model key the
+  // schema lists as a model picker can be switched to: `voxtype config
+  // select-model` commits that engine and its model together
+  // (config_set::select_model), and refuses an engine this binary lacks.
+  readonly property string catalogModelKey: {
+    if (root.catalogEngine === "gguf") return "gguf.model"
+    if (root.catalogEngine === root.engine) return root.modelKey
+    return root.catalogEngine === "" ? "" : modelKeyFor(root.catalogEngine)
   }
 
   readonly property string modelValue: {
@@ -191,7 +278,26 @@ Item {
     var payload = {}
     try { payload = JSON.parse(payloadJson || "{}") || {} } catch (e) {}
 
+    root.view = payload.view === "meetings" ? "meetings" : payload.view === "history" ? "history" : "settings"
     root.opened = true
+    if (root.view === "history") {
+      var path = payload.config === undefined ? "" : String(payload.config)
+      var host = root.historyHosts[path]
+      if (!host) {
+        host = historyHostFactory.createObject(root, { configPath: path })
+        if (!host) { root.opened = false; return }
+        var next = Object.assign({}, root.historyHosts)
+        next[path] = host
+        root.historyHosts = next
+      }
+      root.activeHistoryHost = host
+      host.window.refresh()
+      return
+    }
+    if (root.view === "meetings") {
+      meetings.select(payload)
+      return
+    }
     if (cli.downloading) root.browsingEngine = cli.downloadEngine
     // Re-read on every summon: the config file may have been edited by the
     // TUI, another shell, or an upgrade since the last time we looked.
@@ -203,6 +309,10 @@ Item {
     root.schemaError = ""
     root.upgradeDeclinedHere = false
     root.upgradeActionError = ""
+    root.osdOfferError = ""
+    root.osdStyleNotice = ""
+    root.secretErrors = ({})
+    root.secretNotices = ({})
     if (payload.section !== undefined) root.activeSection = root.canonicalSection(payload.section)
 
     root.refreshAll()
@@ -222,6 +332,10 @@ Item {
   // `section` verb on an open panel both re-read all of it: either can follow a
   // change made behind the panel's back (an upgrade, a new binary, a tray
   // click after a model update).
+  // The account's full name, offered (as placeholder text) for an unset
+  // meeting.my_name; "" when there is none or the CLI cannot say.
+  property string myNameSuggestion: ""
+
   function refreshAll() {
     cli.fetchSchema()
     cli.fetchStatus()
@@ -233,6 +347,8 @@ Item {
     cli.fetchStyles()
     cli.fetchUpgrade()
     cli.fetchPluginLink()
+    cli.fetchOsdStatus()
+    cli.fetchMyName()
   }
 
   // A binary that cannot be run cannot vouch for anything shown from its last
@@ -262,6 +378,9 @@ Item {
     root.accelEvidence = ""
     root.upgradeStatus = null
     root.pluginLink = null
+    root.osdStatus = null
+    root.secrets = []
+    root.secretStatus = ({})
     root.infoErrors = ({})
   }
 
@@ -374,6 +493,48 @@ Item {
     cli.startUpgrade(offerId, model)
   }
 
+  // A config change the running daemon has not read.
+  function noteRestartNeeded() {
+    if (!root.restartNeeded) {
+      root.restartBaselinePending = true
+      cli.fetchUnit()
+    }
+    root.restartNeeded = true
+  }
+
+  // Styles belong to the Quickshell OSD. A pick on another frontend is never a
+  // silent no-op: with Quickshell available the frontend goes to auto as well
+  // (and the row says so); without it nothing is written and the row says why.
+  // A CLI without `setup osd --status` gives no answer, so the pick is written
+  // as it always was.
+  function setStyle(value) {
+    var s = root.osdStatus
+    root.osdStyleNotice = ""
+    if (!s || String(s.active || "") === "quickshell") {
+      cli.setKey("osd.style", value)
+      return
+    }
+    if (s.quickshell_available === true) {
+      root.osdFrontendSwitchPending = true
+      cli.setKey("osd.style", value)
+      cli.setKey("osd.frontend", "auto")
+      return
+    }
+    root.osdStyleNotice = "Not changed: styles need the Quickshell OSD, which is not available on this system."
+    // Put the picker back on the value the config actually holds.
+    form.revertRow("osd.style")
+  }
+
+  function requestSet(key, value) {
+    if (String(key) === "osd.style") root.setStyle(value)
+    else cli.setKey(key, value)
+  }
+
+  function switchToQuickshellOsd() {
+    root.osdOfferError = ""
+    cli.useAutoOsd()
+  }
+
   function startModelDownload(name) {
     var info = root.engines[root.catalogEngine]
     var argument = name
@@ -414,7 +575,7 @@ Item {
     function open(): string {
       // Already up: leave the panel as the user left it rather than resetting
       // its search and section.
-      if (root.opened) return "ok"
+      if (root.opened && root.view === "settings") return "ok"
       return root.requestOpen("{}")
     }
 
@@ -434,7 +595,7 @@ Item {
     function section(name: string): string {
       var wanted = root.canonicalSection(name || "")
       if (wanted === "") return "usage: section <name>"
-      if (root.opened) {
+      if (root.opened && root.view === "settings") {
         // The tray's "Model update available" lands here on an open panel,
         // and so can a jump made after the binary or config changed. Re-read
         // everything, as a summon does, not just the upgrade offers.
@@ -454,6 +615,21 @@ Item {
         return "ok"
       }
       return root.requestOpen(JSON.stringify({ section: wanted }))
+    }
+
+    // History uses an immutable client for each explicit configuration.
+    function history(): string {
+      return root.requestOpen(JSON.stringify({ view: "history" }))
+    }
+
+    function historyConfig(path: string): string {
+      return root.requestOpen(JSON.stringify({ view: "history", config: path }))
+    }
+
+    // The live meeting view, or a no-op if it is already up.
+    function meetings(): string {
+      if (root.opened && root.view === "meetings") return "ok"
+      return root.requestOpen(JSON.stringify({ view: "meetings" }))
     }
 
     // Restarts the daemon, not the panel — the same button the restart banner
@@ -501,6 +677,7 @@ Item {
     // its signal(var) can wrap it as a QML sequence: length/indexing survive,
     // but Array.isArray does not. Rejecting that wrapper hides every section.
     var normalized = []
+    var restartValues = []
     var incoming = next.keys && next.keys.length !== undefined ? next.keys : []
     for (var i = 0; i < incoming.length; ++i) {
       if (!incoming[i]) continue
@@ -508,8 +685,32 @@ Item {
       for (var key in incoming[i]) spec[key] = incoming[i][key]
       spec.section = canonicalSection(spec.section || "")
       normalized.push(spec)
+      if (String(spec.key).indexOf("history.") !== 0)
+        restartValues.push([String(spec.key), spec.file_value])
     }
+    // Scalars use file-layer values rather than environment overrides or TOML
+    // formatting. Replacements and profiles are separate canonical structures;
+    // profile vocabulary is cached at daemon startup. Our own live History
+    // writes must not create or clear an unrelated restart requirement.
+    var restartState = JSON.stringify([restartValues, next.replacements || ({}), next.profiles || ({})])
+    if (root.configPath === String(next.config_path || "")
+        && root.restartFileState !== "" && root.restartFileState !== restartState
+        && !cli.upgrading && Date.now() - root.upgradeSettledAt > 2000
+        && cli.restartRequestedAt < root.configChangedAt)
+      root.noteRestartNeeded()
+    root.restartFileState = restartState
     root.keys = normalized
+    var secrets = []
+    var incomingSecrets = next.secrets && next.secrets.length !== undefined ? next.secrets : []
+    for (var si = 0; si < incomingSecrets.length; ++si) {
+      if (!incomingSecrets[si] || !incomingSecrets[si].key) continue
+      var secret = ({})
+      for (var sf in incomingSecrets[si]) secret[sf] = incomingSecrets[si][sf]
+      secret.section = canonicalSection(secret.section || "")
+      secrets.push(secret)
+    }
+    root.secrets = secrets
+    cli.fetchSecretStatuses(secrets)
     root.activeSection = canonicalSection(root.activeSection)
     root.engine = next.engine === undefined || next.engine === null ? "" : String(next.engine)
     root.voxtypeVersion = next.voxtype_version ? String(next.voxtype_version) : ""
@@ -614,9 +815,47 @@ Item {
       else if (what === "styles") root.styles = []
     }
     onPluginLinkLoaded: function(status) { root.pluginLink = status }
+    onOsdStatusLoaded: function(status) { root.osdStatus = status }
+    onMyNameLoaded: function(answer) { root.myNameSuggestion = answer && answer.suggestion ? String(answer.suggestion) : "" }
+    onSecretStatusLoaded: function(key, status) {
+      root.secretStatus = root.withEntry(root.secretStatus, key, status)
+    }
+    onSecretActionFinished: function(key, action, ok, message, result) {
+      root.secretErrors = root.withEntry(root.secretErrors, key, ok ? "" : message)
+      var notice = ""
+      if (ok && action === "set") {
+        root.secretSaves = root.withEntry(root.secretSaves, key, (root.secretSaves[key] || 0) + 1)
+        var host = result && result.host ? String(result.host) : ""
+        var n = result ? result.events : null
+        notice = host === "" ? "Saved." : "Linked to " + host + (n === null || n === undefined ? "." :
+          ": " + n + (n === 1 ? " event" : " events") + " in the next 48 hours.")
+      }
+      if (ok && action === "clear") notice = "Removed."
+      root.secretNotices = root.withEntry(root.secretNotices, key, notice)
+      // The schema carries set/host/last_error; reading it again also reads
+      // every status_command again.
+      cli.fetchSchema()
+    }
+    onOsdActionFinished: function(action, ok, message) {
+      if (action === "use-auto") {
+        if (ok) {
+          // The config changed; the panel's restart flow is what makes it
+          // live, with its own validation and error banner.
+          cli.restartDaemon()
+          cli.fetchSchema()
+        } else {
+          root.osdOfferError = message
+        }
+      } else if (!ok) {
+        console.warn("Voxtype panel: could not record Not now for the OSD offer (" + message
+                     + "); hiding it for this session")
+        root.osdDismissedHere = true
+      }
+      cli.fetchOsdStatus()
+    }
     onCopyDismissFinished: function(ok, message) {
       if (!ok) {
-        console.warn("Voxtype Settings: could not record Not now (" + message + "); hiding the banner for this session")
+        console.warn("Voxtype panel: could not record Not now (" + message + "); hiding the banner for this session")
         root.copyDismissedHere = true
       }
       cli.fetchPluginLink()
@@ -647,6 +886,17 @@ Item {
     onUnitLoaded: function(activeState, pid) {
       root.unitState = activeState
       root.mainPid = pid
+      if (root.restartNeeded) {
+        if (root.restartBaselinePending) {
+          root.restartBaselinePending = false
+          root.restartBaselinePid = pid
+        } else if (pid !== "" && pid !== root.restartBaselinePid) {
+          // Restarted outside the panel: the new process read the new config.
+          root.restartNeeded = false
+          root.restartError = ""
+          accelAfterRestart.restart()
+        }
+      }
       // The GPU query needs the pid to attribute memory to, so it follows the
       // unit rather than running beside it.
       cli.fetchVram(pid)
@@ -662,15 +912,26 @@ Item {
     }
     onWriteSucceeded: function(key) {
       root.clearError(key)
-      // The daemon only reads config at startup, so a successful write is
-      // exactly when the restart prompt becomes true.
-      root.restartNeeded = true
+      // History refreshes its settings and privacy generation without a
+      // restart. Do not imply a saved pause needs one, or clear a restart
+      // already required by an unrelated setting.
+      if (key.indexOf("history.") !== 0) root.noteRestartNeeded()
       root.restartError = ""
       cli.fetchSchema()
       if (key === "engine") cli.fetchModels()
+      if (key.indexOf("osd.") === 0) cli.fetchOsdStatus()
+      if (key === "osd.frontend" && root.osdFrontendSwitchPending) {
+        root.osdFrontendSwitchPending = false
+        root.osdStyleNotice = "Styles belong to the Quickshell OSD, so the OSD frontend was also set to auto, which picks Quickshell."
+      }
     }
     onWriteFailed: function(key, message) {
       root.recordError(key, message)
+      form.revertRow(key)
+      if (key === "osd.frontend" && root.osdFrontendSwitchPending) {
+        root.osdFrontendSwitchPending = false
+        root.osdStyleNotice = "The style was saved, but the OSD frontend could not be set to auto, so it will not show: " + message
+      }
       // The control is showing a value the config never took; the schema is
       // the only thing that knows what it actually holds now.
       cli.fetchSchema()
@@ -741,7 +1002,7 @@ Item {
     property int ticks: 0
 
     interval: 5000
-    running: root.opened && !root.degraded
+    running: root.opened && root.view === "settings" && !root.degraded
     repeat: true
     onTriggered: {
       cli.fetchStatus()
@@ -769,12 +1030,13 @@ Item {
   // already doing.
   FileView {
     id: configWatcher
-    path: root.opened && root.configPath !== "" ? root.configPath : ""
+    path: root.opened && root.view === "settings" && root.configPath !== "" ? root.configPath : ""
     watchChanges: true
     printErrors: false
     // `voxtype config set` writes atomically, so the path is replaced rather
     // than edited; reload() is what re-arms the watch on the new file.
     onFileChanged: {
+      root.configChangedAt = Date.now()
       reload()
       reloadDebounce.restart()
     }
@@ -790,13 +1052,10 @@ Item {
       if (!root.opened) return
       cli.fetchSchema()
       cli.fetchModels()
-      // The banner's claim is that the file on disk no longer matches what the
-      // daemon loaded at startup, which an edit from the CLI or the TUI makes
-      // just as true as one made here. Without this the panel would quietly
-      // refresh to show a setting the running daemon is not using. An accepted
-      // upgrade is the exception: it restarted the daemon after its own write.
-      if (!cli.upgrading && Date.now() - root.upgradeSettledAt > 2000)
-        root.restartNeeded = true
+      cli.fetchOsdStatus()
+      // applySchema compares the refreshed non-History file-layer settings.
+      // A watcher notification alone cannot distinguish a live History save
+      // from an external edit that really requires a restart.
     }
   }
 
@@ -811,9 +1070,49 @@ Item {
 
   // ---------------------------------------------------------------- window
 
+  Component {
+    id: historyHostFactory
+    Item {
+      id: historyHost
+      required property string configPath
+      readonly property alias window: historyWindow
+      VoxtypeCli {
+        id: historyClient
+        manifest: root.manifest
+        historyConfigPath: historyHost.configPath
+      }
+      OmarchyTheme { id: historyTheme }
+      HistoryWindow {
+        id: historyWindow
+        client: historyClient
+        theme: historyTheme
+        visible: root.opened && root.view === "history" && root.activeHistoryHost === historyHost
+        onPasteRequested: root.dismiss()
+        onCloseRequested: root.dismiss()
+        onPasteFailed: root.requestOpen(JSON.stringify({ view: "history", config: historyHost.configPath }))
+        onVisibleChanged: {
+          if (!visible && root.opened && root.view === "history" && root.activeHistoryHost === historyHost)
+            root.dismiss()
+        }
+      }
+    }
+  }
+
+  OmarchyMeetingsHost {
+    id: meetings
+    bin: cli.bin
+    shown: root.opened && root.view === "meetings"
+    // Settings open: a meeting start does not take it over.
+    panelOpen: root.opened && root.view !== "meetings"
+    onOpenRequested: root.requestOpen(JSON.stringify({ view: "meetings" }))
+    onCloseRequested: root.dismiss()
+    // "Change in Settings" on the agent chip: the Meeting section.
+    onSettingsRequested: root.requestOpen(JSON.stringify({ section: "Meeting" }))
+  }
+
   PanelWindow {
     id: window
-    visible: root.opened
+    visible: root.opened && root.view === "settings"
     anchors { top: true; bottom: true; left: true; right: true }
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
@@ -889,6 +1188,7 @@ Item {
         }
 
         RestartBanner {
+          objectName: "restartBanner"
           Layout.fillWidth: true
           active: root.restartNeeded || root.restartError !== ""
           restarting: cli.restarting
@@ -945,7 +1245,7 @@ Item {
                 objectName: "degradedTitle"
                 width: parent.width
                 text: root.cliMissing !== ""
-                  ? "Voxtype Settings could not run " + root.cliMissing + "."
+                  ? "The Voxtype panel could not run " + root.cliMissing + "."
                   : "This panel requires voxtype 0.8 or newer."
                 color: ShellTheme.Color.foreground
                 font.family: Style.font.family
@@ -1054,6 +1354,7 @@ Item {
             deviceOptions: root.deviceOptions
             styleOptions: root.styleOptions
             modelKey: root.modelKey
+            catalogModelKey: root.catalogModelKey
             modelValue: root.modelValue
             downloadingModel: cli.downloadEngine === root.catalogEngine ? cli.downloadModel : ""
             downloadPct: cli.downloadPct
@@ -1070,12 +1371,14 @@ Item {
 
             onFocusReturned: root.refocusCard()
 
-            onSetRequested: function(key, value) { cli.setKey(key, value) }
+            onSetRequested: function(key, value) { root.requestSet(key, value) }
             onUnsetRequested: function(key) { cli.unsetKey(key) }
             onEngineChangeRequested: function(name) { if (cli.downloading) return; root.browsingEngine = name; root.engineError = "" }
             onModelSelectionRequested: function(name, language) {
               if (root.catalogEngine === "gguf") cli.selectModel("gguf", name, language)
               else if (root.catalogEngine === root.engine) cli.setKey(root.modelKey, name)
+              // A language hint is GGUF-only in select-model.
+              else if (root.catalogModelKey !== "") cli.selectModel(root.catalogEngine, name, "")
             }
             onDownloadRequested: function(name) {
               root.startModelDownload(name)
@@ -1091,6 +1394,35 @@ Item {
             onUpgradeAcceptRequested: function(offerId) { root.acceptUpgrade(offerId) }
             onUpgradeDeclineRequested: { root.upgradeActionError = ""; cli.declineUpgrade() }
             onUpgradeCleanupRequested: { root.upgradeActionError = ""; cli.cleanupUpgrade() }
+            osdOfferActive: root.offerQuickshellOsd
+            osdConfigured: root.osdStatus ? String(root.osdStatus.configured || "") : ""
+            osdSwitching: cli.osdSwitching
+            osdRestarting: cli.restarting
+            osdDismissing: cli.osdDismissing
+            osdOfferError: root.osdOfferError
+            onOsdSwitchRequested: root.switchToQuickshellOsd()
+            onOsdNotNowRequested: { root.osdOfferError = ""; cli.dismissOsdOffer() }
+            secrets: root.secrets
+            secretStatus: root.secretStatus
+            secretBusyKey: cli.secretBusyKey
+            secretBusyAction: cli.secretBusyAction
+            secretErrors: root.secretErrors
+            secretNotices: root.secretNotices
+            secretSaves: root.secretSaves
+            onSecretSetRequested: function(spec, value) {
+              root.secretErrors = root.withEntry(root.secretErrors, String(spec.key), "")
+              root.secretNotices = root.withEntry(root.secretNotices, String(spec.key), "")
+              cli.setSecret(spec, value)
+            }
+            onSecretClearRequested: function(spec) {
+              root.secretErrors = root.withEntry(root.secretErrors, String(spec.key), "")
+              root.secretNotices = root.withEntry(root.secretNotices, String(spec.key), "")
+              cli.clearSecret(spec)
+            }
+            rowNotes: ({ "osd.style": root.osdStyleHelp })
+            // An empty "Your name" shows the account's full name to type in.
+            rowPlaceholders: ({ "meeting.my_name": root.myNameSuggestion })
+            rowNotices: ({ "osd.style": root.osdStyleNotice })
             onReplacementSetRequested: function(from, to) { cli.setReplacement(from, to) }
             onReplacementUnsetRequested: function(from) { cli.unsetReplacement(from) }
           }

@@ -609,6 +609,7 @@ mod tests {
 
     fn options() -> OutputOptions<'static> {
         OutputOptions {
+            history_context: None,
             pre_output_command: None,
             post_output_command: None,
             wait_for_modifier_release: false,
