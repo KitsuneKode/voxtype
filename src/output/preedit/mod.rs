@@ -19,6 +19,7 @@ pub mod state;
 mod wayland;
 
 pub use state::CommitOutcome;
+
 use state::{Event, Ime, Request};
 
 use super::TextOutput;
@@ -28,6 +29,13 @@ use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+
+/// `$XDG_RUNTIME_DIR/voxtype/field_text.json`: the focused field's text
+/// around the cursor while voxtype holds the input method, for Shuush's
+/// edit learning and spacing. Gone whenever no readable field is bound.
+fn field_path() -> std::path::PathBuf {
+    crate::config::Config::runtime_dir().join("field_text.json")
+}
 
 /// After a take, the binding stays on the same field this long so the field's
 /// text can be read as the user edits it (see [`Driver::field_update`]);
@@ -203,7 +211,7 @@ impl PreeditHandle {
     pub async fn release_now(&self) {
         self.release();
         self.flush().await;
-        let _ = std::fs::remove_file(wayland::field_path());
+        let _ = std::fs::remove_file(field_path());
     }
 
     /// Wait until every command sent so far has reached the compositor.

@@ -183,13 +183,6 @@ pub fn spawn() -> Result<Backend, SpawnError> {
     Ok(Backend::new(tx, Arc::new(wake), shared))
 }
 
-/// `$XDG_RUNTIME_DIR/voxtype/field_text.json`: the focused field's text
-/// around the cursor while voxtype holds the input method, for Shuush's
-/// edit learning and spacing. Gone whenever no readable field is bound.
-pub(super) fn field_path() -> std::path::PathBuf {
-    crate::config::Config::runtime_dir().join("field_text.json")
-}
-
 /// Field writes are coalesced: a burst of keystrokes is one write.
 const FIELD_WRITE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -206,7 +199,7 @@ fn capture_paused() -> bool {
 }
 
 fn write_field(field: &Option<(String, String)>) {
-    let path = field_path();
+    let path = super::field_path();
     let Some((before, after)) = field.as_ref().filter(|_| !capture_paused()) else {
         let _ = std::fs::remove_file(&path);
         return;

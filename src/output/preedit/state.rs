@@ -65,9 +65,16 @@ pub struct Ime {
     pending_surrounding: Option<(String, usize)>,
     /// The focused field's text and cursor, as of the latest `done`.
     surrounding: Option<(String, usize)>,
+    /// The field's text before the cursor when our preedit appeared in it.
+    /// Surrounding text leaves the preedit out, so `base` + preedit reported
+    /// as the text before the cursor means the field made it typed text.
+    base: Option<String>,
     /// The preedit a field was showing when it lost us. Chromium keeps it as
-    /// typed text, so it is removed when the field comes back with it.
+    /// typed text (on blur, a click or a page shortcut).
     lost: String,
+    /// Reactivated with `lost` pending and no field text yet: nothing is
+    /// shown until the field reports what it kept.
+    awaiting_field: bool,
 }
 
 impl Ime {
@@ -104,6 +111,8 @@ impl Ime {
             Event::Done => {
                 self.serial = self.serial.wrapping_add(1);
                 let was_active = self.active;
+                let reactivated = self.pending_active == Some(true);
+                self.awaiting_field = false;
                 if let Some(active) = self.pending_active.take() {
                     self.active = active;
                     // A (re)activation starts the field with no preedit: it
@@ -126,6 +135,16 @@ impl Ime {
                     self.surrounding = None;
                 }
                 let kept = self.take_kept();
+                // Chromium reports the field's text only after our next
+                // commit: ask with an empty one before showing anything.
+                if reactivated
+                    && !self.lost.is_empty()
+                    && self.base.is_some()
+                    && self.field().is_none()
+                {
+                    self.awaiting_field = true;
+                    return vec![Request::Commit(self.serial)];
+                }
                 let mut requests = self.sync();
                 if let Some(len) = kept {
                     requests.retain(|r| !matches!(r, Request::Commit(_)));
@@ -161,6 +180,7 @@ impl Ime {
     /// Remove the preedit.
     pub fn clear(&mut self) -> Vec<Request> {
         self.text.clear();
+        self.warn_if_kept();
         self.lost.clear();
         self.sync()
     }
@@ -171,21 +191,46 @@ impl Ime {
         }
     }
 
-    /// Once a field that lost our preedit is back with its text known: the
-    /// byte length to delete before the cursor when it kept the preedit.
+    fn warn_if_kept(&self) {
+        if !self.lost.is_empty() && !self.active() {
+            tracing::warn!(
+                "Dictation preedit: the field lost focus while showing live text and may have kept it"
+            );
+        }
+    }
+
+    /// The byte length to delete before the cursor when the field turned our
+    /// preedit into typed text: its text before the cursor is exactly the
+    /// text it had when the preedit appeared, followed by that preedit.
     fn take_kept(&mut self) -> Option<u32> {
-        if self.lost.is_empty() || !self.active() || self.hidden {
+        if !self.active() || self.hidden {
             return None;
         }
-        let kept = self.field()?.0.ends_with(&self.lost);
-        let lost = std::mem::take(&mut self.lost);
-        if !kept {
-            return None;
+        let before = self.field()?.0.to_string();
+        let lost = !self.lost.is_empty();
+        let candidate = if lost { &self.lost } else { &self.shown };
+        let kept = !candidate.is_empty()
+            && self.base.as_deref().is_some_and(|base| {
+                before.len() == base.len() + candidate.len()
+                    && before.starts_with(base)
+                    && before.ends_with(candidate.as_str())
+            });
+        if kept {
+            tracing::info!(
+                "Dictation preedit: the field kept the live text as typed text; removing it"
+            );
+            let len = candidate.len() as u32;
+            self.lost.clear();
+            // The field has no preedit of ours now: show it again.
+            self.shown.clear();
+            return Some(len);
         }
-        tracing::info!(
-            "Dictation preedit: the field kept the live text when it lost focus; removing it"
-        );
-        Some(lost.len() as u32)
+        if lost {
+            // Dropped, or another field: it starts over from here.
+            self.lost.clear();
+            self.base = Some(before);
+        }
+        None
     }
 
     /// Replace the preedit with `text`, committed into the field.
@@ -195,6 +240,7 @@ impl Ime {
         }
         if !self.active {
             self.text.clear();
+            self.warn_if_kept();
             return (CommitOutcome::NotActive, Vec::new());
         }
         let mut requests = Vec::new();
@@ -214,16 +260,22 @@ impl Ime {
         self.text.clear();
         self.shown.clear();
         self.lost.clear();
+        self.base = None;
         (CommitOutcome::Committed, requests)
     }
 
     fn sync(&mut self) -> Vec<Request> {
-        if !self.active() {
+        if !self.active() || self.awaiting_field {
             return Vec::new();
         }
         let want = if self.hidden { "" } else { self.text.as_str() };
         if want == self.shown {
             return Vec::new();
+        }
+        if want.is_empty() {
+            self.base = None;
+        } else if self.base.is_none() {
+            self.base = self.field().map(|(before, _)| before.to_string());
         }
         self.shown = want.to_string();
         vec![
@@ -388,37 +440,88 @@ mod tests {
         }
     }
 
+    /// A take showing `live` in a field whose text before the cursor is `base`.
+    fn showing(base: &str, live: &str) -> Ime {
+        let mut ime = Ime::new();
+        ime.on_event(Event::Activate);
+        ime.on_event(surrounding(base));
+        ime.on_event(Event::Done);
+        ime.set(live);
+        ime
+    }
+
+    const LIVE: &str = "Also it's very weird";
+
+    fn removes_and_reshows(serial: u32) -> Vec<Request> {
+        vec![
+            Request::DeleteBefore(LIVE.len() as u32),
+            Request::Preedit(LIVE.to_string()),
+            Request::Commit(serial),
+        ]
+    }
+
     // Chromium keeps a preedit as typed text when its field loses focus; the
     // final commit then landed after that copy ("weirdAlso, it's very weird.").
+    // Chromium 152 reports the field's text only after our next commit.
     #[test]
-    fn a_preedit_the_field_kept_when_it_lost_focus_is_removed() {
-        let mut ime = activated();
-        ime.set("Also it's very weird");
+    fn a_preedit_kept_on_focus_loss_is_removed_once_the_field_reports_it() {
+        let mut ime = showing("Done.\n\n", LIVE);
         ime.on_event(Event::Deactivate);
-        ime.on_event(Event::Done);
+        assert!(ime.on_event(Event::Done).is_empty());
         ime.on_event(Event::Activate);
-        ime.on_event(surrounding("Done.\n\nAlso it's very weird"));
         assert_eq!(
             ime.on_event(Event::Done),
-            vec![
-                Request::DeleteBefore("Also it's very weird".len() as u32),
-                Request::Preedit("Also it's very weird".to_string()),
-                Request::Commit(3),
-            ]
+            vec![Request::Commit(3)],
+            "asks for the field's text without showing the preedit again"
         );
+        assert!(ime.set(LIVE).is_empty(), "still waiting for the field");
+        ime.on_event(surrounding(&format!("Done.\n\n{LIVE}")));
+        assert_eq!(ime.on_event(Event::Done), removes_and_reshows(4));
         let (_, requests) = ime.commit("Also, it's very weird.");
         assert!(!requests
             .iter()
             .any(|r| matches!(r, Request::DeleteBefore(_))));
     }
 
+    // Chrome 158 sends the field's text with the activation.
     #[test]
-    fn a_preedit_the_field_dropped_is_not_deleted_again() {
-        let mut ime = activated();
-        ime.set("hello");
+    fn a_preedit_kept_on_focus_loss_is_removed_when_reported_at_activation() {
+        let mut ime = showing("Done.\n\n", LIVE);
+        ime.on_event(Event::Deactivate);
+        ime.on_event(Event::Done);
         ime.on_event(Event::Activate);
-        ime.on_event(surrounding("Something else "));
-        assert_eq!(ime.on_event(Event::Done), preedit("hello", 2));
+        ime.on_event(surrounding(&format!("Done.\n\n{LIVE}")));
+        assert_eq!(ime.on_event(Event::Done), removes_and_reshows(3));
+    }
+
+    // A click in the field or a page shortcut commits the composition with no
+    // deactivation at all.
+    #[test]
+    fn a_preedit_the_field_committed_in_place_is_removed() {
+        let mut ime = showing("Done. ", LIVE);
+        ime.on_event(surrounding(&format!("Done. {LIVE}")));
+        assert_eq!(ime.on_event(Event::Done), removes_and_reshows(2));
+    }
+
+    #[test]
+    fn a_field_still_showing_the_preedit_is_left_alone() {
+        let mut ime = showing("Done. ", LIVE);
+        ime.on_event(surrounding("Done. "));
+        assert!(ime.on_event(Event::Done).is_empty());
+    }
+
+    // Text that merely ends with the same words, or another field, is the
+    // user's own: nothing is deleted.
+    #[test]
+    fn text_that_only_ends_like_the_preedit_is_never_deleted() {
+        for field in [LIVE.to_string(), format!("Other text. {LIVE}")] {
+            let mut ime = showing("Done. ", LIVE);
+            ime.on_event(Event::Deactivate);
+            ime.on_event(Event::Done);
+            ime.on_event(Event::Activate);
+            ime.on_event(surrounding(&field));
+            assert_eq!(ime.on_event(Event::Done), preedit(LIVE, 3), "{field:?}");
+        }
     }
 
     #[test]

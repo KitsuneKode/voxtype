@@ -2180,14 +2180,18 @@ impl Daemon {
     /// would die with it.
     async fn restore_recording_media_before_exit(&mut self) {
         let players = std::mem::take(&mut self.paused_media_players);
-        self.restore_ducked_media_streams();
-        let fade = self.media_fade_task.take();
+        let streams = std::mem::take(&mut self.ducked_media_streams);
+        if let Some(task) = self.media_fade_task.take() {
+            task.abort();
+        }
+        let ducked_percent = self.config.audio.duck_media_volume_percent;
         let _ = tokio::time::timeout(Duration::from_secs(2), async move {
             if !players.is_empty() {
                 audio::media::resume_players(players).await;
             }
-            if let Some(task) = fade {
-                let _ = task.await;
+            // No fade: a ramp cut short by the timeout would leave media quiet.
+            if !streams.is_empty() {
+                audio::media::restore_ducked_audio(streams, ducked_percent, 0).await;
             }
         })
         .await;
@@ -9112,7 +9116,8 @@ impl Daemon {
         }
         self.restore_recording_media_before_exit().await;
         if let Some(preedit) = &self.preedit {
-            preedit.release_now().await;
+            // A hung compositor must not hold up the exit.
+            let _ = tokio::time::timeout(Duration::from_millis(500), preedit.release_now()).await;
         }
         notification::close_persistent().await;
         if let Some(task) = streaming_task {
