@@ -198,10 +198,12 @@ impl PreeditHandle {
         self.send(Cmd::Release);
     }
 
-    /// [`end`](Self::end), waiting until the compositor has it (shutdown).
-    pub async fn end_now(&self) {
-        self.end();
+    /// Release the input method and remove the field-text file before
+    /// returning (shutdown: the process exits before the Wayland thread would).
+    pub async fn release_now(&self) {
+        self.release();
         self.flush().await;
+        let _ = std::fs::remove_file(wayland::field_path());
     }
 
     /// Wait until every command sent so far has reached the compositor.
@@ -298,11 +300,17 @@ impl Driver {
     pub fn command(&mut self, cmd: Cmd, sink: &mut dyn Sink) -> Ack {
         let ack = match cmd {
             Cmd::Begin => {
-                // A take that never ended, or the binding kept after the
-                // last one: drop its preedit first.
-                self.release(sink);
-                if sink.bind() {
-                    self.ime = Some(Ime::new());
+                let lingering = self.linger_until.take().is_some();
+                match self.ime.as_mut() {
+                    // Still on the field the last take went into: keep it.
+                    Some(ime) if lingering && ime.active() => sink.send(ime.clear()),
+                    // A take that never ended, or a binding with no field.
+                    _ => {
+                        self.release(sink);
+                        if sink.bind() {
+                            self.ime = Some(Ime::new());
+                        }
+                    }
                 }
                 Ack::None
             }
@@ -441,6 +449,14 @@ impl TextOutput for PreeditOutput {
                 "text has newlines or control keys; typing it instead".to_string(),
             ));
         }
+        // Several commits for one text can each need a newer serial, and a
+        // stale one is dropped silently: longer text goes the normal way.
+        if full.len() > state::MAX_STRING_BYTES {
+            self.handle.clear_now().await;
+            return Err(OutputError::InjectionFailed(
+                "text too long for one input method commit; typing it instead".to_string(),
+            ));
+        }
         match self.handle.commit(&full).await {
             CommitOutcome::Committed => {}
             outcome => {
@@ -513,6 +529,7 @@ mod tests {
                 self.log.push(match r {
                     Request::Preedit(t) => format!("preedit:{t}"),
                     Request::CommitString(t) => format!("commit_string:{t}"),
+                    Request::DeleteBefore(n) => format!("delete_before:{n}"),
                     Request::Commit(s) => format!("commit:{s}"),
                 });
             }

@@ -2159,6 +2159,24 @@ impl Daemon {
         self.resume_media_players();
     }
 
+    /// [`restore_recording_media`](Self::restore_recording_media), waited for
+    /// (at most 2 s): the process exits right after, and spawned restores
+    /// would die with it.
+    async fn restore_recording_media_before_exit(&mut self) {
+        let players = std::mem::take(&mut self.paused_media_players);
+        self.restore_ducked_media_streams();
+        let fade = self.media_fade_task.take();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async move {
+            if !players.is_empty() {
+                audio::media::resume_players(players).await;
+            }
+            if let Some(task) = fade {
+                let _ = task.await;
+            }
+        })
+        .await;
+    }
+
     /// Leave the failure visible until the next recording/state change, without
     /// changing the public state-file protocol or requiring audio feedback.
     fn queue_language(&mut self, language: &str) -> std::result::Result<(), String> {
@@ -2659,6 +2677,8 @@ impl Daemon {
                         // Drop the capture cleanly; ignore final samples.
                         let mut c = capture;
                         let _ = c.stop().await;
+                        self.cut_streaming_audio();
+                        self.abandon_final_pass();
                         return false;
                     }
                 }
@@ -9059,9 +9079,9 @@ impl Daemon {
         if let Some(mut capture) = audio_capture.take() {
             let _ = capture.stop().await;
         }
-        self.restore_recording_media();
+        self.restore_recording_media_before_exit().await;
         if let Some(preedit) = &self.preedit {
-            preedit.end_now().await;
+            preedit.release_now().await;
         }
         notification::close_persistent().await;
         if let Some(task) = streaming_task {

@@ -163,6 +163,7 @@ mod imp {
         for factor in ramp_factors(from_percent, to_percent, fade_ms) {
             for stream in streams {
                 let _ = Command::new("pactl")
+                    .kill_on_drop(true)
                     .arg("set-sink-input-volume")
                     .arg(stream.index.to_string())
                     .args(scaled_volumes(&stream.volumes, factor))
@@ -185,6 +186,7 @@ mod imp {
                 "Ducking media stream"
             );
             match Command::new("pactl")
+                .kill_on_drop(true)
                 .arg("set-sink-input-volume")
                 .arg(stream.index.to_string())
                 .args(&target)
@@ -276,6 +278,7 @@ mod imp {
         for stream in streams {
             debug!(stream = stream.index, "Restoring ducked media stream");
             match Command::new("pactl")
+                .kill_on_drop(true)
                 .arg("set-sink-input-volume")
                 .arg(stream.index.to_string())
                 .args(&stream.volumes)
@@ -347,6 +350,7 @@ mod imp {
                 };
                 debug!(stream = stream.index, "Restoring a re-created media stream");
                 let ok = Command::new("pactl")
+                    .kill_on_drop(true)
                     .arg("set-sink-input-volume")
                     .arg(stream.index.to_string())
                     .args(&original.volumes)
@@ -456,6 +460,7 @@ mod imp {
 
     async fn pactl_list(what: &str) -> Result<Value, String> {
         let output = Command::new("pactl")
+            .kill_on_drop(true)
             .args(["-f", "json", "list", what])
             .output()
             .await

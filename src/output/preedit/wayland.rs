@@ -55,6 +55,7 @@ impl Sink for WlSink {
                     im.set_preedit_string(text, end, end);
                 }
                 Request::CommitString(text) => im.commit_string(text),
+                Request::DeleteBefore(len) => im.delete_surrounding_text(len, 0),
                 Request::Commit(serial) => im.commit(serial),
             }
         }
@@ -185,7 +186,7 @@ pub fn spawn() -> Result<Backend, SpawnError> {
 /// `$XDG_RUNTIME_DIR/voxtype/field_text.json`: the focused field's text
 /// around the cursor while voxtype holds the input method, for Shuush's
 /// edit learning and spacing. Gone whenever no readable field is bound.
-fn field_path() -> std::path::PathBuf {
+pub(super) fn field_path() -> std::path::PathBuf {
     crate::config::Config::runtime_dir().join("field_text.json")
 }
 
@@ -238,6 +239,9 @@ fn run(
     let mut pending_field: Option<(std::time::Instant, Option<(String, String)>)> = None;
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         loop {
+            // Events read at the end of the last pass first: a command sent
+            // before them would carry an out-of-date serial and be ignored.
+            queue.dispatch_pending(&mut app)?;
             let mut cmds = Vec::new();
             let mut disconnected = false;
             loop {
