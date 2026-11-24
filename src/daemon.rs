@@ -4809,6 +4809,9 @@ impl Daemon {
             _ => false,
         };
         self.handle_transcription_result_inner(state, result).await;
+        // Every exit of the inner handler (empty, fillers only, cancelled,
+        // failed, delivered) leaves the take over: release the input method.
+        self.end_preedit();
         if failed {
             self.show_tray_error();
         }
