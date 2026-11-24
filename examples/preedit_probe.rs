@@ -2,7 +2,8 @@
 //!
 //! `preedit_probe` binds the input method for a second, reports whether the
 //! focused field activated it, and releases it without sending any text.
-//! `preedit_probe demo` shows a preedit in the focused field for two seconds
+//! `preedit_probe field` reports how much text the focused field shares
+//! (lengths only). `preedit_probe demo` shows a preedit in the focused field for two seconds
 //! and removes it; `preedit_probe commit` then commits it instead.
 //! Set `RUST_LOG=voxtype=debug` to see the compositor's events.
 use std::time::Duration;
@@ -40,6 +41,20 @@ async fn main() {
             let outcome = preedit.commit("voxtype preedit test").await;
             println!("PREEDIT_COMMIT {outcome:?}");
             assert_eq!(outcome, CommitOutcome::Committed);
+        }
+    }
+    if active && mode == "field" {
+        // Lengths only: the field may hold anything.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let path = std::path::Path::new(&std::env::var("XDG_RUNTIME_DIR").unwrap_or_default())
+            .join("voxtype/field_text.json");
+        match std::fs::read_to_string(&path) {
+            Ok(body) => {
+                let v: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                let len = |k: &str| v[k].as_str().map_or(0, |s| s.chars().count());
+                println!("PREEDIT_FIELD before={} after={}", len("before"), len("after"));
+            }
+            Err(_) => println!("PREEDIT_FIELD none (the field sent no surrounding text)"),
         }
     }
     preedit.end_now().await;

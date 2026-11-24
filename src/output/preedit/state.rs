@@ -18,6 +18,12 @@ pub enum Event {
     Done,
     /// Another input method holds the seat; this binding is dead.
     Unavailable,
+    /// `surrounding_text`: the field's text around the cursor (`cursor` is a
+    /// byte offset into `text`).
+    Surrounding {
+        text: String,
+        cursor: u32,
+    },
 }
 
 /// A request for the Wayland thread to send, in order.
@@ -54,6 +60,9 @@ pub struct Ime {
     /// What the field currently shows, as far as this binding knows.
     shown: String,
     unavailable: bool,
+    pending_surrounding: Option<(String, usize)>,
+    /// The focused field's text and cursor, as of the latest `done`.
+    surrounding: Option<(String, usize)>,
 }
 
 impl Ime {
@@ -76,6 +85,10 @@ impl Ime {
                 self.pending_active = Some(true);
                 // Activation resets the content type to its default.
                 self.pending_hidden.get_or_insert(false);
+                self.surrounding = None;
+            }
+            Event::Surrounding { text, cursor } => {
+                self.pending_surrounding = Some((text, cursor as usize));
             }
             Event::Deactivate => self.pending_active = Some(false),
             Event::ContentHidden(hidden) => self.pending_hidden = Some(hidden),
@@ -96,13 +109,33 @@ impl Ime {
                 if let Some(hidden) = self.pending_hidden.take() {
                     self.hidden = hidden;
                 }
+                if let Some(surrounding) = self.pending_surrounding.take() {
+                    self.surrounding = Some(surrounding);
+                }
                 if !self.active && was_active {
                     self.shown.clear();
+                }
+                if !self.active {
+                    self.surrounding = None;
                 }
                 return self.sync();
             }
         }
         Vec::new()
+    }
+
+    /// The focused field's text before and after the cursor, when a field
+    /// whose text may be read is focused (never a password field).
+    pub fn field(&self) -> Option<(&str, &str)> {
+        if !self.active() || self.hidden {
+            return None;
+        }
+        let (text, cursor) = self.surrounding.as_ref()?;
+        let mut at = (*cursor).min(text.len());
+        while !text.is_char_boundary(at) {
+            at -= 1;
+        }
+        Some(text.split_at(at))
     }
 
     /// Show `text` as the preedit (trimmed to its tail when too long).
@@ -324,6 +357,37 @@ mod tests {
         ime.on_event(Event::Activate);
         ime.on_event(Event::Done);
         assert_eq!(ime.set("visible"), preedit("visible", 2));
+    }
+
+    #[test]
+    fn the_field_text_is_read_at_done_and_never_from_password_fields() {
+        let mut ime = activated();
+        ime.on_event(Event::Surrounding {
+            text: "héllo world".into(),
+            cursor: 6,
+        });
+        assert_eq!(ime.field(), None, "applies only at done");
+        ime.on_event(Event::Done);
+        assert_eq!(ime.field(), Some(("héllo", " world")));
+        // A cursor inside a character is clamped back to its start.
+        ime.on_event(Event::Surrounding {
+            text: "é".into(),
+            cursor: 1,
+        });
+        ime.on_event(Event::Done);
+        assert_eq!(ime.field(), Some(("", "é")));
+        ime.on_event(Event::ContentHidden(true));
+        ime.on_event(Event::Done);
+        assert_eq!(ime.field(), None);
+        ime.on_event(Event::Deactivate);
+        ime.on_event(Event::Done);
+        ime.on_event(Event::Activate);
+        ime.on_event(Event::Done);
+        assert_eq!(
+            ime.field(),
+            None,
+            "a new focus starts with no text until the field sends it"
+        );
     }
 
     #[test]

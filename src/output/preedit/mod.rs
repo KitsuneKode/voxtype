@@ -26,7 +26,13 @@ use crate::error::OutputError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+
+/// After a take, the binding stays on the same field this long so the field's
+/// text can be read as the user edits it (see [`Driver::field_update`]);
+/// focus leaving the field or the next take ends it sooner.
+pub const LINGER: Duration = Duration::from_secs(120);
 
 /// A command for the backend thread.
 pub enum Cmd {
@@ -236,21 +242,58 @@ pub trait Sink {
 pub struct Driver {
     ime: Option<Ime>,
     shared: Arc<Shared>,
+    /// Set while bound after a take ended (no preedit, field reading only).
+    linger_until: Option<Instant>,
+    /// The field text last handed out by [`field_update`](Self::field_update).
+    field: Option<(String, String)>,
+    field_dirty: bool,
 }
 
 impl Driver {
     pub fn new(shared: Arc<Shared>) -> Self {
-        Self { ime: None, shared }
+        Self {
+            ime: None,
+            shared,
+            linger_until: None,
+            field: None,
+            field_dirty: false,
+        }
+    }
+
+    /// When the binding kept after a take must be released.
+    pub fn linger_deadline(&self) -> Option<Instant> {
+        self.linger_until
+    }
+
+    /// Release a binding kept after a take once its time is up.
+    pub fn tick(&mut self, now: Instant, sink: &mut dyn Sink) {
+        if self.linger_until.is_some_and(|t| now >= t) {
+            self.release(sink);
+            self.publish();
+        }
+    }
+
+    /// The focused field's (before, after) cursor text when it changed since
+    /// the last call: `Some(None)` once it is gone (focus left, released,
+    /// password field).
+    pub fn field_update(&mut self) -> Option<Option<(String, String)>> {
+        std::mem::take(&mut self.field_dirty).then(|| self.field.clone())
+    }
+
+    fn release(&mut self, sink: &mut dyn Sink) {
+        self.linger_until = None;
+        if let Some(mut ime) = self.ime.take() {
+            sink.send(ime.clear());
+            sink.unbind();
+        }
     }
 
     pub fn command(&mut self, cmd: Cmd, sink: &mut dyn Sink) -> Ack {
         let ack = match cmd {
             Cmd::Begin => {
-                if let Some(mut ime) = self.ime.take() {
-                    // A take that never ended: drop its preedit first.
-                    sink.send(ime.clear());
-                    sink.unbind();
-                }
+                // A take that never ended, or the binding kept after the
+                // last one: drop its preedit first.
+                self.release(sink);
                 if sink.bind() {
                     self.ime = Some(Ime::new());
                 }
@@ -280,9 +323,13 @@ impl Driver {
                 Ack::Committed(reply, outcome)
             }
             Cmd::End => {
-                if let Some(mut ime) = self.ime.take() {
-                    sink.send(ime.clear());
-                    sink.unbind();
+                match self.ime.as_mut() {
+                    // Keep reading the field the text went into.
+                    Some(ime) if ime.active() && self.linger_until.is_none() => {
+                        sink.send(ime.clear());
+                        self.linger_until = Some(Instant::now() + LINGER);
+                    }
+                    _ => self.release(sink),
                 }
                 Ack::None
             }
@@ -305,18 +352,32 @@ impl Driver {
             );
             sink.unbind();
             self.ime = None;
+            self.linger_until = None;
+        } else if self.linger_until.is_some() && !self.ime.as_ref().is_some_and(Ime::active) {
+            // Focus left the field the text went into.
+            self.release(sink);
         }
         self.publish();
     }
 
     /// Release everything (the daemon went away).
     pub fn shutdown(&mut self, sink: &mut dyn Sink) {
-        self.command(Cmd::End, sink);
+        self.release(sink);
+        self.publish();
     }
 
-    fn publish(&self) {
+    fn publish(&mut self) {
         let active = self.ime.as_ref().is_some_and(Ime::active);
         self.shared.active.store(active, Ordering::Release);
+        let field = self
+            .ime
+            .as_ref()
+            .and_then(Ime::field)
+            .map(|(b, a)| (b.to_string(), a.to_string()));
+        if field != self.field {
+            self.field = field;
+            self.field_dirty = true;
+        }
     }
 }
 
@@ -571,9 +632,11 @@ mod tests {
                 "preedit:",
                 "commit_string:Hello, world.",
                 "commit:1",
-                "unbind",
             ]
         );
+        // The binding stays on the field until focus leaves it.
+        fake.unfocus();
+        assert_eq!(fake.log(), ["unbind"]);
     }
 
     #[tokio::test]
@@ -639,12 +702,49 @@ mod tests {
                 "commit:1",
                 "preedit:",
                 "commit:1",
-                "unbind"
             ]
         );
+        // Kept on the field (no preedit) until focus leaves it.
+        fake.unfocus();
+        assert_eq!(fake.log(), ["unbind"]);
         assert!(!fake.handle.text_input_active());
-        // Commands after the end go nowhere.
         assert_eq!(fake.handle.commit("x").await, CommitOutcome::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn the_kept_binding_reports_field_edits_then_expires() {
+        let fake = Fake::new(true, true);
+        fake.handle.begin();
+        fake.settle().await;
+        fake.focus();
+        fake.handle.end();
+        fake.settle().await;
+        fake.log();
+        fake.event(Event::Surrounding {
+            text: "Ask Groq now".into(),
+            cursor: 12,
+        });
+        fake.event(Event::Done);
+        let mut guard = fake.driver.lock().unwrap();
+        let (driver, sink) = &mut *guard;
+        assert_eq!(
+            driver.field_update(),
+            Some(Some(("Ask Groq now".to_string(), String::new())))
+        );
+        assert_eq!(
+            driver.field_update(),
+            None,
+            "an unchanged field is reported once"
+        );
+        let deadline = driver.linger_deadline().expect("lingering");
+        driver.tick(deadline, sink);
+        assert_eq!(sink.log, ["unbind"]);
+        assert_eq!(
+            driver.field_update(),
+            Some(None),
+            "released: the field is gone"
+        );
+        assert_eq!(driver.linger_deadline(), None);
     }
 
     #[tokio::test]

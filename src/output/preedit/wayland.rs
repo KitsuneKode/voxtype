@@ -88,6 +88,9 @@ impl Dispatch<ZwpInputMethodV2, ()> for App {
                 );
                 Event::ContentHidden(secret_purpose || secret_hint)
             }
+            zwp_input_method_v2::Event::SurroundingText { text, cursor, .. } => {
+                Event::Surrounding { text, cursor }
+            }
             zwp_input_method_v2::Event::Done => Event::Done,
             zwp_input_method_v2::Event::Unavailable => Event::Unavailable,
             _ => return,
@@ -179,89 +182,158 @@ pub fn spawn() -> Result<Backend, SpawnError> {
     Ok(Backend::new(tx, Arc::new(wake), shared))
 }
 
+/// `$XDG_RUNTIME_DIR/voxtype/field_text.json`: the focused field's text
+/// around the cursor while voxtype holds the input method, for Shuush's
+/// edit learning and spacing. Gone whenever no readable field is bound.
+fn field_path() -> std::path::PathBuf {
+    crate::config::Config::runtime_dir().join("field_text.json")
+}
+
+/// Field writes are coalesced: a burst of keystrokes is one write.
+const FIELD_WRITE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+fn write_field(field: &Option<(String, String)>) {
+    let path = field_path();
+    let Some((before, after)) = field else {
+        let _ = std::fs::remove_file(&path);
+        return;
+    };
+    let body = serde_json::json!({ "before": before, "after": after }).to_string();
+    let tmp = path.with_extension("tmp");
+    let written = (|| {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        f.write_all(body.as_bytes())?;
+        std::fs::rename(&tmp, &path)
+    })();
+    if let Err(e) = written {
+        tracing::debug!("Dictation preedit: cannot write {}: {}", path.display(), e);
+    }
+}
+
 fn run(
     mut queue: EventQueue<App>,
     mut app: App,
     rx: Receiver<Cmd>,
     mut wake_rx: UnixStream,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    loop {
-        let mut cmds = Vec::new();
-        let mut disconnected = false;
+    write_field(&None);
+    let mut pending_field: Option<(std::time::Instant, Option<(String, String)>)> = None;
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         loop {
-            match rx.try_recv() {
-                Ok(cmd) => cmds.push(cmd),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    disconnected = true;
-                    break;
+            let mut cmds = Vec::new();
+            let mut disconnected = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(cmd) => cmds.push(cmd),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        disconnected = true;
+                        break;
+                    }
                 }
             }
-        }
-        // Partials arrive faster than they are worth drawing: of a run of
-        // updates only the newest goes out.
-        let mut cmds = cmds.into_iter().peekable();
-        while let Some(cmd) = cmds.next() {
-            if matches!(cmd, Cmd::Set(_)) && matches!(cmds.peek(), Some(Cmd::Set(_))) {
-                continue;
-            }
-            match app.driver.command(cmd, &mut app.sink) {
-                Ack::None => {}
-                Ack::Cleared(reply) => {
-                    queue.roundtrip(&mut app)?;
-                    let _ = reply.send(());
+            // Partials arrive faster than they are worth drawing: of a run of
+            // updates only the newest goes out.
+            let mut cmds = cmds.into_iter().peekable();
+            while let Some(cmd) = cmds.next() {
+                if matches!(cmd, Cmd::Set(_)) && matches!(cmds.peek(), Some(Cmd::Set(_))) {
+                    continue;
                 }
-                Ack::Committed(reply, outcome) => {
-                    queue.roundtrip(&mut app)?;
-                    let _ = reply.send(outcome);
+                match app.driver.command(cmd, &mut app.sink) {
+                    Ack::None => {}
+                    Ack::Cleared(reply) => {
+                        queue.roundtrip(&mut app)?;
+                        let _ = reply.send(());
+                    }
+                    Ack::Committed(reply, outcome) => {
+                        queue.roundtrip(&mut app)?;
+                        let _ = reply.send(outcome);
+                    }
                 }
             }
-        }
-        if disconnected {
-            app.driver.shutdown(&mut app.sink);
-            queue.roundtrip(&mut app)?;
-            return Ok(());
-        }
+            if disconnected {
+                app.driver.shutdown(&mut app.sink);
+                queue.roundtrip(&mut app)?;
+                return Ok(());
+            }
 
-        queue.dispatch_pending(&mut app)?;
-        queue.flush()?;
-        let Some(guard) = queue.prepare_read() else {
-            continue;
-        };
-        let mut fds = [
-            libc::pollfd {
-                fd: guard.connection_fd().as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: wake_rx.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        // SAFETY: `fds` is a valid array of two pollfd for the call's duration.
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
+            queue.dispatch_pending(&mut app)?;
+            let now = std::time::Instant::now();
+            app.driver.tick(now, &mut app.sink);
+            if let Some(field) = app.driver.field_update() {
+                // Gone is written at once; text waits for the burst to settle.
+                let due = if field.is_none() {
+                    now
+                } else {
+                    now + FIELD_WRITE_DELAY
+                };
+                let due = pending_field.as_ref().map_or(due, |(d, _)| (*d).min(due));
+                pending_field = Some((due, field));
+            }
+            if pending_field.as_ref().is_some_and(|(due, _)| now >= *due) {
+                if let Some((_, field)) = pending_field.take() {
+                    write_field(&field);
+                }
+            }
+            queue.flush()?;
+            let wake_at = [
+                pending_field.as_ref().map(|(due, _)| *due),
+                app.driver.linger_deadline(),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            let timeout_ms = wake_at.map_or(-1, |t| {
+                t.saturating_duration_since(now)
+                    .as_millis()
+                    .min(i32::MAX as u128) as i32
+            });
+            let Some(guard) = queue.prepare_read() else {
                 continue;
+            };
+            let mut fds = [
+                libc::pollfd {
+                    fd: guard.connection_fd().as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: wake_rx.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            // SAFETY: `fds` is a valid array of two pollfd for the call's duration.
+            let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                if err.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err.into());
             }
-            return Err(err.into());
-        }
-        if fds[0].revents != 0 {
-            match guard.read() {
-                Ok(_) => {}
-                Err(wayland_client::backend::WaylandError::Io(e))
-                    if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
+            if fds[0].revents != 0 {
+                match guard.read() {
+                    Ok(_) => {}
+                    Err(wayland_client::backend::WaylandError::Io(e))
+                        if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                drop(guard);
             }
-        } else {
-            drop(guard);
+            if fds[1].revents != 0 {
+                let mut buf = [0u8; 64];
+                while matches!(wake_rx.read(&mut buf), Ok(n) if n > 0) {}
+            }
         }
-        if fds[1].revents != 0 {
-            let mut buf = [0u8; 64];
-            while matches!(wake_rx.read(&mut buf), Ok(n) if n > 0) {}
-        }
-    }
+    })();
+    write_field(&None);
+    result
 }
