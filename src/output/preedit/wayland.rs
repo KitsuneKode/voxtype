@@ -192,9 +192,21 @@ fn field_path() -> std::path::PathBuf {
 /// Field writes are coalesced: a burst of keystrokes is one write.
 const FIELD_WRITE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 
+/// Shuush leaves `field_text.off` after a private take (a password manager,
+/// a sign-in page): the field is not written for five minutes after that.
+fn capture_paused() -> bool {
+    let off = crate::config::Config::runtime_dir().join("field_text.off");
+    std::fs::metadata(off)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| {
+            t.elapsed()
+                .is_ok_and(|age| age < std::time::Duration::from_secs(300))
+        })
+}
+
 fn write_field(field: &Option<(String, String)>) {
     let path = field_path();
-    let Some((before, after)) = field else {
+    let Some((before, after)) = field.as_ref().filter(|_| !capture_paused()) else {
         let _ = std::fs::remove_file(&path);
         return;
     };
@@ -252,8 +264,11 @@ fn run(
                         let _ = reply.send(());
                     }
                     Ack::Committed(reply, outcome) => {
-                        queue.roundtrip(&mut app)?;
+                        // Answer even if the connection drops now: the commit
+                        // may have landed, and "unavailable" would type it again.
+                        let sent = queue.roundtrip(&mut app);
                         let _ = reply.send(outcome);
+                        sent?;
                     }
                 }
             }

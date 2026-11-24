@@ -237,6 +237,10 @@ mod imp {
             .into_iter()
             .filter(|s| !same_app(&s.app, paused_apps))
             .collect();
+        // A watch from the last restore must not see this duck's levels.
+        if let Some(watch) = RESPAWN_WATCH.lock().ok().and_then(|mut w| w.take()) {
+            watch.abort();
+        }
 
         if streams.is_empty() {
             debug!("No active audio streams found for media ducking");
@@ -290,8 +294,17 @@ mod imp {
         }
 
         debug!("Restored {restored}/{total} ducked media stream(s)");
-        restore_recreated_streams(&streams_snapshot, ducked_percent.min(150)).await;
+        // Watched in the background: the next take must not wait on it.
+        let pct = ducked_percent.min(150);
+        let watch =
+            tokio::spawn(async move { restore_recreated_streams(&streams_snapshot, pct).await });
+        if let Ok(mut slot) = RESPAWN_WATCH.lock() {
+            *slot = Some(watch.abort_handle());
+        }
     }
+
+    static RESPAWN_WATCH: std::sync::Mutex<Option<tokio::task::AbortHandle>> =
+        std::sync::Mutex::new(None);
 
     /// Streams an app re-created while ducked come back at the ducked level
     /// (stream-restore remembered it). Watch briefly for them and put them
@@ -315,21 +328,28 @@ mod imp {
                 .filter(|c| !known.contains(&c.index) && !fixed.contains(&c.index))
                 .collect();
             for stream in fresh {
-                let Some(original) = gone.iter().find(|d| same_app(&stream.app, &d.app)) else {
+                // Same app and at that stream's ducked level: two streams of
+                // one app can have different volumes.
+                let Some(original) = gone.iter().find(|d| {
+                    same_app(&stream.app, &d.app)
+                        && volumes_near(
+                            &stream.volumes,
+                            &scaled_volumes(&d.volumes, ducked_percent),
+                        )
+                }) else {
                     continue;
                 };
-                let ducked_volumes = scaled_volumes(&original.volumes, ducked_percent);
-                if !volumes_near(&stream.volumes, &ducked_volumes) {
-                    continue;
-                }
                 debug!(stream = stream.index, "Restoring a re-created media stream");
-                let _ = Command::new("pactl")
+                let ok = Command::new("pactl")
                     .arg("set-sink-input-volume")
                     .arg(stream.index.to_string())
                     .args(&original.volumes)
                     .status()
-                    .await;
-                fixed.push(stream.index);
+                    .await
+                    .is_ok_and(|s| s.success());
+                if ok {
+                    fixed.push(stream.index);
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(RESPAWN_WATCH_STEP_MS)).await;
         }

@@ -43,8 +43,10 @@ pub enum Cmd {
     Clear(Option<oneshot::Sender<()>>),
     /// Commit text in place of the preedit; replies after the compositor has it.
     Commit(String, oneshot::Sender<CommitOutcome>),
-    /// Clear the preedit and release the input method.
+    /// Clear the preedit; the binding stays on the field for [`LINGER`].
     End,
+    /// Clear the preedit and release the input method now (a cancelled take).
+    Release,
     /// Change nothing; the ack fires once everything sent before has reached
     /// the compositor.
     Flush(oneshot::Sender<()>),
@@ -191,6 +193,11 @@ impl PreeditHandle {
         self.send(Cmd::End);
     }
 
+    /// Clear the preedit and release the input method right away.
+    pub fn release(&self) {
+        self.send(Cmd::Release);
+    }
+
     /// [`end`](Self::end), waiting until the compositor has it (shutdown).
     pub async fn end_now(&self) {
         self.end();
@@ -333,6 +340,10 @@ impl Driver {
                 }
                 Ack::None
             }
+            Cmd::Release => {
+                self.release(sink);
+                Ack::None
+            }
             Cmd::Flush(ack) => Ack::Cleared(ack),
         };
         self.publish();
@@ -343,7 +354,17 @@ impl Driver {
         let Some(ime) = self.ime.as_mut() else {
             return;
         };
-        tracing::debug!(?event, "Input method event");
+        match &event {
+            // The field's own text never reaches a log.
+            Event::Surrounding { text, cursor } => {
+                tracing::debug!(
+                    len = text.len(),
+                    cursor,
+                    "Input method event: surrounding text"
+                )
+            }
+            other => tracing::debug!(event = ?other, "Input method event"),
+        }
         let unavailable = event == Event::Unavailable;
         sink.send(ime.on_event(event));
         if unavailable {
@@ -709,6 +730,29 @@ mod tests {
         assert_eq!(fake.log(), ["unbind"]);
         assert!(!fake.handle.text_input_active());
         assert_eq!(fake.handle.commit("x").await, CommitOutcome::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_take_releases_at_once() {
+        let fake = Fake::new(true, true);
+        fake.handle.begin();
+        fake.settle().await;
+        fake.focus();
+        fake.handle.set("never mind");
+        fake.handle.release();
+        fake.settle().await;
+        assert_eq!(
+            fake.log(),
+            [
+                "bind:true",
+                "preedit:never mind",
+                "commit:1",
+                "preedit:",
+                "commit:1",
+                "unbind"
+            ]
+        );
+        assert!(!fake.handle.text_input_active());
     }
 
     #[tokio::test]

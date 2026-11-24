@@ -2410,7 +2410,7 @@ impl Daemon {
         if let Some(mut preview) = self.streaming_preview.take() {
             preview.clear();
         }
-        self.end_preedit();
+        self.release_preedit();
         *streaming_session = None;
         *streaming_chain = None;
         self.end_external_session(true).await;
@@ -2969,11 +2969,21 @@ impl Daemon {
         }
     }
 
-    /// Clear this take's preedit and release the input method.
+    /// Clear this take's preedit; the binding stays on the field a while
+    /// for edit learning (see `output::preedit::LINGER`).
     fn end_preedit(&mut self) {
         if std::mem::take(&mut self.preedit_take) {
             if let Some(preedit) = &self.preedit {
                 preedit.end();
+            }
+        }
+    }
+
+    /// A cancelled take: clear the preedit and release the input method now.
+    fn release_preedit(&mut self) {
+        if std::mem::take(&mut self.preedit_take) {
+            if let Some(preedit) = &self.preedit {
+                preedit.release();
             }
         }
     }
@@ -3411,7 +3421,7 @@ impl Daemon {
         if let Some(mut preview) = self.streaming_preview.take() {
             preview.clear();
         }
-        self.end_preedit();
+        self.release_preedit();
         *streaming_session = None;
         *streaming_chain = None;
 
@@ -4914,7 +4924,14 @@ impl Daemon {
                             PostProcessor::new(&crate::config::PostProcessConfig {
                                 command: cmd.clone(),
                                 timeout_ms: profile.post_process_timeout_ms.unwrap_or(30000),
-                                trim: true,
+                                // Same whitespace rule as the main command: a
+                                // leading space can be the command's own join.
+                                trim: self
+                                    .config
+                                    .output
+                                    .post_process
+                                    .as_ref()
+                                    .is_none_or(|config| config.trim),
                                 fallback_on_empty: true,
                                 streaming: false,
                                 edit_list: self
@@ -5090,6 +5107,7 @@ impl Daemon {
                                     tracing::error!("Output failed: {}", e);
                                 }
                                 StreamedDelivery::Cancelled => {
+                                    self.release_preedit();
                                     self.publish_empty_outcome();
                                     self.play_feedback(SoundEvent::Cancelled);
                                     self.reset_to_idle(state).await;
@@ -5137,6 +5155,7 @@ impl Daemon {
                                 }
                                 PostProcessWait::Cancelled => {
                                     tracing::info!("Post-processing cancelled");
+                                    self.release_preedit();
                                     self.publish_empty_outcome();
                                     self.play_feedback(SoundEvent::Cancelled);
                                     self.reset_to_idle(state).await;
