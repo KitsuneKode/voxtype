@@ -320,8 +320,11 @@ mod imp {
                 .iter()
                 .filter(|d| !current.iter().any(|c| c.index == d.index))
                 .collect();
+            // Nothing gone yet: a player re-creates its stream a moment
+            // after Play, so keep watching for the whole window.
             if gone.is_empty() {
-                return;
+                tokio::time::sleep(std::time::Duration::from_millis(RESPAWN_WATCH_STEP_MS)).await;
+                continue;
             }
             let fresh: Vec<&DuckedMediaStream> = current
                 .iter()

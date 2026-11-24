@@ -4848,6 +4848,7 @@ impl Daemon {
             Ok(Ok(text)) => {
                 if text.is_empty() {
                     tracing::debug!("Transcription was empty");
+                    self.release_preedit();
                     self.publish_osd_outcome(osd::session::OutcomeKind::Empty, 0);
                     self.reset_to_idle(state).await;
                 } else {
@@ -4899,6 +4900,7 @@ impl Daemon {
                     // "submit" still presses Enter.
                     if processed_text.trim().is_empty() && !smart_submit {
                         tracing::debug!("Transcription was only filler words");
+                        self.release_preedit();
                         self.publish_osd_outcome(osd::session::OutcomeKind::Empty, 0);
                         self.reset_to_idle(state).await;
                         return;
