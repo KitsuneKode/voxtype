@@ -193,7 +193,7 @@ pub struct OutputConfig {
     pub restore_clipboard_delay_ms: u32,
 
     /// In type mode, paste a final text longer than this many characters
-    /// instead of typing it (with the clipboard restored afterwards): typing
+    /// instead of typing it (the clipboard restored only with restore_clipboard): typing
     /// runs at ~120 characters a second, so a few minutes of dictation took
     /// over ten seconds to appear. Unset (the default) always types.
     #[serde(default)]

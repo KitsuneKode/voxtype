@@ -32,6 +32,12 @@ const QUERY_TIMEOUT: Duration = Duration::from_millis(250);
 const TERMINAL_CLASSES: &[&str] = &[
     "alacritty",
     "kitty",
+    // kuwai's own kitty windows (`kitty --class …`)
+    "drop-term",
+    "float-term",
+    "kuwai-console",
+    "kuwai-edit",
+    "kuwai-monitor",
     "com.mitchellh.ghostty",
     "ghostty",
     "foot",
@@ -223,6 +229,14 @@ fn niri_is_terminal(json: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kuwais_own_kitty_windows_are_terminals() {
+        for class in ["drop-term", "float-term", "kuwai-console", "kuwai-edit", "kuwai-monitor"] {
+            assert!(is_terminal_class(class), "{class}");
+        }
+        assert!(!is_terminal_class("kuwai-shell"));
+    }
 
     #[test]
     fn hyprland_dynamic_terminal_tag_marks_a_terminal() {

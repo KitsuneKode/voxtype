@@ -372,7 +372,10 @@ fn create_driver_output(
 
 /// Factory function that returns a fallback chain of output methods
 /// The output settings for a final text: a type-mode text longer than
-/// `paste_over_chars` is pasted (clipboard restored after) instead of typed.
+/// `paste_over_chars` is pasted instead of typed. The clipboard is restored
+/// only if `restore_clipboard` says so: a cleanup that keeps each dictation on
+/// the clipboard (shuush) would race a restore, and a restore keeps one MIME
+/// type, dropping a password manager's "don't keep" hint.
 pub fn config_for_text(config: &OutputConfig, text: &str) -> Option<OutputConfig> {
     let limit = config.paste_over_chars?;
     if config.mode != crate::config::OutputMode::Type || text.chars().count() <= limit {
@@ -380,7 +383,6 @@ pub fn config_for_text(config: &OutputConfig, text: &str) -> Option<OutputConfig
     }
     let mut long = config.clone();
     long.mode = crate::config::OutputMode::Paste;
-    long.restore_clipboard = true;
     Some(long)
 }
 
@@ -967,12 +969,14 @@ mod paste_over_chars_tests {
     }
 
     #[test]
-    fn a_short_text_is_typed_and_a_long_one_pasted_with_the_clipboard_restored() {
+    fn a_short_text_is_typed_and_a_long_one_pasted_restoring_only_if_asked() {
         let c = typed(Some(300));
         assert!(config_for_text(&c, &"x".repeat(300)).is_none());
         let long = config_for_text(&c, &"x".repeat(301)).expect("over the limit pastes");
         assert_eq!(long.mode, OutputMode::Paste);
-        assert!(long.restore_clipboard);
+        assert!(!long.restore_clipboard);
+        let asked = OutputConfig { restore_clipboard: true, ..c };
+        assert!(config_for_text(&asked, &"x".repeat(301)).unwrap().restore_clipboard);
     }
 
     #[test]

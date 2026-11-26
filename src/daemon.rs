@@ -6997,7 +6997,8 @@ impl Daemon {
                         Some(processor)
                             if processor.streaming()
                                 && file_output_path.is_none()
-                                && output_config.mode == OutputMode::Type =>
+                                && output_config.mode == OutputMode::Type
+                                && output::config_for_text(&output_config, &processed_text).is_none() =>
                         {
                             tracing::info!(
                                 "Post-processing, typed as it streams (profile: {:?}), has_context: {}",
