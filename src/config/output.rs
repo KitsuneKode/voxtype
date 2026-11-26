@@ -192,6 +192,13 @@ pub struct OutputConfig {
     #[serde(default = "default_restore_clipboard_delay")]
     pub restore_clipboard_delay_ms: u32,
 
+    /// In type mode, paste a final text longer than this many characters
+    /// instead of typing it (with the clipboard restored afterwards): typing
+    /// runs at ~120 characters a second, so a few minutes of dictation took
+    /// over ten seconds to appear. Unset (the default) always types.
+    #[serde(default)]
+    pub paste_over_chars: Option<usize>,
+
     /// Wait for modifier keys (Ctrl/Alt/Shift/Super) to be released before
     /// typing transcribed text. Prevents the typed letters from combining
     /// with held modifiers and triggering compositor or application
@@ -289,6 +296,7 @@ impl Default for OutputConfig {
             file_mode: FileMode::default(),
             restore_clipboard: false,
             restore_clipboard_delay_ms: default_restore_clipboard_delay(),
+            paste_over_chars: None,
             wait_for_modifier_release: true,
             modifier_release_timeout_ms: default_modifier_release_timeout_ms(),
             streaming_commit: StreamingCommit::default(),

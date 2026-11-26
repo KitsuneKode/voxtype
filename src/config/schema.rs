@@ -2017,6 +2017,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Milliseconds to wait after the paste keystroke before restoring the clipboard.",
     ),
     spec(
+        "output.paste_over_chars",
+        "output",
+        "paste_over_chars",
+        KeyType::Int { min: 0, max: 1000000 },
+        "Output",
+        "Paste long dictations",
+        "In type mode, paste a dictation longer than this many characters instead of typing it (the clipboard is restored after). Unset types everything.",
+    ),
+    spec(
         "output.wait_for_modifier_release",
         "output",
         "wait_for_modifier_release",
@@ -3698,6 +3707,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "output.paste_keys_terminal" => opt_str(cfg.output.paste_keys_terminal.as_ref()),
         "output.restore_clipboard" => json!(cfg.output.restore_clipboard),
         "output.restore_clipboard_delay_ms" => json!(cfg.output.restore_clipboard_delay_ms),
+        "output.paste_over_chars" => json!(cfg.output.paste_over_chars),
         "output.wait_for_modifier_release" => json!(cfg.output.wait_for_modifier_release),
         "output.modifier_release_timeout_ms" => json!(cfg.output.modifier_release_timeout_ms),
         "output.wtype_shift_prefix" => json!(cfg.output.wtype_shift_prefix),

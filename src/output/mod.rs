@@ -371,6 +371,19 @@ fn create_driver_output(
 }
 
 /// Factory function that returns a fallback chain of output methods
+/// The output settings for a final text: a type-mode text longer than
+/// `paste_over_chars` is pasted (clipboard restored after) instead of typed.
+pub fn config_for_text(config: &OutputConfig, text: &str) -> Option<OutputConfig> {
+    let limit = config.paste_over_chars?;
+    if config.mode != crate::config::OutputMode::Type || text.chars().count() <= limit {
+        return None;
+    }
+    let mut long = config.clone();
+    long.mode = crate::config::OutputMode::Paste;
+    long.restore_clipboard = true;
+    Some(long)
+}
+
 pub fn create_output_chain(config: &OutputConfig) -> Vec<Box<dyn TextOutput>> {
     create_output_chain_with_override(config, None)
 }
@@ -936,5 +949,42 @@ mod tests {
         assert_eq!(sanitize_urgency("LOW"), "normal");
         assert_eq!(sanitize_urgency("urgent"), "normal");
         assert_eq!(sanitize_urgency("--rm -rf /"), "normal");
+    }
+}
+
+#[cfg(test)]
+mod paste_over_chars_tests {
+    use super::*;
+    use crate::config::OutputMode;
+
+    fn typed(limit: Option<usize>) -> OutputConfig {
+        OutputConfig { mode: OutputMode::Type, paste_over_chars: limit, ..OutputConfig::default() }
+    }
+
+    #[test]
+    fn unset_always_types() {
+        assert!(config_for_text(&typed(None), &"word ".repeat(2000)).is_none());
+    }
+
+    #[test]
+    fn a_short_text_is_typed_and_a_long_one_pasted_with_the_clipboard_restored() {
+        let c = typed(Some(300));
+        assert!(config_for_text(&c, &"x".repeat(300)).is_none());
+        let long = config_for_text(&c, &"x".repeat(301)).expect("over the limit pastes");
+        assert_eq!(long.mode, OutputMode::Paste);
+        assert!(long.restore_clipboard);
+    }
+
+    #[test]
+    fn the_limit_counts_characters_not_bytes() {
+        assert!(config_for_text(&typed(Some(10)), &"é".repeat(10)).is_none());
+    }
+
+    #[test]
+    fn other_modes_are_left_alone() {
+        for mode in [OutputMode::Paste, OutputMode::Clipboard] {
+            let c = OutputConfig { mode, paste_over_chars: Some(1), ..OutputConfig::default() };
+            assert!(config_for_text(&c, "a long enough text").is_none());
+        }
     }
 }

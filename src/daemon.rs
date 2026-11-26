@@ -7272,13 +7272,18 @@ impl Daemon {
                         return;
                     }
 
+                    let long_config = output::config_for_text(&output_config, &final_text);
+                    if long_config.is_some() {
+                        tracing::info!("Pasting {} chars instead of typing them", final_text.chars().count());
+                    }
+                    let chain_config = long_config.as_ref().unwrap_or(&output_config);
                     #[cfg(test)]
                     let mut output_chain = match self.history_test_output_chain.take() {
                         Some(chain) => chain,
-                        None => output::create_output_chain(&output_config),
+                        None => output::create_output_chain(chain_config),
                     };
                     #[cfg(not(test))]
-                    let mut output_chain = output::create_output_chain(&output_config);
+                    let mut output_chain = output::create_output_chain(chain_config);
                     if let Some(preedit) = preedit {
                         output_chain.insert(
                             0,
