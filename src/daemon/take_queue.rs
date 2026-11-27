@@ -78,6 +78,12 @@ impl Order {
         self.sequence += 1;
         self.sequence
     }
+    /// Whether the primary take is still being transcribed or delivered,
+    /// so a cancel or skip set now reaches it. Set while idle, one would
+    /// land on whatever take came next.
+    fn primary_busy(&self) -> bool {
+        self.processing || self.primary == "transcribing"
+    }
 }
 
 /// A panic while the lock was held must not take intake down with it: the
@@ -204,12 +210,51 @@ impl TakeQueue {
         });
         self.ready.notify_one();
     }
-    fn cancel_waiting(&self) -> Option<Take> {
+    /// Cancel the most recent take that hasn't started delivering, or else
+    /// the primary one if it is still busy, and acknowledge `record cancel`.
+    /// Decided in one change: the primary may have finished since the input
+    /// was routed here, and then there is nothing to cancel.
+    fn cancel_latest(&self) -> Option<Take> {
         self.change(|q| {
-            let take = q.waiting.pop_back()?;
+            let take = q.waiting.pop_back();
+            if take.is_none() && q.primary_busy() {
+                q.cancel = true;
+            }
             acknowledge_queue_cancel(&self.dir);
-            Some(take)
+            take
         })
+    }
+
+    /// Mark a queued take as recording. A `record cancel` older than this
+    /// start drops the latest waiting take, or the busy primary one.
+    fn start_recording(&self, request_at: Option<u128>) -> Option<Take> {
+        self.change(|q| {
+            let cancel = self.dir.join("cancel");
+            let mut dropped = None;
+            if cancel.exists() && !cancel_targets_start(request_at, read_trigger_stamp(&cancel)) {
+                dropped = q.waiting.pop_back();
+                if dropped.is_none() && q.primary_busy() {
+                    q.cancel = true;
+                }
+                acknowledge_queue_cancel(&self.dir);
+            }
+            q.recording = true;
+            dropped
+        })
+    }
+
+    /// `record stop --no-post-process` with no queued take recording: it
+    /// applies to the latest waiting take, or the busy primary one.
+    fn skip_latest(&self, post_process: Option<bool>) {
+        self.change(|q| {
+            if let Some(take) = q.waiting.back_mut() {
+                if let Some(v) = post_process {
+                    take.options.post_process = Some(v);
+                }
+            } else if post_process == Some(false) && q.primary_busy() {
+                q.skip = true;
+            }
+        });
     }
 }
 
@@ -318,11 +363,9 @@ impl Inputs {
             let start = match input {
                 Input::Key(HotkeyEvent::Cancel) => {
                     if active.is_none() {
-                        if let Some(take) = queue.cancel_waiting() {
+                        if let Some(take) = queue.cancel_latest() {
                             report_cancelled(&config, &take.options);
                             keep_cancelled(&config, take.pressed().to_vec()).await;
-                        } else {
-                            queue.change(|q| q.cancel = true);
                         }
                         continue;
                     }
@@ -348,16 +391,7 @@ impl Inputs {
                 }
                 Input::Start if active.is_none() => Some((None, None, true)),
                 Input::Stop if active.is_none() => {
-                    let options = Overrides::read();
-                    queue.change(|q| {
-                        if let Some(take) = q.waiting.back_mut() {
-                            if let Some(v) = options.post_process {
-                                take.options.post_process = Some(v);
-                            }
-                        } else if options.post_process == Some(false) {
-                            q.skip = true;
-                        }
-                    });
+                    queue.skip_latest(Overrides::read().post_process);
                     continue;
                 }
                 Input::Start => {
@@ -390,24 +424,8 @@ impl Inputs {
                     continue;
                 }
                 let request = external.then(StartRequest::read);
-                let older_cancel = queue.change(|q| {
-                    let cancel = queue.dir.join("cancel");
-                    let mut dropped = None;
-                    if cancel.exists()
-                        && !cancel_targets_start(
-                            request.as_ref().and_then(|r| r.issued_at),
-                            read_trigger_stamp(&cancel),
-                        )
-                    {
-                        dropped = q.waiting.pop_back();
-                        if dropped.is_none() {
-                            q.cancel = true;
-                        }
-                        acknowledge_queue_cancel(&queue.dir);
-                    }
-                    q.recording = true;
-                    dropped
-                });
+                let older_cancel =
+                    queue.start_recording(request.as_ref().and_then(|r| r.issued_at));
                 if let Some(take) = older_cancel {
                     report_cancelled(&config, &take.options);
                     keep_cancelled(&config, take.pressed().to_vec()).await;
@@ -697,7 +715,7 @@ mod tests {
         assert!(queue.next_for_delivery().is_none());
 
         // Cancel waiting take 3 before take 2 finishes: take 3 is dropped.
-        let dropped = queue.cancel_waiting().expect("take 3 dropped");
+        let dropped = queue.cancel_latest().expect("take 3 dropped");
         assert_eq!(dropped.sequence, 3);
 
         // Take 2 finishes with nothing left waiting or recording: state becomes idle immediately.
@@ -705,6 +723,50 @@ mod tests {
         assert_eq!(read_state(), "idle");
         assert!(!queue.accepting_overlap());
         assert!(queue.next_for_delivery().is_none());
+    }
+
+    /// The primary take finishes between the routing check and the cancel:
+    /// nothing is left to cancel, so nothing may stay armed for the next take,
+    /// and `record cancel` is still acknowledged.
+    #[test]
+    fn a_cancel_that_arrives_after_the_primary_finished_arms_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let queue = TakeQueue::running_in(Some(dir.path().join("state")), dir.path());
+        let cancel = dir.path().join("cancel");
+        let armed = || lock(&queue.order).cancel;
+
+        queue.primary_finished_capture();
+        assert!(queue.accepting_overlap());
+        queue.primary("idle");
+        std::fs::write(&cancel, "41").unwrap();
+        assert!(queue.cancel_latest().is_none());
+        assert!(!armed());
+        assert!(!cancel.exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("cancel_ack")).unwrap(),
+            "41"
+        );
+        assert!(!queue.cancel_primary());
+
+        std::fs::write(&cancel, "42").unwrap();
+        assert!(queue.start_recording(None).is_none());
+        assert!(
+            !armed(),
+            "a stale cancel at a start while idle arms nothing"
+        );
+        assert!(!cancel.exists());
+        queue.change(|q| q.recording = false);
+
+        queue.skip_latest(Some(false));
+        assert!(!lock(&queue.order).skip);
+
+        queue.primary_finished_capture();
+        assert!(queue.cancel_latest().is_none());
+        assert!(armed(), "a busy primary take is cancelled");
+        queue.skip_latest(Some(false));
+        assert!(queue.skip_post_process());
+        assert!(queue.cancel_primary());
+        assert!(!armed());
     }
 
     #[test]
