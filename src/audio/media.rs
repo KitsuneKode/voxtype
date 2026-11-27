@@ -32,6 +32,18 @@ pub struct DuckedMediaStream {
     app: Vec<String>,
 }
 
+#[cfg(test)]
+impl DuckedMediaStream {
+    /// A stream as `duck_playing_audio` would have recorded it.
+    pub(crate) fn recorded(index: u32, volumes: &[&str]) -> Self {
+        Self {
+            index,
+            volumes: volumes.iter().map(|v| v.to_string()).collect(),
+            app: Vec::new(),
+        }
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::DuckedMediaStream;

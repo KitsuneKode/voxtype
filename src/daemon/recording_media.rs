@@ -15,11 +15,13 @@ struct MediaState {
     config: AudioConfig,
 }
 
-pub(super) struct Lease(OwnedMutexGuard<MediaState>);
+pub(super) struct Lease(Option<OwnedMutexGuard<MediaState>>);
 impl Drop for Lease {
     fn drop(&mut self) {
-        self.0.restore_ducked_media_streams();
-        self.0.resume_media_players();
+        if let Some(state) = &mut self.0 {
+            state.restore_ducked_media_streams();
+            state.resume_media_players();
+        }
     }
 }
 
@@ -33,22 +35,55 @@ impl Media {
         if let Some(task) = state.resume.take() {
             let _ = task.await;
         }
-        let mut lease = Lease(state);
-        lease.0.pause_media_players().await;
-        lease.0.duck_media_streams().await;
-        Some(lease)
+        state.pause_media_players().await;
+        state.duck_media_streams().await;
+        Some(Lease(Some(state)))
     }
-    pub async fn settle(&self) {
+
+    /// Put media back before the process exits, waiting at most 2 s:
+    /// spawned restores would die with it. Streams still ducked come back
+    /// at once, with no fade, since a ramp cut short by the timeout would
+    /// leave media quiet; a restore already fading up is waited for.
+    pub async fn restore_before_exit(&self, lease: Option<Lease>) {
+        let held = lease.and_then(|mut lease| lease.0.take());
         let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            let mut state = self.0.lock().await;
+            let mut state = match held {
+                Some(state) => state,
+                None => self.0.clone().lock_owned().await,
+            };
+            let players = std::mem::take(&mut state.paused_media_players);
+            let streams = std::mem::take(&mut state.ducked_media_streams);
+            if let Some(task) = state.media_fade_task.take() {
+                if streams.is_empty() {
+                    let _ = task.await;
+                } else {
+                    task.abort();
+                }
+            }
             if let Some(task) = state.resume.take() {
                 let _ = task.await;
             }
-            if let Some(task) = state.media_fade_task.take() {
-                let _ = task.await;
+            if !players.is_empty() {
+                audio::media::resume_players(players).await;
+            }
+            if !streams.is_empty() {
+                let ducked = state.config.duck_media_volume_percent;
+                audio::media::restore_ducked_audio(streams, ducked, 0).await;
             }
         })
         .await;
+    }
+
+    #[cfg(test)]
+    pub async fn ducked(
+        &self,
+        config: &AudioConfig,
+        streams: Vec<audio::media::DuckedMediaStream>,
+    ) -> Lease {
+        let mut state = self.0.clone().lock_owned().await;
+        state.config = config.clone();
+        state.ducked_media_streams = streams;
+        Lease(Some(state))
     }
 }
 

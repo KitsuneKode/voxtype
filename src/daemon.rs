@@ -2147,8 +2147,9 @@ impl Daemon {
         self.media_lease.take();
     }
     async fn restore_recording_media_before_exit(&mut self) {
-        self.restore_recording_media();
-        self.media.settle().await;
+        self.media
+            .restore_before_exit(self.media_lease.take())
+            .await;
     }
 
     /// Leave the failure visible until the next recording/state change, without

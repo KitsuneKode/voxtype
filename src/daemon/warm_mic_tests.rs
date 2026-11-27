@@ -639,3 +639,58 @@ async fn a_recovered_take_keeps_its_own_options() {
         .contains("heard"));
     assert_eq!(std::fs::read_to_string(&output).unwrap(), "clipboard");
 }
+
+/// At exit, media still ducked comes back at once rather than over the
+/// configured fade, which the 2 s exit budget could cut short; a restore
+/// already fading up when the daemon stops is waited for, not aborted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn media_is_restored_without_a_fade_on_exit() {
+    const NAME: &str = "daemon::tests::history_contracts::media_is_restored_without_a_fade_on_exit";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    use crate::audio::media::DuckedMediaStream;
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let log = root.path().join("pactl");
+    crate::test_support::write_script(
+        &bin.join("pactl"),
+        &format!("#!/bin/sh\necho \"$*\" >> {}\n", log.display()),
+    );
+    std::env::set_var("PATH", &bin);
+    let volume_writes = || -> Vec<String> {
+        let all = std::fs::read_to_string(&log).unwrap_or_default();
+        let _ = std::fs::remove_file(&log);
+        all.lines()
+            .filter(|l| l.starts_with("set-sink-input-volume"))
+            .map(str::to_string)
+            .collect()
+    };
+    let mut config = crate::config::AudioConfig::default();
+    config.duck_media = true;
+    config.duck_media_volume_percent = 30;
+    config.duck_media_fade_ms = 1500;
+    let media = recording_media::Media::default();
+
+    let lease = media
+        .ducked(
+            &config,
+            vec![DuckedMediaStream::recorded(42, &["30000", "30000"])],
+        )
+        .await;
+    let started = Instant::now();
+    media.restore_before_exit(Some(lease)).await;
+    assert!(started.elapsed() < Duration::from_millis(1000));
+    assert_eq!(volume_writes(), ["set-sink-input-volume 42 30000 30000"]);
+
+    config.duck_media_fade_ms = 300;
+    let lease = media
+        .ducked(&config, vec![DuckedMediaStream::recorded(7, &["20000"])])
+        .await;
+    drop(lease);
+    media.restore_before_exit(None).await;
+    let writes = volume_writes();
+    assert!(writes.len() > 1, "the fade ran: {writes:?}");
+    assert_eq!(writes.last().unwrap(), "set-sink-input-volume 7 20000");
+}
