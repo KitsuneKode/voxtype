@@ -104,6 +104,8 @@ pub(super) struct TakeQueue {
     managed: bool,
     processing: watch::Sender<bool>,
     pub ready: Notify,
+    #[cfg(test)]
+    published: Mutex<Vec<&'static str>>,
 }
 
 impl TakeQueue {
@@ -137,8 +139,16 @@ impl TakeQueue {
             if let Some(path) = &self.path {
                 write_state_file(path, order.state());
             }
+            #[cfg(test)]
+            lock(&self.published).push(order.state());
         }
         result
+    }
+
+    /// Every state written to the state file, in order.
+    #[cfg(test)]
+    pub fn published(&self) -> Vec<&'static str> {
+        lock(&self.published).clone()
     }
     pub fn primary(&self, state: &'static str) {
         self.change(|q| {
@@ -154,9 +164,14 @@ impl TakeQueue {
         });
         self.processing.send_replace(state == "transcribing");
     }
-    pub fn primary_finished_capture(&self) {
+    /// Number the primary take whose capture just ended.
+    pub fn primary_captured(&self) {
         let sequence = self.change(|q| q.next());
         tracing::debug!(sequence, "Dictation capture finished");
+    }
+    #[cfg(test)]
+    pub fn primary_finished_capture(&self) {
+        self.primary_captured();
         self.primary("transcribing");
     }
     fn accepting_overlap(&self) -> bool {

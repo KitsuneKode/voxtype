@@ -16,8 +16,9 @@ impl HeardAudio {
     }
 }
 
-/// A daemon that makes no sound, sends no notification and transcribes with
-/// `HeardAudio`, publishing its state to `<root>/state`.
+/// A daemon that makes no sound, sends no notification, transcribes with
+/// `HeardAudio` into `<root>/transcript.txt` (never typed, never on the
+/// clipboard) and publishes its state to `<root>/state`.
 fn quiet_daemon(root: &Path) -> (Daemon, Arc<HeardAudio>) {
     let mut daemon = history_daemon(root);
     let n = &mut daemon.config.output.notification;
@@ -30,6 +31,9 @@ fn quiet_daemon(root: &Path) -> (Daemon, Arc<HeardAudio>) {
     daemon.config.tray.enabled = false;
     daemon.config.meeting.enabled = false;
     daemon.config.engine = crate::config::TranscriptionEngine::Soniox;
+    daemon.config.output.mode = crate::config::OutputMode::File;
+    daemon.config.output.file_path = Some(root.join("transcript.txt"));
+    daemon.config.output.fallback_to_clipboard = false;
     let heard = Arc::new(HeardAudio::default());
     daemon.transcriber_preloaded = Some(heard.clone());
     let state = root.join("state");
@@ -693,4 +697,49 @@ async fn media_is_restored_without_a_fade_on_exit() {
     let writes = volume_writes();
     assert!(writes.len() > 1, "the fade ran: {writes:?}");
     assert_eq!(writes.last().unwrap(), "set-sink-input-volume 7 20000");
+}
+
+/// A batch take too short to transcribe goes from recording straight back to
+/// idle; only a take that will be transcribed says so.
+#[tokio::test]
+async fn a_tap_never_publishes_transcribing() {
+    const NAME: &str = "daemon::tests::history_contracts::a_tap_never_publishes_transcribing";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (mut daemon, heard) = quiet_daemon(root.path());
+    for (pressed, published) in [
+        (1600, &["recording", "idle"][..]),
+        (8000, &["recording", "transcribing", "idle"][..]),
+    ] {
+        daemon.queue = Arc::new(TakeQueue::running(daemon.state_file_path.clone()));
+        daemon.frozen = None;
+        daemon.pre_roll_samples = 4000;
+        let mut state = State::Recording {
+            started_at: Instant::now(),
+            model_override: None,
+        };
+        daemon.update_state("recording");
+        let mut capture: Option<Box<dyn AudioCapture>> = Some(Box::new(WarmAudio {
+            samples: warm_take(4000, pressed),
+            prefix: 4000,
+            started: opened_flag(),
+        }));
+        let started = daemon
+            .start_transcription_task(&mut state, &mut capture, None)
+            .await;
+        assert_eq!(started, published.len() == 3);
+        if let Some(task) = daemon.transcription_task.take() {
+            let result = task.await;
+            daemon.handle_transcription_result(&mut state, result).await;
+        }
+        assert!(state.is_idle());
+        assert_eq!(
+            daemon.queue.published(),
+            published,
+            "{pressed} samples pressed"
+        );
+    }
+    assert_eq!(heard.takes().len(), 1);
 }

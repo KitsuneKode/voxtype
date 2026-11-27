@@ -3002,15 +3002,28 @@ impl Daemon {
         }
     }
 
+    /// Settle the stopped take's options and say it is transcribing, which
+    /// also lets the next start record alongside it.
     fn freeze_take(&mut self) {
-        if self.frozen.is_none() {
-            let options = Overrides::read();
-            if let Some(profile) = &options.profile {
-                self.recording_profile = Some(profile.clone());
-            }
-            self.frozen = Some(options);
-            self.queue.primary_finished_capture();
+        if self.freeze_options() {
+            self.queue.primary("transcribing");
         }
+    }
+
+    /// Settle the stopped take's options only. A batch take says it is
+    /// transcribing once it is known to be long enough, so a tap goes from
+    /// recording straight back to idle. Returns whether this froze them.
+    fn freeze_options(&mut self) -> bool {
+        if self.frozen.is_some() {
+            return false;
+        }
+        let options = Overrides::read();
+        if let Some(profile) = &options.profile {
+            self.recording_profile = Some(profile.clone());
+        }
+        self.frozen = Some(options);
+        self.queue.primary_captured();
+        true
     }
 
     /// Stop whatever recording is currently active — streaming, batch
@@ -6610,7 +6623,7 @@ impl Daemon {
         // transcription work, then restore media immediately.
         if let Some(mut capture) = audio_capture.take() {
             let stop_result = capture.stop().await;
-            self.freeze_take();
+            self.freeze_options();
             self.restore_recording_media();
 
             self.play_feedback(SoundEvent::RecordingStop);
