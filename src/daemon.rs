@@ -8109,6 +8109,9 @@ impl Daemon {
                     tracing::debug!(sequence = take.sequence, "Processing queued dictation");
                     self.pre_roll_samples = take.prefix;
                     self.frozen = Some(take.options);
+                    self.osd_session_suppressed
+                        .store(take.no_osd, std::sync::atomic::Ordering::Relaxed);
+                    set_osd_suppressed(take.no_osd);
                     self.prepare_for_recording(take.model.as_deref());
                     state = State::Recording {
                         started_at: take.started,

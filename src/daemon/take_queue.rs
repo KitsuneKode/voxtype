@@ -38,6 +38,15 @@ pub(super) struct Take {
     pub prefix: usize,
     pub started: Instant,
     pub external: bool,
+    /// `record start --no-osd`, read when the take started.
+    pub no_osd: bool,
+}
+
+impl Take {
+    /// What the take recorded after its key went down.
+    fn pressed(&self) -> &[f32] {
+        &self.samples[self.prefix.min(self.samples.len())..]
+    }
 }
 
 #[derive(Default)]
@@ -205,6 +214,7 @@ struct Recording {
     profile: Option<String>,
     started: Instant,
     external: bool,
+    no_osd: bool,
     tracker: Option<audio::levels::SpeechTracker>,
     media: Option<recording_media::Lease>,
 }
@@ -298,6 +308,7 @@ impl Inputs {
                     if active.is_none() {
                         if let Some(take) = queue.cancel_waiting() {
                             report_cancelled(&config, &take.options);
+                            keep_cancelled(&config, take.pressed().to_vec()).await;
                         } else {
                             queue.change(|q| q.cancel = true);
                         }
@@ -365,12 +376,52 @@ impl Inputs {
                 });
                 if let Some(take) = older_cancel {
                     report_cancelled(&config, &take.options);
+                    keep_cancelled(&config, take.pressed().to_vec()).await;
                 }
                 if external {
                     apply_start_options();
                 }
                 let model = model.or_else(read_model_override);
-                let _ = read_bool_override("no_osd");
+                let no_osd = read_bool_override("no_osd").unwrap_or(false);
+                if let Some(problem) = model
+                    .as_deref()
+                    .and_then(|name| crate::model_catalog::override_route(&config, name).err())
+                {
+                    tracing::error!("Model override failed: {}", problem);
+                    services.play(SoundEvent::Error);
+                    let options = Overrides::read();
+                    report_outcome(&config, &options, TranscriptOutcome::error(&problem));
+                    queue.change(|q| q.recording = false);
+                    let n = &config.output.notification;
+                    send_notification(
+                        "Voxtype: Model Override Failed",
+                        &problem,
+                        n.show_engine_icon,
+                        config.engine,
+                        &n.urgency,
+                    )
+                    .await;
+                    continue;
+                }
+                if config.output.notification.on_recording_start {
+                    let n = &config.output.notification;
+                    let body = if external {
+                        "External trigger"
+                    } else if config.hotkey.mode == ActivationMode::Toggle {
+                        "Press hotkey again to stop"
+                    } else {
+                        "Recording..."
+                    };
+                    send_notification_with_lifetime(
+                        "Recording Started",
+                        body,
+                        n.show_engine_icon,
+                        config.engine,
+                        &n.urgency,
+                        Lifetime::UntilClosed,
+                    )
+                    .await;
+                }
                 let result = async {
                     let media = services.media.acquire(&config.audio).await;
                     let mut capture = services.mic.capture(&config.audio)?;
@@ -399,6 +450,7 @@ impl Inputs {
                         model,
                         profile,
                         external,
+                        no_osd,
                         started: Instant::now(),
                         tracker,
                         media,
@@ -436,6 +488,10 @@ impl Inputs {
                         acknowledge_queue_cancel(&queue.dir);
                         q.recording = false;
                     });
+                    if let Ok(mut samples) = samples {
+                        samples.drain(..prefix.min(samples.len()));
+                        keep_cancelled(&config, samples).await;
+                    }
                 } else if let Ok(samples) = samples {
                     services.play(SoundEvent::RecordingStop);
                     queue.finish(Take {
@@ -445,8 +501,16 @@ impl Inputs {
                         options,
                         started: r.started,
                         external: r.external,
+                        no_osd: r.no_osd,
                         model: r.model,
                     });
+                    end_recording_notification(
+                        "Recording Stopped",
+                        "Transcribing...",
+                        &config.output.notification,
+                        config.engine,
+                    )
+                    .await;
                 } else {
                     report_cancelled(&config, &options);
                     queue.change(|q| q.recording = false);
@@ -459,6 +523,23 @@ impl Inputs {
             }
         }
     }
+}
+
+/// Keep a cancelled queued take for `record recover`, as a cancelled primary
+/// take is, and say whether it was kept.
+async fn keep_cancelled(config: &Config, pressed: Vec<f32>) {
+    let kept = keep_cancelled_take(pressed).await;
+    end_recording_notification(
+        "Cancelled",
+        if kept {
+            KEPT_BODY
+        } else {
+            "Recording discarded"
+        },
+        &config.output.notification,
+        config.engine,
+    )
+    .await;
 }
 
 fn report_cancelled(config: &Config, options: &Overrides) {
@@ -534,6 +615,7 @@ mod tests {
             prefix: 0,
             started: Instant::now(),
             external: false,
+            no_osd: false,
         }
     }
 

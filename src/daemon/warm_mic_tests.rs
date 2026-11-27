@@ -209,3 +209,255 @@ async fn toggle_press_while_transcribing_waits_when_queueing_is_off() {
         })
         .await;
 }
+
+/// A capture whose first `prefix` samples are warm-mic pre-roll.
+struct WarmAudio {
+    samples: Vec<f32>,
+    prefix: usize,
+    started: Arc<std::sync::atomic::AtomicBool>,
+}
+#[async_trait::async_trait]
+impl AudioCapture for WarmAudio {
+    async fn start(
+        &mut self,
+    ) -> std::result::Result<tokio::sync::mpsc::Receiver<Vec<f32>>, crate::error::AudioError> {
+        self.started
+            .store(true, std::sync::atomic::Ordering::Release);
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
+        Ok(rx)
+    }
+    fn pre_roll_samples(&self) -> usize {
+        self.prefix
+    }
+    async fn stop(&mut self) -> std::result::Result<Vec<f32>, crate::error::AudioError> {
+        Ok(std::mem::take(&mut self.samples))
+    }
+    async fn get_samples(&mut self) -> Vec<f32> {
+        std::mem::take(&mut self.samples)
+    }
+}
+
+/// `pre` samples of silence followed by `pressed` samples of speech level.
+fn warm_take(pre: usize, pressed: usize) -> Vec<f32> {
+    let mut samples = vec![0.0; pre];
+    samples.resize(pre + pressed, 0.2);
+    samples
+}
+
+/// The daemon loop with a primary take held in its eager decode until
+/// `release` is sent, queueing on, push-to-talk. Queued takes are
+/// transcribed by `replacement`.
+struct QueueHarness {
+    events: tokio::sync::mpsc::Sender<HotkeyEvent>,
+    release: std::sync::mpsc::Sender<()>,
+    slow: Arc<LifecycleEngine>,
+    state: PathBuf,
+}
+
+impl QueueHarness {
+    fn new(root: &Path, replacement: Arc<dyn Transcriber>) -> (Daemon, Self) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        let mut daemon = fidelity_daemon(root);
+        daemon.config.hotkey.enabled = false;
+        daemon.config.hotkey.mode = ActivationMode::PushToTalk;
+        daemon.config.audio.queue_dictations = true;
+        daemon.config.osd.enabled = false;
+        daemon.config.tray.enabled = false;
+        daemon.config.meeting.enabled = false;
+        daemon.config.output.file_mode = FileMode::Append;
+        let state = root.join("state");
+        daemon.state_file_path = Some(state.clone());
+        let (release, wait) = std::sync::mpsc::channel();
+        let slow = Arc::new(LifecycleEngine {
+            id: "First",
+            language: "en",
+            load: 0,
+            fail: false,
+            calls: AtomicUsize::new(0),
+            completed: AtomicBool::new(false),
+            gate: std::sync::Mutex::new(Some(wait)),
+        });
+        let initial = State::EagerRecording {
+            started_at: Instant::now(),
+            model_override: None,
+            accumulated_audio: vec![0.2; 2000],
+            chunks_sent: 1,
+            chunk_results: vec![],
+            tasks_in_flight: 1,
+        };
+        let (events, rx) = tokio::sync::mpsc::channel(8);
+        daemon.history_test_eager_loop = Some((initial, slow.clone(), replacement, rx));
+        daemon.history_test_capture = Some(Box::new(PrerecordedHistoryAudio { samples: vec![] }));
+        (
+            daemon,
+            Self {
+                events,
+                release,
+                slow,
+                state,
+            },
+        )
+    }
+
+    fn says(&self, state: &str) -> bool {
+        std::fs::read_to_string(&self.state).as_deref().ok() == Some(state)
+    }
+
+    /// Stop the primary take; it stays transcribing until `release`.
+    async fn primary_transcribing(&self) {
+        until_true(|| self.slow.calls.load(std::sync::atomic::Ordering::Acquire) > 0).await;
+        self.events.send(HotkeyEvent::Released).await.unwrap();
+        until_true(|| self.says("transcribing")).await;
+    }
+
+    async fn press(&self, model_override: Option<&str>) {
+        let event = HotkeyEvent::Pressed {
+            model_override: model_override.map(str::to_string),
+            profile_override: None,
+        };
+        self.events.send(event).await.unwrap();
+    }
+}
+
+fn opened_flag() -> Arc<std::sync::atomic::AtomicBool> {
+    Arc::new(std::sync::atomic::AtomicBool::new(false))
+}
+
+fn is_set(flag: &std::sync::atomic::AtomicBool) -> bool {
+    flag.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A queued start is held to what a primary start is: a model override the
+/// daemon can't serve opens no microphone and says why, the start
+/// notification is sent, and `--no-osd` reaches the take's OSD outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_starts_check_the_model_notify_and_keep_no_osd() {
+    const NAME: &str =
+        "daemon::tests::history_contracts::queued_starts_check_the_model_notify_and_keep_no_osd";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let notified = root.path().join("notified");
+    crate::test_support::write_script(
+        &bin.join("notify-send"),
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> {}\necho 7\n",
+            notified.display()
+        ),
+    );
+    std::env::set_var("PATH", &bin);
+    let said = || std::fs::read_to_string(&notified).unwrap_or_default();
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let heard = Arc::new(HeardAudio::default());
+            let (mut daemon, h) = QueueHarness::new(root.path(), heard.clone());
+            daemon.config.output.notification.on_recording_start = true;
+            let opened = opened_flag();
+            daemon
+                .mic
+                .fixtures
+                .lock()
+                .unwrap()
+                .push_back(Box::new(LifecycleAudio {
+                    samples: vec![0.2; 8000],
+                    started: opened.clone(),
+                }));
+            let task = tokio::task::spawn_local(async move { daemon.run().await });
+            h.primary_transcribing().await;
+
+            h.press(Some("no-such-model-anywhere")).await;
+            h.events.send(HotkeyEvent::Released).await.unwrap();
+            until_true(|| said().contains("Model Override Failed")).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!is_set(&opened), "a refused override opens no microphone");
+            assert!(h.says("transcribing"));
+            assert!(!said().contains("Recording Started"));
+
+            let runtime = Config::runtime_dir();
+            std::fs::write(runtime.join("no_osd_override"), "true").unwrap();
+            h.press(None).await;
+            until_true(|| is_set(&opened) && h.says("recording")).await;
+            assert!(said().contains("Recording Started"));
+            assert!(!runtime.join("no_osd_override").exists());
+            h.events.send(HotkeyEvent::Released).await.unwrap();
+            until_true(|| h.says("transcribing")).await;
+
+            h.release.send(()).unwrap();
+            assert_eq!(wait_for_entries(root.path(), 2).await.len(), 2);
+            until_true(|| h.says("idle")).await;
+            assert_eq!(heard.takes(), [vec![0.2; 8000]]);
+            let outcome: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(runtime.join(osd::session::OUTCOME_FILE)).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(outcome["suppressed"], true, "{outcome}");
+            task.abort();
+            let _ = task.await;
+        })
+        .await;
+}
+
+/// A queued take that is cancelled, while waiting or while recording, is
+/// kept for `record recover` as a primary one is, without its pre-roll.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_queued_takes_are_kept_without_pre_roll() {
+    const NAME: &str =
+        "daemon::tests::history_contracts::cancelled_queued_takes_are_kept_without_pre_roll";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let heard = Arc::new(HeardAudio::default());
+            let (mut daemon, h) = QueueHarness::new(root.path(), heard.clone());
+            let (waiting, recording) = (opened_flag(), opened_flag());
+            {
+                let mut fixtures = daemon.mic.fixtures.lock().unwrap();
+                fixtures.push_back(Box::new(WarmAudio {
+                    samples: warm_take(4000, 48000),
+                    prefix: 4000,
+                    started: waiting.clone(),
+                }));
+                fixtures.push_back(Box::new(WarmAudio {
+                    samples: warm_take(2000, 40000),
+                    prefix: 2000,
+                    started: recording.clone(),
+                }));
+            }
+            let task = tokio::task::spawn_local(async move { daemon.run().await });
+            let kept = crate::cancelled_take::path().unwrap();
+            let recover = || {
+                let samples = crate::cancelled_take::take().expect("kept for recover");
+                assert!(samples.iter().all(|s| *s > 0.1), "no pre-roll silence");
+                samples.len()
+            };
+            h.primary_transcribing().await;
+
+            h.press(None).await;
+            until_true(|| is_set(&waiting) && h.says("recording")).await;
+            h.events.send(HotkeyEvent::Released).await.unwrap();
+            until_true(|| h.says("transcribing")).await;
+            std::fs::write(Config::runtime_dir().join("cancel"), trigger_stamp()).unwrap();
+            until_true(|| kept.exists()).await;
+            assert_eq!(recover(), 48000);
+
+            h.press(None).await;
+            until_true(|| is_set(&recording) && h.says("recording")).await;
+            h.events.send(HotkeyEvent::Cancel).await.unwrap();
+            until_true(|| kept.exists()).await;
+            assert_eq!(recover(), 40000);
+            until_true(|| h.says("transcribing")).await;
+
+            h.release.send(()).unwrap();
+            assert_eq!(wait_for_entries(root.path(), 1).await.len(), 1);
+            until_true(|| h.says("idle")).await;
+            assert!(heard.takes().is_empty());
+            task.abort();
+            let _ = task.await;
+        })
+        .await;
+}
