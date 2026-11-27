@@ -120,6 +120,24 @@ mod tests {
         assert_eq!(b.start(tx, 16000, 16000), 0);
     }
 
+    /// Without a warm window a take is exactly its chunks, in the buffer
+    /// and on the streaming channel alike, and nothing outlives its stop.
+    #[test]
+    fn a_cold_take_is_exactly_what_was_captured() {
+        let mut b = CaptureBuffer::Closed;
+        b.push(vec![9., 9.]);
+        let (tx, mut rx) = mpsc::channel(4);
+        assert_eq!(b.start(tx, 16000, 16000), 0);
+        b.push(vec![1., 2.]);
+        b.push(vec![3.]);
+        assert_eq!(rx.try_recv().unwrap(), [1., 2.]);
+        assert_eq!(rx.try_recv().unwrap(), [3.]);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(b.stop(None), [1., 2., 3.]);
+        b.push(vec![4.]);
+        assert!(matches!(b, CaptureBuffer::Closed));
+    }
+
     #[test]
     fn warm_ring_with_zero_pre_roll_retains_nothing() {
         let mut b = CaptureBuffer::Closed;

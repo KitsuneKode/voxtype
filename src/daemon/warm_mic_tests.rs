@@ -743,3 +743,109 @@ async fn a_tap_never_publishes_transcribing() {
     }
     assert_eq!(heard.takes().len(), 1);
 }
+
+fn wav_len(path: &Path) -> usize {
+    hound::WavReader::open(path).unwrap().len() as usize
+}
+
+/// Pre-roll is transcribed, but it never reaches a file: the last take, a
+/// cancelled take and a failed take's audio all start where the key went
+/// down.
+#[tokio::test]
+async fn pre_roll_never_reaches_the_disk() {
+    const NAME: &str = "daemon::tests::history_contracts::pre_roll_never_reaches_the_disk";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::env::set_var("PATH", &bin);
+    let (mut daemon, _) = quiet_daemon(root.path());
+    daemon.config.audio.keep_failed_recordings = true;
+    let runtime = Config::runtime_dir();
+    let (pre, pressed) = (4000, 48000);
+    daemon.pre_roll_samples = pre;
+
+    daemon
+        .save_last_take(Arc::new(warm_take(pre, pressed)))
+        .await
+        .unwrap();
+    assert_eq!(wav_len(&runtime.join("last_take.wav")), pressed);
+
+    daemon
+        .keep_failed_recording(&State::Transcribing {
+            audio: warm_take(pre, pressed),
+        })
+        .await;
+    let failed: Vec<_> = std::fs::read_dir(crate::failed_recording::dir())
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(wav_len(&failed[0]), pressed);
+
+    let mut state = State::Recording {
+        started_at: Instant::now(),
+        model_override: None,
+    };
+    daemon.update_state("recording");
+    let mut capture: Option<Box<dyn AudioCapture>> = Some(Box::new(WarmAudio {
+        samples: warm_take(pre, pressed),
+        prefix: pre,
+        started: opened_flag(),
+    }));
+    daemon
+        .cancel_requested_session(
+            &mut state,
+            &mut capture,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .await;
+    assert!(state.is_idle());
+    let kept = crate::cancelled_take::take().expect("kept for recover");
+    assert_eq!(kept.len(), pressed);
+    assert!(kept.iter().all(|s| *s > 0.1), "no pre-roll silence");
+}
+
+/// With `warm_mic_secs = 0` there is no pre-roll anywhere: the transcriber
+/// gets exactly what was captured, sample for sample, as before the warm
+/// microphone existed.
+#[tokio::test]
+async fn without_a_warm_mic_the_transcriber_gets_exactly_the_capture() {
+    const NAME: &str = "daemon::tests::history_contracts::without_a_warm_mic_the_transcriber_gets_exactly_the_capture";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (mut daemon, heard) = quiet_daemon(root.path());
+    assert_eq!(daemon.config.audio.warm_mic_secs, 0);
+    let captured: Vec<f32> = (0..16000).map(|i| (i as f32 / 50.0).sin() * 0.3).collect();
+    daemon
+        .mic
+        .fixtures
+        .lock()
+        .unwrap()
+        .push_back(Box::new(LifecycleAudio {
+            samples: captured.clone(),
+            started: opened_flag(),
+        }));
+    let mut capture = Some(daemon.start_recording_capture(false).await.unwrap());
+    assert_eq!(daemon.pre_roll_samples, 0);
+    let mut state = State::Recording {
+        started_at: Instant::now(),
+        model_override: None,
+    };
+    daemon.update_state("recording");
+    assert!(
+        daemon
+            .start_transcription_task(&mut state, &mut capture, None)
+            .await
+    );
+    let result = daemon.transcription_task.take().unwrap().await;
+    daemon.handle_transcription_result(&mut state, result).await;
+    assert_eq!(heard.takes(), [captured]);
+}

@@ -84,9 +84,14 @@ impl DictationMic {
         if let Some(capture) = self.fixtures.lock().unwrap().pop_front() {
             return Ok(capture);
         }
+        Ok(Box::new(self.cpal(config)?))
+    }
+
+    /// A capture that shares this warm stream only when `warm_mic_secs` is on.
+    fn cpal(&self, config: &AudioConfig) -> Result<CpalCapture, AudioError> {
         let mut capture = CpalCapture::new(config)?;
         capture.warm = (config.warm_mic_secs > 0).then(|| self.clone());
-        Ok(Box::new(capture))
+        Ok(capture)
     }
 }
 
@@ -580,6 +585,21 @@ mod tests {
             thread: None,
         });
         assert!(lock(&mic.parked).take().is_some());
+    }
+
+    /// `warm_mic_secs = 0` builds a capture that never parks its stream, so
+    /// every take opens the device afresh and carries no pre-roll.
+    #[test]
+    fn without_a_warm_window_a_capture_never_warms() {
+        use super::*;
+        let mic = DictationMic::default();
+        let mut config = AudioConfig::default();
+        assert_eq!(config.warm_mic_secs, 0);
+        let cold = mic.cpal(&config).unwrap();
+        assert!(cold.warm.is_none());
+        assert_eq!(cold.pre_roll_samples(), 0);
+        config.warm_mic_secs = 3;
+        assert!(mic.cpal(&config).unwrap().warm.is_some());
     }
 
     /// Shutdown closes a warm stream and waits for its thread, instead of

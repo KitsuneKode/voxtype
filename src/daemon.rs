@@ -2920,10 +2920,7 @@ impl Daemon {
     ) {
         let secs = captured.len() as f32 / self.config.audio.sample_rate as f32;
         let captured = Arc::new(captured);
-        let wav = Arc::clone(&captured);
-        let rate = self.config.audio.sample_rate;
-        let prefix = self.pre_roll_samples.min(wav.len());
-        tokio::task::spawn_blocking(move || Self::write_last_take(&wav[prefix..], rate));
+        self.save_last_take(Arc::clone(&captured));
         let transcriber_retry = transcriber.clone();
         self.final_pass_task = Some(tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -3189,6 +3186,14 @@ impl Daemon {
         }
     }
 
+    /// [`write_last_take`](Self::write_last_take) off the runtime, without
+    /// the pre-roll: only what was said after the key went down is kept.
+    fn save_last_take(&self, audio: Arc<Vec<f32>>) -> tokio::task::JoinHandle<()> {
+        let rate = self.config.audio.sample_rate;
+        let prefix = self.pre_roll_samples.min(audio.len());
+        tokio::task::spawn_blocking(move || Self::write_last_take(&audio[prefix..], rate))
+    }
+
     /// Keep the take that was just stopped, 16 kHz mono, so a bad cleanup
     /// can be replayed. Overwrites the previous one. A failure here does
     /// not affect the transcript.
@@ -3311,12 +3316,7 @@ impl Daemon {
                         secs
                     );
                     let captured = Arc::new(captured);
-                    let wav = Arc::clone(&captured);
-                    let rate = self.config.audio.sample_rate;
-                    let prefix = self.pre_roll_samples.min(wav.len());
-                    tokio::task::spawn_blocking(move || {
-                        Self::write_last_take(&wav[prefix..], rate)
-                    });
+                    self.save_last_take(Arc::clone(&captured));
                     self.final_pass_task =
                         Some(tokio::spawn(async move { (Some(text), captured) }));
                     self.update_state("transcribing");
@@ -3631,10 +3631,7 @@ impl Daemon {
         self.streaming_feed = None;
         let final_audio = self.streaming_final_audio.take();
         if let Some(ref audio) = final_audio {
-            let wav = audio.clone();
-            let rate = self.config.audio.sample_rate;
-            let prefix = self.pre_roll_samples.min(wav.len());
-            tokio::task::spawn_blocking(move || Self::write_last_take(&wav[prefix..], rate));
+            self.save_last_take(Arc::new(audio.clone()));
         }
         if let Some(h) = streaming_handle.take() {
             // Don't error on join failure; the task may have already
