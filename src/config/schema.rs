@@ -1102,6 +1102,15 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Audio to retain before the next warm start, in milliseconds.",
     ),
     spec(
+        "audio.queue_dictations",
+        "audio",
+        "queue_dictations",
+        KeyType::Bool,
+        "Audio",
+        "Queue dictations",
+        "Record a new dictation while the last one is transcribing; deliver them in order.",
+    ),
+    spec(
         "audio.max_duration_secs",
         "audio",
         "max_duration_secs",
@@ -3603,6 +3612,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "audio.device" => json!(cfg.audio.device),
         "audio.warm_mic_secs" => json!(cfg.audio.warm_mic_secs),
         "audio.pre_roll_ms" => json!(cfg.audio.pre_roll_ms),
+        "audio.queue_dictations" => json!(cfg.audio.queue_dictations),
         "audio.max_duration_secs" => json!(cfg.audio.max_duration_secs),
         "audio.keep_failed_recordings" => json!(cfg.audio.keep_failed_recordings),
         "audio.pause_media" => json!(cfg.audio.pause_media),

@@ -70,7 +70,11 @@ async fn too_short_guard_does_not_count_pre_roll() {
 
     let mut state = recording();
     let press = vec![0.1; pre_roll + 4800];
-    assert!(daemon.transcribe_take_samples(&mut state, press, None).await);
+    assert!(
+        daemon
+            .transcribe_take_samples(&mut state, press, None)
+            .await
+    );
     finish_transcription(&mut daemon).await;
 
     daemon.pre_roll_samples = 0;
@@ -80,7 +84,11 @@ async fn too_short_guard_does_not_count_pre_roll() {
     finish_transcription(&mut daemon).await;
 
     let lengths: Vec<usize> = heard.takes().iter().map(Vec::len).collect();
-    assert_eq!(lengths, [pre_roll + 4800, 4960], "pre-roll is still transcribed");
+    assert_eq!(
+        lengths,
+        [pre_roll + 4800, 4960],
+        "pre-roll is still transcribed"
+    );
 }
 
 /// whisper-cli is handed audio on stdin only when a take can hold pre-roll.
@@ -92,6 +100,112 @@ fn whisper_cli_gets_stdin_audio_only_with_a_warm_mic() {
         config.state_file = None;
         config.audio.warm_mic_secs = warm;
         let daemon = Daemon::new(config, None);
-        assert_eq!(daemon.config.whisper.audio_over_stdin, over_stdin, "warm_mic_secs = {warm}");
+        assert_eq!(
+            daemon.config.whisper.audio_over_stdin, over_stdin,
+            "warm_mic_secs = {warm}"
+        );
     }
+}
+
+async fn until_true(mut test: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !test() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("dictation transition timed out");
+}
+
+/// With `queue_dictations` off (the default), a toggle press while the last
+/// take is transcribing opens no microphone and changes no state. It waits,
+/// as a key did before queueing existed, and starts the next take once the
+/// first is delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn toggle_press_while_transcribing_waits_when_queueing_is_off() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    const NAME: &str =
+        "daemon::tests::history_contracts::toggle_press_while_transcribing_waits_when_queueing_is_off";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let mut daemon = fidelity_daemon(root.path());
+            daemon.config.hotkey.enabled = false;
+            daemon.config.hotkey.mode = ActivationMode::Toggle;
+            daemon.config.osd.enabled = false;
+            daemon.config.tray.enabled = false;
+            daemon.config.meeting.enabled = false;
+            daemon.config.output.file_mode = FileMode::Append;
+            assert!(!daemon.config.audio.queue_dictations);
+            let state_path = root.path().join("state");
+            daemon.state_file_path = Some(state_path.clone());
+            let (release, wait) = std::sync::mpsc::channel();
+            let slow = Arc::new(LifecycleEngine {
+                id: "First",
+                language: "en",
+                load: 0,
+                fail: false,
+                calls: AtomicUsize::new(0),
+                completed: AtomicBool::new(false),
+                gate: std::sync::Mutex::new(Some(wait)),
+            });
+            let heard = Arc::new(HeardAudio::default());
+            let initial = State::EagerRecording {
+                started_at: Instant::now(),
+                model_override: None,
+                accumulated_audio: vec![0.2; 2000],
+                chunks_sent: 1,
+                chunk_results: vec![],
+                tasks_in_flight: 1,
+            };
+            let (events, rx) = tokio::sync::mpsc::channel(8);
+            daemon.history_test_eager_loop = Some((initial, slow.clone(), heard.clone(), rx));
+            daemon.history_test_capture =
+                Some(Box::new(PrerecordedHistoryAudio { samples: vec![] }));
+            let opened = Arc::new(AtomicBool::new(false));
+            daemon
+                .mic
+                .fixtures
+                .lock()
+                .unwrap()
+                .push_back(Box::new(LifecycleAudio {
+                    samples: vec![0.2; 8000],
+                    started: opened.clone(),
+                }));
+            let task = tokio::task::spawn_local(async move { daemon.run().await });
+            let says = |s| std::fs::read_to_string(&state_path).as_deref().ok() == Some(s);
+            let press = || HotkeyEvent::Pressed {
+                model_override: None,
+                profile_override: None,
+            };
+
+            until_true(|| slow.calls.load(Ordering::Acquire) > 0).await;
+            events.send(press()).await.unwrap();
+            until_true(|| says("transcribing")).await;
+
+            events.send(press()).await.unwrap();
+            events.send(HotkeyEvent::Released).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!opened.load(Ordering::Acquire), "no second microphone");
+            assert!(says("transcribing"));
+            assert!(!slow.completed.load(Ordering::Acquire));
+
+            release.send(()).unwrap();
+            let entries = wait_for_entries(root.path(), 1).await;
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("transcript.txt")).unwrap(),
+                "First transcript\n"
+            );
+            until_true(|| opened.load(Ordering::Acquire) && says("recording")).await;
+            events.send(HotkeyEvent::Cancel).await.unwrap();
+            until_true(|| says("idle")).await;
+            assert!(heard.takes().is_empty(), "nothing was queued");
+            task.abort();
+            let _ = task.await;
+        })
+        .await;
 }

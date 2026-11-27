@@ -25,6 +25,7 @@ async fn queued_take_delivery_and_cancel() {
             let mut daemon = fidelity_daemon(root.path());
             daemon.config.hotkey.enabled = false;
             daemon.config.hotkey.mode = ActivationMode::PushToTalk;
+            daemon.config.audio.queue_dictations = true;
             daemon.config.osd.enabled = false;
             daemon.config.tray.enabled = false;
             daemon.config.meeting.enabled = false;

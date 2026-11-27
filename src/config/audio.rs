@@ -21,6 +21,12 @@ pub struct AudioConfig {
     #[serde(default = "default_pre_roll_ms")]
     pub pre_roll_ms: u32,
 
+    /// Let a new dictation record while the previous one is still being
+    /// transcribed or delivered; the takes are delivered in order. Off, a
+    /// start while one is in flight is ignored, as it always was.
+    #[serde(default)]
+    pub queue_dictations: bool,
+
     /// Maximum recording duration in seconds (safety limit)
     #[serde(default = "default_audio_max_duration_secs")]
     pub max_duration_secs: u32,
@@ -109,6 +115,7 @@ impl Default for AudioConfig {
             sample_rate: default_audio_sample_rate(),
             warm_mic_secs: 0,
             pre_roll_ms: default_pre_roll_ms(),
+            queue_dictations: false,
             max_duration_secs: default_audio_max_duration_secs(),
             keep_failed_recordings: default_keep_failed_recordings(),
             pause_media: false,

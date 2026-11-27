@@ -49,9 +49,15 @@ device = "default"
 # Sample rate in Hz (whisper expects 16000)
 sample_rate = 16000
 
-# Maximum recording duration in seconds (safety limit)
+# Keep the microphone open this many seconds after a dictation, so the next
+# one starts with up to pre_roll_ms of what came just before the key (0 = off)
 # warm_mic_secs = 0
 # pre_roll_ms = 250
+
+# Let a new dictation record while the last one is transcribing (default false)
+# queue_dictations = false
+
+# Maximum recording duration in seconds (safety limit)
 max_duration_secs = 60
 
 # Keep the audio of a recording whose transcription failed, so it can be

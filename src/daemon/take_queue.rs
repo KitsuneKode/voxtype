@@ -247,6 +247,9 @@ impl Inputs {
         config: Config,
         services: CaptureServices,
     ) {
+        // Off, every input goes to the daemon's loop as it did before
+        // queueing existed, and this task never opens the microphone.
+        let queueing = config.audio.queue_dictations;
         let mut active: Option<Recording> = None;
         let mut tick = tokio::time::interval(Duration::from_millis(50));
         let mut processing = queue.processing.subscribe();
@@ -255,7 +258,7 @@ impl Inputs {
                 biased;
                 _ = primary.closed() => return,
                 input = self.recv() => input,
-                _ = tick.tick(), if queue.accepting_overlap() => {
+                _ = tick.tick(), if queueing && queue.accepting_overlap() => {
                     if (active.is_some() || !queue.order.lock().unwrap().waiting.is_empty()) && queue.dir.join("cancel").exists() {
                         Input::Key(HotkeyEvent::Cancel)
                     } else if let Some(r) = &active {
@@ -272,7 +275,8 @@ impl Inputs {
             } else {
                 None
             };
-            if !queue.accepting_overlap()
+            if !queueing
+                || !queue.accepting_overlap()
                 || matches!(&input, Input::Start) && queue.dir.join("recover").exists()
             {
                 let (ack, done) = oneshot::channel();

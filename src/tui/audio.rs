@@ -22,6 +22,9 @@ use crate::config::AudioConfig;
 #[derive(Debug)]
 pub struct AudioState {
     pub device: String,
+    pub warm_mic_secs: u32,
+    pub pre_roll_ms: u32,
+    pub queue_dictations: bool,
     pub max_duration_secs: u32,
     pub keep_failed_recordings: bool,
     pub pause_media: bool,
@@ -73,6 +76,9 @@ pub enum FeedbackLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Device,
+    WarmMic,
+    PreRoll,
+    QueueDictations,
     MaxDuration,
     KeepFailedRecordings,
     PauseMedia,
@@ -87,6 +93,9 @@ pub enum Field {
 impl Field {
     const ALL: &'static [Field] = &[
         Field::Device,
+        Field::WarmMic,
+        Field::PreRoll,
+        Field::QueueDictations,
         Field::MaxDuration,
         Field::KeepFailedRecordings,
         Field::PauseMedia,
@@ -110,6 +119,11 @@ const DUCK_VOLUME_STEP: i32 = 5;
 /// `audio::media`, so every stop lands on a value that produces whole steps.
 const DUCK_FADE_STEP: i32 = 50;
 const DUCK_FADE_MAX: u32 = 2000;
+/// Upper stops for the warm window and pre-roll cyclers.
+const WARM_MIC_STEP: i32 = 1;
+const WARM_MIC_MAX: u32 = 120;
+const PRE_ROLL_STEP: i32 = 50;
+const PRE_ROLL_MAX: u32 = 2000;
 
 impl AudioState {
     pub fn load() -> Result<Self, EditorError> {
@@ -118,6 +132,15 @@ impl AudioState {
             device: ed
                 .get_string("audio", "device")
                 .unwrap_or_else(|| "default".to_string()),
+            warm_mic_secs: ed
+                .get_int("audio", "warm_mic_secs")
+                .map(|n| n.clamp(0, WARM_MIC_MAX as i64) as u32)
+                .unwrap_or_else(|| AudioConfig::default().warm_mic_secs),
+            pre_roll_ms: ed
+                .get_int("audio", "pre_roll_ms")
+                .map(|n| n.clamp(0, PRE_ROLL_MAX as i64) as u32)
+                .unwrap_or_else(|| AudioConfig::default().pre_roll_ms),
+            queue_dictations: ed.get_bool("audio", "queue_dictations").unwrap_or(false),
             max_duration_secs: ed
                 .get_int("audio", "max_duration_secs")
                 .map(|n| n.clamp(0, u32::MAX as i64) as u32)
@@ -216,6 +239,9 @@ impl AudioState {
             }
         };
         ed.set_string("audio", "device", &self.device);
+        ed.set_int("audio", "warm_mic_secs", self.warm_mic_secs as i64);
+        ed.set_int("audio", "pre_roll_ms", self.pre_roll_ms as i64);
+        ed.set_bool("audio", "queue_dictations", self.queue_dictations);
         ed.set_int("audio", "max_duration_secs", self.max_duration_secs as i64);
         ed.set_bool(
             "audio",
@@ -307,6 +333,17 @@ impl AudioState {
                     let new = (idx + delta).rem_euclid(self.device_choices.len() as i32);
                     self.device = self.device_choices[new as usize].clone();
                 }
+            }
+            Field::WarmMic => {
+                let next = self.warm_mic_secs as i32 + delta * WARM_MIC_STEP;
+                self.warm_mic_secs = next.clamp(0, WARM_MIC_MAX as i32) as u32;
+            }
+            Field::PreRoll => {
+                let next = self.pre_roll_ms as i32 + delta * PRE_ROLL_STEP;
+                self.pre_roll_ms = next.clamp(0, PRE_ROLL_MAX as i32) as u32;
+            }
+            Field::QueueDictations => {
+                self.queue_dictations = !self.queue_dictations;
             }
             Field::MaxDuration => {
                 let next = self.max_duration_secs as i32 + delta * DURATION_STEP as i32;
@@ -428,6 +465,26 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
                 Some(e) if e.field == Field::Device => e.input.caret_string(),
                 _ => state.device.clone(),
             },
+        ),
+        FormRowSpec::new(
+            state.field == Field::WarmMic,
+            "Keep mic open after a take",
+            if state.warm_mic_secs == 0 {
+                "off".to_string()
+            } else {
+                format!("{} s", state.warm_mic_secs)
+            },
+        ),
+        FormRowSpec::new(
+            state.field == Field::PreRoll,
+            "Pre-roll",
+            format!("{} ms", state.pre_roll_ms),
+        )
+        .dimmed(state.warm_mic_secs == 0),
+        FormRowSpec::new(
+            state.field == Field::QueueDictations,
+            "Record while transcribing",
+            yesno(state.queue_dictations),
         ),
         FormRowSpec::new(
             state.field == Field::MaxDuration,
@@ -560,6 +617,45 @@ fn guidance_for_field(state: &AudioState) -> Vec<Line<'_>> {
                 ),
             ]
         }
+        Field::WarmMic => vec![
+            heading("Keep mic open after a take"),
+            Line::from(""),
+            Line::from(
+                "Leaves the microphone open this many seconds after a \
+                 dictation stops. A dictation started in that window opens \
+                 instantly and starts with the pre-roll: what was said just \
+                 before the key went down.",
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Off by default. The microphone indicator stays lit while the \
+                 window is open; the pre-roll is only ever held in memory.",
+                Style::default().fg(Color::Gray),
+            )),
+        ],
+        Field::PreRoll => vec![
+            heading("Pre-roll"),
+            Line::from(""),
+            Line::from(
+                "How much sound from before the key a warm start keeps, so a \
+                 first word spoken with the press is not clipped. 250 ms is \
+                 the default.",
+            ),
+        ],
+        Field::QueueDictations => vec![
+            heading("Record while transcribing"),
+            Line::from(""),
+            Line::from(
+                "Lets you start the next dictation while the last one is \
+                 still being transcribed or cleaned up. Each take waits its \
+                 turn and is delivered in the order it was recorded.",
+            ),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Off by default: a start while one is in flight is ignored.",
+                Style::default().fg(Color::Gray),
+            )),
+        ],
         Field::MaxDuration => vec![
             heading("Max recording duration"),
             Line::from(""),
@@ -799,6 +895,9 @@ mod tests {
             .iter()
             .map(|f| match f {
                 Field::Device => "audio.device",
+                Field::WarmMic => "audio.warm_mic_secs",
+                Field::PreRoll => "audio.pre_roll_ms",
+                Field::QueueDictations => "audio.queue_dictations",
                 Field::MaxDuration => "audio.max_duration_secs",
                 Field::KeepFailedRecordings => "audio.keep_failed_recordings",
                 Field::PauseMedia => "audio.pause_media",

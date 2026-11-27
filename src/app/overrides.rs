@@ -305,6 +305,11 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(value) = cli.pre_roll_ms {
         config.audio.pre_roll_ms = value;
     }
+    apply_bool_override(
+        &mut config.audio.queue_dictations,
+        cli.queue_dictations,
+        cli.no_queue_dictations,
+    );
     if let Some(max_dur) = cli.max_duration {
         config.audio.max_duration_secs = max_dur;
     }

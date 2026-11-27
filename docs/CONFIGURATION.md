@@ -569,6 +569,29 @@ milliseconds of preceding sound (default **250**). The privacy indicator can
 stay lit until the window expires. The pre-roll is held in memory. Meeting
 recordings and soundchecks use their own capture lifetimes.
 
+Environment: `VOXTYPE_WARM_MIC_SECS`, `VOXTYPE_PRE_ROLL_MS`. CLI:
+`--warm-mic-secs`, `--pre-roll-ms`.
+
+### queue_dictations
+
+**Type:** Boolean
+**Default:** `false`
+
+Lets a new dictation record while the previous one is still transcribing or
+being delivered. Each overlapping take waits in memory and is delivered in
+recording order, through batch transcription.
+
+When off, a start while a dictation is still transcribing or being delivered
+is ignored, as it always was.
+
+```toml
+[audio]
+queue_dictations = true
+```
+
+Environment: `VOXTYPE_QUEUE_DICTATIONS=true`. CLI: `--queue-dictations`,
+`--no-queue-dictations`.
+
 ### max_duration_secs
 
 **Type:** Integer

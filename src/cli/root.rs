@@ -298,6 +298,19 @@ pub struct Cli {
     )]
     pub pre_roll_ms: Option<u32>,
 
+    /// Record a new dictation while the last one is still being transcribed
+    #[arg(long, help_heading = "Audio", hide_short_help = true)]
+    pub queue_dictations: bool,
+
+    /// Wait for a dictation to be delivered before another can record (default)
+    #[arg(
+        long,
+        help_heading = "Audio",
+        hide_short_help = true,
+        conflicts_with = "queue_dictations"
+    )]
+    pub no_queue_dictations: bool,
+
     /// Maximum recording duration in seconds (safety limit)
     #[arg(
         long,
@@ -908,6 +921,18 @@ mod tests {
     // =========================================================================
     // Engine flag tests
     // =========================================================================
+
+    #[test]
+    fn queue_dictations_flags_parse_and_conflict() {
+        let cli = Cli::parse_from(["voxtype"]);
+        assert!(!cli.queue_dictations && !cli.no_queue_dictations);
+        assert!(Cli::parse_from(["voxtype", "--queue-dictations"]).queue_dictations);
+        assert!(Cli::parse_from(["voxtype", "--no-queue-dictations"]).no_queue_dictations);
+        assert!(
+            Cli::try_parse_from(["voxtype", "--queue-dictations", "--no-queue-dictations"])
+                .is_err()
+        );
+    }
 
     #[test]
     fn keep_failed_recordings_flags_parse_and_conflict() {

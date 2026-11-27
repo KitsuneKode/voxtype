@@ -263,6 +263,9 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     {
         config.audio.pre_roll_ms = value;
     }
+    if let Ok(val) = std::env::var("VOXTYPE_QUEUE_DICTATIONS") {
+        config.audio.queue_dictations = parse_bool_env(&val);
+    }
     if let Ok(val) = std::env::var("VOXTYPE_MAX_DURATION_SECS") {
         if let Ok(n) = val.parse::<u32>() {
             config.audio.max_duration_secs = n;
