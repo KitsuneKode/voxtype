@@ -569,6 +569,10 @@ milliseconds of preceding sound (default **250**). The privacy indicator can
 stay lit until the window expires. The pre-roll is held in memory. Meeting
 recordings and soundchecks use their own capture lifetimes.
 
+Both are capped: `warm_mic_secs` at 120 and `pre_roll_ms` at 2000.
+`voxtype config set` refuses a larger value, and one set in the file, the
+environment or on the command line is treated as the cap.
+
 Environment: `VOXTYPE_WARM_MIC_SECS`, `VOXTYPE_PRE_ROLL_MS`. CLI:
 `--warm-mic-secs`, `--pre-roll-ms`.
 

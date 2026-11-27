@@ -119,11 +119,10 @@ const DUCK_VOLUME_STEP: i32 = 5;
 /// `audio::media`, so every stop lands on a value that produces whole steps.
 const DUCK_FADE_STEP: i32 = 50;
 const DUCK_FADE_MAX: u32 = 2000;
-/// Upper stops for the warm window and pre-roll cyclers.
 const WARM_MIC_STEP: i32 = 1;
-const WARM_MIC_MAX: u32 = 120;
+const WARM_MIC_MAX: u32 = crate::config::MAX_WARM_MIC_SECS;
 const PRE_ROLL_STEP: i32 = 50;
-const PRE_ROLL_MAX: u32 = 2000;
+const PRE_ROLL_MAX: u32 = crate::config::MAX_PRE_ROLL_MS;
 
 impl AudioState {
     pub fn load() -> Result<Self, EditorError> {

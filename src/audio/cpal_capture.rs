@@ -266,11 +266,9 @@ impl AudioCapture for CpalCapture {
         // handing back a receiver that never yields a sample.
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-        let warm_window = self
-            .warm
-            .as_ref()
-            .map(|_| Duration::from_secs(self.config.warm_mic_secs.into()));
-        let limit = (u64::from(source_sample_rate) * u64::from(self.config.pre_roll_ms) / 1000)
+        let warm_window = self.warm.as_ref().map(|_| self.config.warm_mic_window());
+        let limit = (u64::from(source_sample_rate) * self.config.pre_roll().as_millis() as u64
+            / 1000)
             .try_into()
             .unwrap_or(usize::MAX);
         // Spawn audio capture thread

@@ -1087,7 +1087,10 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "audio.warm_mic_secs",
         "audio",
         "warm_mic_secs",
-        KeyType::Int { min: 0, max: u32::MAX as i64 },
+        KeyType::Int {
+            min: 0,
+            max: crate::config::MAX_WARM_MIC_SECS as i64,
+        },
         "Audio",
         "Warm mic secs",
         "Time to keep the microphone open after a dictation (0 disables).",
@@ -1096,7 +1099,10 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "audio.pre_roll_ms",
         "audio",
         "pre_roll_ms",
-        KeyType::Int { min: 0, max: u32::MAX as i64 },
+        KeyType::Int {
+            min: 0,
+            max: crate::config::MAX_PRE_ROLL_MS as i64,
+        },
         "Audio",
         "Pre roll ms",
         "Audio to retain before the next warm start, in milliseconds.",
@@ -4383,6 +4389,32 @@ mod tests {
         ed.save().unwrap();
         let cfg = load_config(Some(&path)).unwrap();
         assert!(!cfg.text.replacements.contains_key("btw"));
+    }
+
+    #[test]
+    fn warm_mic_keys_are_capped() {
+        let spec = |key| scalar_keys().find(|s| s.key == key).unwrap();
+        for (key, cap) in [
+            ("audio.warm_mic_secs", crate::config::MAX_WARM_MIC_SECS),
+            ("audio.pre_roll_ms", crate::config::MAX_PRE_ROLL_MS),
+        ] {
+            assert!(validate_value(spec(key), &cap.to_string()).is_ok(), "{key}");
+            assert!(
+                validate_value(spec(key), &(cap + 1).to_string()).is_err(),
+                "{key}"
+            );
+        }
+        let mut audio = crate::config::AudioConfig {
+            warm_mic_secs: 3600,
+            pre_roll_ms: 60_000,
+            ..Default::default()
+        };
+        assert_eq!(audio.warm_mic_window(), std::time::Duration::from_secs(120));
+        assert_eq!(audio.pre_roll(), std::time::Duration::from_millis(2000));
+        audio.warm_mic_secs = 3;
+        audio.pre_roll_ms = 250;
+        assert_eq!(audio.warm_mic_window(), std::time::Duration::from_secs(3));
+        assert_eq!(audio.pre_roll(), std::time::Duration::from_millis(250));
     }
 
     #[test]

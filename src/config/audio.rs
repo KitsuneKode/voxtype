@@ -140,6 +140,25 @@ fn default_audio_sample_rate() -> u32 {
     16000
 }
 
+/// Longest warm window, in seconds. The microphone stays open (and its
+/// indicator lit) for this long at most after a dictation.
+pub const MAX_WARM_MIC_SECS: u32 = 120;
+/// Longest pre-roll, in milliseconds: enough for a first syllable, not a
+/// recording of the room.
+pub const MAX_PRE_ROLL_MS: u32 = 2000;
+
+impl AudioConfig {
+    /// `warm_mic_secs`, held to [`MAX_WARM_MIC_SECS`] whatever set it.
+    pub fn warm_mic_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.warm_mic_secs.min(MAX_WARM_MIC_SECS).into())
+    }
+
+    /// `pre_roll_ms`, held to [`MAX_PRE_ROLL_MS`] whatever set it.
+    pub fn pre_roll(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.pre_roll_ms.min(MAX_PRE_ROLL_MS).into())
+    }
+}
+
 fn default_pre_roll_ms() -> u32 {
     250
 }

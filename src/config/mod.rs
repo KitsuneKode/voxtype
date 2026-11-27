@@ -27,7 +27,7 @@ pub(crate) mod text;
 mod vad;
 mod whisper;
 
-pub use audio::{AudioConfig, AudioFeedbackConfig};
+pub use audio::{AudioConfig, AudioFeedbackConfig, MAX_PRE_ROLL_MS, MAX_WARM_MIC_SECS};
 pub use default_config::{default_config_content, DEFAULT_CONFIG};
 pub use engines::{
     openvino_driver_packages, CohereConfig, DolphinConfig, GgufConfig, MoonshineConfig,
