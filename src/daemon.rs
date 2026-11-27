@@ -6563,6 +6563,9 @@ impl Daemon {
             "Recovering a cancelled take ({:.1}s)",
             samples.len() as f32 / 16000.0
         );
+        // The take's options are settled now, as at any stop: a queued take
+        // that starts while this one transcribes reads its own.
+        self.freeze_take();
         *state = State::Transcribing {
             audio: samples.clone(),
         };

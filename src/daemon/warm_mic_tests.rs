@@ -601,3 +601,41 @@ async fn a_full_queue_refuses_another_start() {
         })
         .await;
 }
+
+/// `record recover` settles its options when it starts, as a stop does, so a
+/// queued take that writes its own while the recovered one transcribes
+/// neither takes them nor gives it its own.
+#[tokio::test]
+async fn a_recovered_take_keeps_its_own_options() {
+    const NAME: &str = "daemon::tests::history_contracts::a_recovered_take_keeps_its_own_options";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (mut daemon, heard) = quiet_daemon(root.path());
+    let runtime = Config::runtime_dir();
+    std::fs::create_dir_all(&runtime).unwrap();
+    assert!(crate::cancelled_take::keep(&vec![0.2; 48000]));
+    let recovered = root.path().join("recovered.txt");
+    let output = runtime.join("output_mode_override");
+    std::fs::write(&output, format!("file:{}", recovered.display())).unwrap();
+
+    let mut state = State::Idle;
+    daemon.recover_cancelled_take(&mut state).await;
+    assert!(matches!(state, State::Transcribing { .. }));
+    assert_eq!(
+        daemon.frozen.as_ref().and_then(|o| o.output.clone()),
+        Some(OutputOverride::FileWithPath(recovered.clone()))
+    );
+    assert!(!output.exists(), "read when the recovery started");
+
+    std::fs::write(&output, "clipboard").unwrap();
+    let result = daemon.transcription_task.take().unwrap().await;
+    daemon.handle_transcription_result(&mut state, result).await;
+    assert_eq!(heard.takes().len(), 1);
+    assert!(std::fs::read_to_string(&recovered)
+        .unwrap()
+        .to_lowercase()
+        .contains("heard"));
+    assert_eq!(std::fs::read_to_string(&output).unwrap(), "clipboard");
+}
