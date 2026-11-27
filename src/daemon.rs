@@ -6664,9 +6664,11 @@ impl Daemon {
         let audio_duration = samples.len() as f32 / 16000.0;
         self.history_note(|p| p.transcribing(samples.len()));
 
-        // Skip if too short (likely accidental press)
-        if audio_duration < 0.3 {
-            tracing::debug!("Recording too short ({:.2}s), ignoring", audio_duration);
+        // Skip if too short (likely accidental press). Pre-roll is sound from
+        // before the key went down, so it does not make a tap long enough.
+        let pressed = samples.len().saturating_sub(self.pre_roll_samples) as f32 / 16000.0;
+        if pressed < 0.3 {
+            tracing::debug!("Recording too short ({:.2}s), ignoring", pressed);
             self.publish_empty_outcome();
             self.publish_osd_outcome(osd::session::OutcomeKind::TooShort, 0);
             self.reset_to_idle(state).await;
@@ -9030,6 +9032,7 @@ impl Drop for AbortOnDrop {
 mod tests {
     mod history_contracts {
         include!("daemon/queued_dictation_tests.rs");
+        include!("daemon/warm_mic_tests.rs");
         include!("daemon/history_contract_tests.rs");
     }
 
