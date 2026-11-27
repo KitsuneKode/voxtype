@@ -7738,6 +7738,7 @@ impl Daemon {
         // Clean up any stale cancel and profile override files from previous runs
         cleanup_cancel_file();
         mark_live_in_field(false);
+        crate::cancelled_take::sweep();
         // The GGUF worker rewrites this once it has bound a backend; a report
         // from a previous daemon must not describe this one.
         let _ =

@@ -122,6 +122,15 @@ fn read(p: &std::path::Path) -> Option<Vec<f32>> {
 }
 
 /// Remove a kept take, if any.
+/// At start: a take older than its window (the daemon ended before its timer) goes.
+pub fn sweep() {
+    if let Some(p) = path() {
+        if p.exists() && !fresh(&p) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
 pub fn forget() {
     if let Some(p) = path() {
         let _ = std::fs::remove_file(p);
@@ -146,6 +155,20 @@ mod tests {
 
     fn tone(secs: f32, amp: f32) -> Vec<f32> {
         (0..(secs * RATE as f32) as usize).map(|i| amp * (i as f32 * 0.05).sin()).collect()
+    }
+
+    #[test]
+    fn an_old_take_is_swept_at_start() {
+        let dir = std::env::temp_dir().join(format!("vt-sweep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("cancelled.wav");
+        std::fs::write(&p, b"x").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(KEEP_SECS + 60);
+        std::fs::File::options().write(true).open(&p).unwrap().set_modified(old).unwrap();
+        assert!(!fresh(&p));
+        std::fs::write(dir.join("new.wav"), b"x").unwrap();
+        assert!(fresh(&dir.join("new.wav")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
