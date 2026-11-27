@@ -578,6 +578,19 @@ async fn keep_cancelled_take(samples: Vec<f32>) -> bool {
     kept
 }
 
+/// `live_in_field` in the runtime dir says the take's words are showing in the
+/// focused field (as preedit), so a status pill can leave them out.
+fn mark_live_in_field(on: bool) {
+    let path = Config::runtime_dir().join("live_in_field");
+    if on {
+        if !path.exists() {
+            let _ = std::fs::write(&path, "1");
+        }
+    } else if path.exists() {
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 /// Whether `voxtype record recover` asked for the cancelled take (consumes the trigger).
 fn take_recover_request() -> bool {
     let file = Config::runtime_dir().join("recover");
@@ -3550,6 +3563,7 @@ impl Daemon {
         if self.preedit_take {
             if let Some(preedit) = &self.preedit {
                 preedit.set(text);
+                mark_live_in_field(preedit.text_input_active());
             }
         }
     }
@@ -3557,6 +3571,7 @@ impl Daemon {
     /// Clear this take's preedit; the binding stays on the field a while
     /// for edit learning (see `output::preedit::LINGER`).
     fn end_preedit(&mut self) {
+        mark_live_in_field(false);
         if std::mem::take(&mut self.preedit_take) | std::mem::take(&mut self.field_take) {
             if let Some(preedit) = &self.preedit {
                 preedit.end();
@@ -3566,6 +3581,7 @@ impl Daemon {
 
     /// A cancelled take: clear the preedit and release the input method now.
     fn release_preedit(&mut self) {
+        mark_live_in_field(false);
         if std::mem::take(&mut self.preedit_take) | std::mem::take(&mut self.field_take) {
             if let Some(preedit) = &self.preedit {
                 preedit.release();
@@ -7721,6 +7737,7 @@ impl Daemon {
 
         // Clean up any stale cancel and profile override files from previous runs
         cleanup_cancel_file();
+        mark_live_in_field(false);
         // The GGUF worker rewrites this once it has bound a backend; a report
         // from a previous daemon must not describe this one.
         let _ =
