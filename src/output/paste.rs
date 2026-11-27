@@ -481,16 +481,9 @@ impl PasteOutput {
         }
 
         let types_str = String::from_utf8_lossy(&types_output.stdout);
-        let mime_type = types_str
-            .lines()
-            .next()
-            .unwrap_or("text/plain")
-            .trim()
-            .to_string();
-
-        if mime_type.is_empty() {
+        let Some(mime_type) = best_mime(&types_str) else {
             return Ok(None);
-        }
+        };
 
         // Read the actual content
         let content_output = Command::new("wl-paste")
@@ -1027,7 +1020,8 @@ impl TextOutput for PasteOutput {
             self.send_enter().await?;
         }
 
-        // Restore original clipboard content if we saved something
+        // Restore original clipboard content if we saved something, and only
+        // while the clipboard still holds this dictation (a copy made since wins).
         if let Some(content) = original_clipboard {
             // Wait for paste to complete before restoring
             tokio::time::sleep(std::time::Duration::from_millis(
@@ -1035,12 +1029,16 @@ impl TextOutput for PasteOutput {
             ))
             .await;
 
-            match self.restore_clipboard_content(&content).await {
-                Ok(()) => {
-                    tracing::debug!("Restored original clipboard content");
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to restore clipboard content: {}", e);
+            if !clipboard_holds(&text_to_paste).await {
+                tracing::debug!("Clipboard changed since the paste; leaving it as it is");
+            } else {
+                match self.restore_clipboard_content(&content).await {
+                    Ok(()) => {
+                        tracing::debug!("Restored original clipboard content");
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to restore clipboard content: {}", e);
+                    }
                 }
             }
         }
@@ -1122,8 +1120,46 @@ impl TextOutput for PasteOutput {
     }
 }
 
+/// The type a clipboard snapshot keeps when it can keep only one (wl-copy offers one
+/// type per owner): a picture before its link or markup, real UTF-8 text before the
+/// legacy X names, else whatever came first.
+fn best_mime(types: &str) -> Option<String> {
+    let list: Vec<&str> = types.lines().map(str::trim).filter(|t| !t.is_empty()).collect();
+    let pick = |want: &dyn Fn(&str) -> bool| list.iter().find(|t| want(t)).map(|t| t.to_string());
+    pick(&|t| t == "image/png")
+        .or_else(|| pick(&|t| t.starts_with("image/")))
+        .or_else(|| pick(&|t| t == "text/uri-list"))
+        .or_else(|| pick(&|t| t == "text/plain;charset=utf-8"))
+        .or_else(|| pick(&|t| t == "text/plain"))
+        .or_else(|| list.first().map(|t| t.to_string()))
+}
+
+/// Does the clipboard still hold exactly `text` (our paste), so restoring cannot
+/// clobber something copied since?
+async fn clipboard_holds(text: &str) -> bool {
+    match Command::new("wl-paste")
+        .args(["--no-newline", "--type", "text/plain"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .await
+    {
+        Ok(out) if out.status.success() => out.stdout == text.as_bytes(),
+        _ => detect() == DisplaySession::X11,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_snapshot_keeps_the_picture_before_its_link_and_utf8_before_legacy_text() {
+        assert_eq!(super::best_mime("text/html\nimage/png\ntext/plain").as_deref(), Some("image/png"));
+        assert_eq!(super::best_mime("text/html\nimage/jpeg").as_deref(), Some("image/jpeg"));
+        assert_eq!(super::best_mime("UTF8_STRING\nTEXT\ntext/plain;charset=utf-8\ntext/plain").as_deref(), Some("text/plain;charset=utf-8"));
+        assert_eq!(super::best_mime("application/x-thing").as_deref(), Some("application/x-thing"));
+        assert_eq!(super::best_mime("  \n"), None);
+    }
+
     use super::*;
 
     #[test]
