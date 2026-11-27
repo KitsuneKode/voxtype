@@ -8916,6 +8916,7 @@ impl Daemon {
         if let Some(mut capture) = audio_capture.take() {
             let _ = capture.stop().await;
         }
+        self.mic.close().await;
         self.restore_recording_media_before_exit().await;
         if let Some(preedit) = &self.preedit {
             // A hung compositor must not hold up the exit.

@@ -45,12 +45,37 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// wakes the capture thread, even when it is waiting on a long deadline.
 #[derive(Clone, Default)]
 pub(crate) struct DictationMic {
-    parked: Arc<Mutex<Option<std::sync::mpsc::Sender<CaptureCommand>>>>,
+    parked: Arc<Mutex<Option<Parked>>>,
     #[cfg(test)]
     pub(crate) fixtures: Arc<Mutex<std::collections::VecDeque<Box<dyn AudioCapture>>>>,
 }
 
+/// A warm stream between takes: its capture thread and the way to reach it.
+struct Parked {
+    commands: std::sync::mpsc::Sender<CaptureCommand>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
 impl DictationMic {
+    /// Close a warm stream now rather than at the end of its window, and
+    /// wait (at most a second) for its thread to release the device: the
+    /// daemon exits without unwinding, which would cut that short.
+    pub(crate) async fn close(&self) {
+        let Some(Parked { commands, thread }) = lock(&self.parked).take() else {
+            return;
+        };
+        drop(commands);
+        if let Some(thread) = thread {
+            let joined = tokio::task::spawn_blocking(move || thread.join());
+            if tokio::time::timeout(Duration::from_secs(1), joined)
+                .await
+                .is_err()
+            {
+                tracing::warn!("The warm microphone did not close within a second");
+            }
+        }
+    }
+
     pub(crate) fn capture(
         &self,
         config: &AudioConfig,
@@ -179,16 +204,17 @@ impl AudioCapture for CpalCapture {
 
         let (chunk_tx, chunk_rx) = mpsc::channel(64);
         if let Some(warm) = &self.warm {
-            let sender = lock(&warm.parked).take();
-            if let Some(sender) = sender {
+            let parked = lock(&warm.parked).take();
+            if let Some(Parked { commands, thread }) = parked {
                 let (ready, resumed) = oneshot::channel();
-                if sender
+                if commands
                     .send(CaptureCommand::Resume(chunk_tx.clone(), ready))
                     .is_ok()
                 {
                     if let Ok(prefix) = resumed.await {
                         self.prefix = prefix;
-                        self.cmd_tx = Some(sender);
+                        self.cmd_tx = Some(commands);
+                        self.thread_handle = thread;
                         return Ok(chunk_rx);
                     }
                 }
@@ -395,8 +421,10 @@ impl AudioCapture for CpalCapture {
                 match tokio::time::timeout(std::time::Duration::from_secs(2), response_rx).await {
                     Ok(Ok(samples)) => {
                         if let Some(warm) = &self.warm {
-                            *lock(&warm.parked) = Some(cmd_tx);
-                            self.thread_handle.take();
+                            *lock(&warm.parked) = Some(Parked {
+                                commands: cmd_tx,
+                                thread: self.thread_handle.take(),
+                            });
                         }
                         samples
                     }
@@ -548,9 +576,39 @@ mod tests {
         })
         .join();
         assert!(mic.parked.is_poisoned());
-        let (tx, _rx) = std::sync::mpsc::channel();
-        *lock(&mic.parked) = Some(tx);
+        let (commands, _rx) = std::sync::mpsc::channel();
+        *lock(&mic.parked) = Some(Parked {
+            commands,
+            thread: None,
+        });
         assert!(lock(&mic.parked).take().is_some());
+    }
+
+    /// Shutdown closes a warm stream and waits for its thread, instead of
+    /// leaving it to the end of its window.
+    #[tokio::test]
+    async fn closing_the_mic_ends_a_warm_stream_and_waits_for_it() {
+        use super::*;
+        let mic = DictationMic::default();
+        mic.close().await;
+        let (commands, rx) = std::sync::mpsc::channel::<CaptureCommand>();
+        let released = Arc::new(AtomicBool::new(false));
+        let flag = released.clone();
+        let thread = thread::spawn(move || {
+            serve_stream(rx, Some(Duration::from_secs(3600)), |_| StreamState::Warm);
+            thread::sleep(Duration::from_millis(50));
+            flag.store(true, Ordering::SeqCst);
+        });
+        *lock(&mic.parked) = Some(Parked {
+            commands,
+            thread: Some(thread),
+        });
+        mic.close().await;
+        assert!(
+            released.load(Ordering::SeqCst),
+            "joined before close returned"
+        );
+        assert!(lock(&mic.parked).is_none());
     }
 
     #[test]
