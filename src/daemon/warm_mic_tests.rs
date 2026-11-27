@@ -82,3 +82,16 @@ async fn too_short_guard_does_not_count_pre_roll() {
     let lengths: Vec<usize> = heard.takes().iter().map(Vec::len).collect();
     assert_eq!(lengths, [pre_roll + 4800, 4960], "pre-roll is still transcribed");
 }
+
+/// whisper-cli is handed audio on stdin only when a take can hold pre-roll.
+#[test]
+fn whisper_cli_gets_stdin_audio_only_with_a_warm_mic() {
+    for (warm, over_stdin) in [(0, false), (3, true)] {
+        let mut config = Config::default();
+        config.audio.feedback.enabled = false;
+        config.state_file = None;
+        config.audio.warm_mic_secs = warm;
+        let daemon = Daemon::new(config, None);
+        assert_eq!(daemon.config.whisper.audio_over_stdin, over_stdin, "warm_mic_secs = {warm}");
+    }
+}

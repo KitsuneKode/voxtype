@@ -31,6 +31,9 @@ pub struct CliTranscriber {
     initial_prompt: Option<String>,
     /// Profile vocabulary selected for the current recording.
     active_vocabulary: Mutex<Vec<String>>,
+    /// Pipe the audio to whisper-cli (`--file -`) instead of writing a
+    /// temporary WAV: on when a take can hold warm-mic pre-roll.
+    audio_over_stdin: bool,
 }
 
 /// JSON output structure from whisper-cli
@@ -126,7 +129,45 @@ impl CliTranscriber {
             threads,
             initial_prompt: config.initial_prompt.clone(),
             active_vocabulary: Mutex::new(Vec::new()),
+            audio_over_stdin: config.audio_over_stdin,
         })
+    }
+
+    /// Write audio samples to a temporary WAV file
+    fn write_temp_wav(&self, samples: &[f32]) -> Result<tempfile::NamedTempFile, TranscribeError> {
+        let temp_file = tempfile::Builder::new()
+            .prefix("voxtype_")
+            .suffix(".wav")
+            .tempfile()
+            .map_err(|e| {
+                TranscribeError::AudioFormat(format!("Failed to create temp file: {}", e))
+            })?;
+
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        let mut writer = hound::WavWriter::create(temp_file.path(), spec).map_err(|e| {
+            TranscribeError::AudioFormat(format!("Failed to create WAV writer: {}", e))
+        })?;
+
+        for &sample in samples {
+            // Convert f32 [-1.0, 1.0] to i16
+            let clamped = sample.clamp(-1.0, 1.0);
+            let scaled = (clamped * 32767.0) as i16;
+            writer.write_sample(scaled).map_err(|e| {
+                TranscribeError::AudioFormat(format!("Failed to write sample: {}", e))
+            })?;
+        }
+
+        writer
+            .finalize()
+            .map_err(|e| TranscribeError::AudioFormat(format!("Failed to finalize WAV: {}", e)))?;
+
+        Ok(temp_file)
     }
 
     /// Encode the recording for whisper-cli's stdin. A take may contain
@@ -200,7 +241,12 @@ impl CliTranscriber {
             samples.len()
         );
 
-        let wav = Self::wav(samples)?;
+        // Write audio to temp WAV file, unless it may hold pre-roll
+        let (temp_wav, wav) = if self.audio_over_stdin {
+            (None, Some(Self::wav(samples)?))
+        } else {
+            (Some(self.write_temp_wav(samples)?), None)
+        };
 
         // Create temp file for JSON output
         let temp_json = tempfile::Builder::new()
@@ -221,7 +267,11 @@ impl CliTranscriber {
         cmd.arg("--model")
             .arg(&self.model_path)
             .arg("--file")
-            .arg("-")
+            .arg(
+                temp_wav
+                    .as_ref()
+                    .map_or(std::ffi::OsStr::new("-"), |f| f.path().as_os_str()),
+            )
             .arg("--output-json")
             .arg("--output-file")
             .arg(output_base)
@@ -254,24 +304,16 @@ impl CliTranscriber {
         tracing::debug!("Running whisper-cli: {:?}", cmd);
 
         // Run whisper-cli
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                TranscribeError::InferenceFailed(format!("Failed to run whisper-cli: {e}"))
-            })?;
-        let mut input = child.stdin.take().expect("piped child stdin");
-        let output = std::thread::scope(|scope| {
-            let writer = scope.spawn(move || std::io::Write::write_all(&mut input, &wav));
-            let output = child.wait_with_output()?;
-            if output.status.success() {
-                writer.join().expect("WAV writer panicked")?;
-            }
-            Ok::<_, std::io::Error>(output)
-        })
-        .map_err(|e| TranscribeError::InferenceFailed(format!("whisper-cli I/O: {e}")))?;
+        let output = match wav {
+            Some(wav) => run_with_stdin(&mut cmd, &wav)?,
+            None => cmd
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|e| {
+                    TranscribeError::InferenceFailed(format!("Failed to run whisper-cli: {}", e))
+                })?,
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -294,6 +336,33 @@ impl CliTranscriber {
             TranscribeError::InferenceFailed(format!("Failed to parse JSON output: {}", e))
         })
     }
+}
+
+/// Run `cmd` with `wav` written to its stdin while its output is read.
+/// A whisper-cli (or wrapper) that succeeds without reading all of stdin
+/// closes the pipe early; that broken pipe is not a failure.
+fn run_with_stdin(cmd: &mut Command, wav: &[u8]) -> Result<std::process::Output, TranscribeError> {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| TranscribeError::InferenceFailed(format!("Failed to run whisper-cli: {e}")))?;
+    let mut input = child.stdin.take().expect("piped child stdin");
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(move || std::io::Write::write_all(&mut input, wav));
+        let output = child.wait_with_output()?;
+        let written = writer
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("WAV writer panicked")));
+        match written {
+            Err(e) if output.status.success() && e.kind() != std::io::ErrorKind::BrokenPipe => {
+                Err(e)
+            }
+            _ => Ok(output),
+        }
+    })
+    .map_err(|e| TranscribeError::InferenceFailed(format!("whisper-cli I/O: {e}")))
 }
 
 /// Resolve whisper-cli path
@@ -463,7 +532,7 @@ mod tests {
         crate::test_support::write_script(
             &cli,
             &format!(
-                "#!/bin/sh\ncat >/dev/null\necho run >> {runs}\nwhile [ $# -gt 0 ]; do \
+                "#!/bin/sh\necho run >> {runs}\nwhile [ $# -gt 0 ]; do \
                  [ \"$1\" = --output-file ] && cp {json} \"$2.json\"; shift; done\n",
                 runs = runs.display(),
                 json = json.display()
@@ -477,6 +546,7 @@ mod tests {
             threads: 1,
             initial_prompt: None,
             active_vocabulary: Mutex::new(Vec::new()),
+            audio_over_stdin: false,
         };
         let audio = vec![0.0f32; 16000 * 10];
         assert_eq!(t.transcribe_timed(&audio).unwrap().len(), 3);
@@ -486,5 +556,97 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&runs).unwrap().lines().count(), 2);
         assert!(t.transcribe_timed(&[]).is_err());
+    }
+
+    /// A fake whisper-cli in `dir` that runs `stdin` first, keeps what
+    /// `--file` named in `dir/arg` (and that file's bytes in `dir/seen.wav`),
+    /// writes the JSON and exits with `status`.
+    fn fake_cli(
+        dir: &std::path::Path,
+        stdin: &str,
+        status: u8,
+        over_stdin: bool,
+    ) -> CliTranscriber {
+        let json = dir.join("out.json");
+        std::fs::write(&json, JSON).unwrap();
+        let cli = dir.join("whisper-cli");
+        crate::test_support::write_script(
+            &cli,
+            &format!(
+                "#!/bin/sh\n{stdin}\nwhile [ $# -gt 0 ]; do case \"$1\" in \
+                 --file) printf %s \"$2\" > {dir}/arg; [ \"$2\" = - ] || cp \"$2\" {dir}/seen.wav ;; \
+                 --output-file) cp {json} \"$2.json\" ;; esac; shift; done\nexit {status}\n",
+                dir = dir.display(),
+                json = json.display()
+            ),
+        );
+        CliTranscriber {
+            cli_path: cli,
+            model_path: dir.join("model.bin"),
+            language: "en".into(),
+            translate: false,
+            threads: 1,
+            initial_prompt: None,
+            active_vocabulary: Mutex::new(Vec::new()),
+            audio_over_stdin: over_stdin,
+        }
+    }
+
+    const TRANSCRIPT: &str = "Hello there. See you at three. ... Bye.";
+
+    /// Without a warm microphone a wrapper still gets a WAV path, holding
+    /// the same bytes as before, and the file is gone after the run.
+    #[test]
+    fn without_warm_mic_whisper_cli_reads_a_temporary_wav() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let t = fake_cli(dir.path(), ":", 0, false);
+        let audio: Vec<f32> = (0..16000).map(|i| (i as f32 / 100.0).sin() * 0.5).collect();
+        assert_eq!(t.transcribe(&audio).unwrap(), TRANSCRIPT);
+        let arg = std::fs::read_to_string(dir.path().join("arg")).unwrap();
+        assert!(arg.ends_with(".wav") && arg.contains("voxtype_"), "{arg}");
+        assert!(!std::path::Path::new(&arg).exists());
+        let seen = std::fs::read(dir.path().join("seen.wav")).unwrap();
+        assert_eq!(seen, CliTranscriber::wav(&audio).unwrap());
+    }
+
+    /// With a warm microphone the same bytes go over stdin and no audio
+    /// file is named.
+    #[test]
+    fn with_warm_mic_whisper_cli_reads_the_wav_on_stdin() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let seen = dir.path().join("seen.wav");
+        let t = fake_cli(dir.path(), &format!("cat > {}", seen.display()), 0, true);
+        let audio: Vec<f32> = (0..16000).map(|i| (i as f32 / 100.0).sin() * 0.5).collect();
+        assert_eq!(t.transcribe(&audio).unwrap(), TRANSCRIPT);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("arg")).unwrap(),
+            "-"
+        );
+        assert_eq!(
+            std::fs::read(&seen).unwrap(),
+            CliTranscriber::wav(&audio).unwrap()
+        );
+    }
+
+    /// A child that succeeds without draining stdin breaks the pipe (10 s of
+    /// audio is far more than a pipe holds): its transcript still counts.
+    /// One that fails is reported as a whisper-cli failure, not as I/O.
+    #[test]
+    fn a_broken_pipe_is_not_an_error_when_whisper_cli_succeeds() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = vec![0.1f32; 16000 * 10];
+        let t = fake_cli(dir.path(), "exec 0<&-", 0, true);
+        assert_eq!(t.transcribe(&audio).unwrap(), TRANSCRIPT);
+        let t = fake_cli(
+            dir.path(),
+            "exec 0<&-; echo model missing >&2; exit 3",
+            0,
+            true,
+        );
+        let error = t.transcribe(&audio).unwrap_err().to_string();
+        assert!(
+            error.contains("whisper-cli failed") && error.contains("model missing"),
+            "{error}"
+        );
     }
 }

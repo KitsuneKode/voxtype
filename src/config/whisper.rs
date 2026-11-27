@@ -238,6 +238,12 @@ pub struct WhisperConfig {
     /// Used when mode = "cli"
     #[serde(default)]
     pub whisper_cli_path: Option<String>,
+
+    /// Set by the daemon when `[audio] warm_mic_secs` is on, never read from
+    /// a file. A take can then hold pre-roll, so whisper-cli gets its audio
+    /// on stdin rather than from a temporary WAV.
+    #[serde(skip)]
+    pub audio_over_stdin: bool,
 }
 
 impl WhisperConfig {
@@ -306,6 +312,7 @@ impl Default for WhisperConfig {
             remote_timeout_secs: None,
             remote_send_auto_language: false,
             whisper_cli_path: None,
+            audio_over_stdin: false,
         }
     }
 }

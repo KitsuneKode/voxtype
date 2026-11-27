@@ -1757,7 +1757,8 @@ impl Daemon {
         }
     }
 
-    pub fn new(config: Config, config_path: Option<PathBuf>) -> Self {
+    pub fn new(mut config: Config, config_path: Option<PathBuf>) -> Self {
+        config.whisper.audio_over_stdin = config.audio.warm_mic_secs > 0;
         let state_file_path = config.resolve_state_file();
         let preedit = (config.output.preedit || config.output.read_field)
             .then(output::preedit::PreeditHandle::wayland)
