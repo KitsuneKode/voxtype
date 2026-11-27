@@ -280,6 +280,24 @@ pub struct Cli {
     #[arg(long, value_name = "DEVICE", help_heading = "Audio")]
     pub audio_device: Option<String>,
 
+    /// Time to keep the microphone open after a dictation (0 disables)
+    #[arg(
+        long,
+        value_name = "SECS",
+        help_heading = "Audio",
+        hide_short_help = true
+    )]
+    pub warm_mic_secs: Option<u32>,
+
+    /// Audio to retain before the next warm start, in milliseconds
+    #[arg(
+        long,
+        value_name = "MS",
+        help_heading = "Audio",
+        hide_short_help = true
+    )]
+    pub pre_roll_ms: Option<u32>,
+
     /// Maximum recording duration in seconds (safety limit)
     #[arg(
         long,

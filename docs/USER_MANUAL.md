@@ -992,6 +992,9 @@ sample_rate = 16000
 
 # Maximum recording duration in seconds (safety limit)
 # Recording automatically stops and transcribes after this time
+# Keep the mic ready briefly between takes (default 0 seconds).
+# warm_mic_secs = 3
+# pre_roll_ms = 250
 max_duration_secs = 60
 
 # Optional media behavior while recording

@@ -251,6 +251,18 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     if let Ok(device) = std::env::var("VOXTYPE_AUDIO_DEVICE") {
         config.audio.device = device;
     }
+    if let Some(value) = std::env::var("VOXTYPE_WARM_MIC_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.audio.warm_mic_secs = value;
+    }
+    if let Some(value) = std::env::var("VOXTYPE_PRE_ROLL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.audio.pre_roll_ms = value;
+    }
     if let Ok(val) = std::env::var("VOXTYPE_MAX_DURATION_SECS") {
         if let Ok(n) = val.parse::<u32>() {
             config.audio.max_duration_secs = n;

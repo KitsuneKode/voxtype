@@ -50,6 +50,8 @@ device = "default"
 sample_rate = 16000
 
 # Maximum recording duration in seconds (safety limit)
+# warm_mic_secs = 0
+# pre_roll_ms = 250
 max_duration_secs = 60
 
 # Keep the audio of a recording whose transcription failed, so it can be

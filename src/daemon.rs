@@ -1492,6 +1492,8 @@ type HistoryTestEagerLoop = (
 );
 
 pub struct Daemon {
+    mic: audio::cpal_capture::DictationMic,
+    pre_roll_samples: usize,
     config: Config,
     pending_language: Option<Config>,
     /// When the `record start` being handled was issued, while that start
@@ -1878,6 +1880,8 @@ impl Daemon {
         let recording_engine = config.engine.to_string();
 
         Self {
+            mic: Default::default(),
+            pre_roll_samples: 0,
             start_request: None,
             config,
             config_path,
@@ -2532,13 +2536,14 @@ impl Daemon {
         #[cfg(test)]
         let capture = match self.history_test_capture.take() {
             Some(capture) => Ok(capture),
-            None => audio::create_capture(&self.config.audio),
+            None => self.mic.capture(&self.config.audio),
         };
         #[cfg(not(test))]
-        let capture = audio::create_capture(&self.config.audio);
+        let capture = self.mic.capture(&self.config.audio);
         match capture {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
+                    self.pre_roll_samples = capture.pre_roll_samples();
                     self.is_external_trigger = track_silence;
                     let speech_tracker = self.new_speech_tracker(track_silence);
                     self.silence_tracker = speech_tracker.clone();
@@ -3009,7 +3014,8 @@ impl Daemon {
         let captured = Arc::new(captured);
         let wav = Arc::clone(&captured);
         let rate = self.config.audio.sample_rate;
-        tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
+        let prefix = self.pre_roll_samples.min(wav.len());
+        tokio::task::spawn_blocking(move || Self::write_last_take(&wav[prefix..], rate));
         let transcriber_retry = transcriber.clone();
         self.final_pass_task = Some(tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -3373,7 +3379,10 @@ impl Daemon {
                     let captured = Arc::new(captured);
                     let wav = Arc::clone(&captured);
                     let rate = self.config.audio.sample_rate;
-                    tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
+                    let prefix = self.pre_roll_samples.min(wav.len());
+                    tokio::task::spawn_blocking(move || {
+                        Self::write_last_take(&wav[prefix..], rate)
+                    });
                     self.final_pass_task =
                         Some(tokio::spawn(async move { (Some(text), captured) }));
                     self.update_state("transcribing");
@@ -3689,7 +3698,8 @@ impl Daemon {
         if let Some(ref audio) = final_audio {
             let wav = audio.clone();
             let rate = self.config.audio.sample_rate;
-            tokio::task::spawn_blocking(move || Self::write_last_take(&wav, rate));
+            let prefix = self.pre_roll_samples.min(wav.len());
+            tokio::task::spawn_blocking(move || Self::write_last_take(&wav[prefix..], rate));
         }
         if let Some(h) = streaming_handle.take() {
             // Don't error on join failure; the task may have already
@@ -4022,7 +4032,8 @@ impl Daemon {
 
             let mut kept = false;
             if let Some(mut capture) = audio_capture.take() {
-                if let Ok(samples) = capture.stop().await {
+                if let Ok(mut samples) = capture.stop().await {
+                    samples.drain(..self.pre_roll_samples.min(samples.len()));
                     kept = keep_cancelled_take(samples).await;
                 }
             }
@@ -4089,7 +4100,11 @@ impl Daemon {
 
             end_recording_notification(
                 "Cancelled",
-                if kept { KEPT_BODY } else { "Recording discarded" },
+                if kept {
+                    KEPT_BODY
+                } else {
+                    "Recording discarded"
+                },
                 &self.config.output.notification,
                 self.config.engine,
             )
@@ -4167,7 +4182,8 @@ impl Daemon {
         self.play_feedback(SoundEvent::Cancelled);
         let mut kept = false;
         if let Some(mut c) = audio_capture.take() {
-            if let Ok(samples) = c.stop().await {
+            if let Ok(mut samples) = c.stop().await {
+                samples.drain(..self.pre_roll_samples.min(samples.len()));
                 kept = keep_cancelled_take(samples).await;
             }
         }
@@ -4234,13 +4250,14 @@ impl Daemon {
         #[cfg(test)]
         let capture = match self.history_test_capture.take() {
             Some(capture) => Ok(capture),
-            None => audio::create_capture(&self.config.audio),
+            None => self.mic.capture(&self.config.audio),
         };
         #[cfg(not(test))]
-        let capture = audio::create_capture(&self.config.audio);
+        let capture = self.mic.capture(&self.config.audio);
         match capture {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
+                    self.pre_roll_samples = capture.pre_roll_samples();
                     let chunk_rx = self.start_incremental_final_pass(chunk_rx);
                     // Bounded; backed-up streaming backend drops chunks
                     // rather than back-pressuring the capture. Deep enough
@@ -4504,7 +4521,7 @@ impl Daemon {
         if audio.is_empty() {
             return;
         }
-        let audio = audio.clone();
+        let audio = audio[self.pre_roll_samples.min(audio.len())..].to_vec();
         let keep = self.config.audio.keep_failed_recordings;
         let saved =
             tokio::task::spawn_blocking(move || crate::failed_recording::keep(keep, &audio))
@@ -6605,6 +6622,7 @@ impl Daemon {
     /// `voxtype record recover`: transcribe the take a cancel kept, and deliver
     /// it like any other, through the same cleanup and output.
     async fn recover_cancelled_take(&mut self, state: &mut State) {
+        self.pre_roll_samples = 0;
         let Some(samples) = tokio::task::spawn_blocking(crate::cancelled_take::take)
             .await
             .ok()
@@ -6613,8 +6631,13 @@ impl Daemon {
             tracing::info!("No cancelled take to recover");
             return;
         };
-        tracing::info!("Recovering a cancelled take ({:.1}s)", samples.len() as f32 / 16000.0);
-        *state = State::Transcribing { audio: samples.clone() };
+        tracing::info!(
+            "Recovering a cancelled take ({:.1}s)",
+            samples.len() as f32 / 16000.0
+        );
+        *state = State::Transcribing {
+            audio: samples.clone(),
+        };
         self.history_begin(state);
         self.history_note(|p| p.transcribing(samples.len()));
         self.update_state("transcribing");
@@ -7081,7 +7104,8 @@ impl Daemon {
                             if processor.streaming()
                                 && file_output_path.is_none()
                                 && output_config.mode == OutputMode::Type
-                                && output::config_for_text(&output_config, &processed_text).is_none() =>
+                                && output::config_for_text(&output_config, &processed_text)
+                                    .is_none() =>
                         {
                             tracing::info!(
                                 "Post-processing, typed as it streams (profile: {:?}), has_context: {}",
@@ -7358,7 +7382,10 @@ impl Daemon {
 
                     let long_config = output::config_for_text(&output_config, &final_text);
                     if long_config.is_some() {
-                        tracing::info!("Pasting {} chars instead of typing them", final_text.chars().count());
+                        tracing::info!(
+                            "Pasting {} chars instead of typing them",
+                            final_text.chars().count()
+                        );
                     }
                     let chain_config = long_config.as_ref().unwrap_or(&output_config);
                     #[cfg(test)]

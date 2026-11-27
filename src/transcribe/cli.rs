@@ -129,16 +129,10 @@ impl CliTranscriber {
         })
     }
 
-    /// Write audio samples to a temporary WAV file
-    fn write_temp_wav(&self, samples: &[f32]) -> Result<tempfile::NamedTempFile, TranscribeError> {
-        let temp_file = tempfile::Builder::new()
-            .prefix("voxtype_")
-            .suffix(".wav")
-            .tempfile()
-            .map_err(|e| {
-                TranscribeError::AudioFormat(format!("Failed to create temp file: {}", e))
-            })?;
-
+    /// Encode the recording for whisper-cli's stdin. A take may contain
+    /// pre-roll, so there must be no temporary audio file.
+    fn wav(samples: &[f32]) -> Result<Vec<u8>, TranscribeError> {
+        let mut bytes = std::io::Cursor::new(Vec::with_capacity(44 + samples.len() * 2));
         let spec = hound::WavSpec {
             channels: 1,
             sample_rate: 16000,
@@ -146,7 +140,7 @@ impl CliTranscriber {
             sample_format: hound::SampleFormat::Int,
         };
 
-        let mut writer = hound::WavWriter::create(temp_file.path(), spec).map_err(|e| {
+        let mut writer = hound::WavWriter::new(&mut bytes, spec).map_err(|e| {
             TranscribeError::AudioFormat(format!("Failed to create WAV writer: {}", e))
         })?;
 
@@ -163,7 +157,7 @@ impl CliTranscriber {
             .finalize()
             .map_err(|e| TranscribeError::AudioFormat(format!("Failed to finalize WAV: {}", e)))?;
 
-        Ok(temp_file)
+        Ok(bytes.into_inner())
     }
 }
 
@@ -206,8 +200,7 @@ impl CliTranscriber {
             samples.len()
         );
 
-        // Write audio to temp WAV file
-        let temp_wav = self.write_temp_wav(samples)?;
+        let wav = Self::wav(samples)?;
 
         // Create temp file for JSON output
         let temp_json = tempfile::Builder::new()
@@ -228,7 +221,7 @@ impl CliTranscriber {
         cmd.arg("--model")
             .arg(&self.model_path)
             .arg("--file")
-            .arg(temp_wav.path())
+            .arg("-")
             .arg("--output-json")
             .arg("--output-file")
             .arg(output_base)
@@ -261,13 +254,24 @@ impl CliTranscriber {
         tracing::debug!("Running whisper-cli: {:?}", cmd);
 
         // Run whisper-cli
-        let output = cmd
+        let mut child = cmd
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|e| {
-                TranscribeError::InferenceFailed(format!("Failed to run whisper-cli: {}", e))
+                TranscribeError::InferenceFailed(format!("Failed to run whisper-cli: {e}"))
             })?;
+        let mut input = child.stdin.take().expect("piped child stdin");
+        let output = std::thread::scope(|scope| {
+            let writer = scope.spawn(move || std::io::Write::write_all(&mut input, &wav));
+            let output = child.wait_with_output()?;
+            if output.status.success() {
+                writer.join().expect("WAV writer panicked")?;
+            }
+            Ok::<_, std::io::Error>(output)
+        })
+        .map_err(|e| TranscribeError::InferenceFailed(format!("whisper-cli I/O: {e}")))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -459,7 +463,7 @@ mod tests {
         crate::test_support::write_script(
             &cli,
             &format!(
-                "#!/bin/sh\necho run >> {runs}\nwhile [ $# -gt 0 ]; do \
+                "#!/bin/sh\ncat >/dev/null\necho run >> {runs}\nwhile [ $# -gt 0 ]; do \
                  [ \"$1\" = --output-file ] && cp {json} \"$2.json\"; shift; done\n",
                 runs = runs.display(),
                 json = json.display()

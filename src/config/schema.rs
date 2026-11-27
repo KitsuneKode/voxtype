@@ -1084,6 +1084,24 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Capture device name, or default to follow the system default.",
     ),
     spec(
+        "audio.warm_mic_secs",
+        "audio",
+        "warm_mic_secs",
+        KeyType::Int { min: 0, max: u32::MAX as i64 },
+        "Audio",
+        "Warm mic secs",
+        "Time to keep the microphone open after a dictation (0 disables).",
+    ),
+    spec(
+        "audio.pre_roll_ms",
+        "audio",
+        "pre_roll_ms",
+        KeyType::Int { min: 0, max: u32::MAX as i64 },
+        "Audio",
+        "Pre roll ms",
+        "Audio to retain before the next warm start, in milliseconds.",
+    ),
+    spec(
         "audio.max_duration_secs",
         "audio",
         "max_duration_secs",
@@ -3583,6 +3601,8 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "hotkey.model_modifier" => opt_str(cfg.hotkey.model_modifier.as_ref()),
 
         "audio.device" => json!(cfg.audio.device),
+        "audio.warm_mic_secs" => json!(cfg.audio.warm_mic_secs),
+        "audio.pre_roll_ms" => json!(cfg.audio.pre_roll_ms),
         "audio.max_duration_secs" => json!(cfg.audio.max_duration_secs),
         "audio.keep_failed_recordings" => json!(cfg.audio.keep_failed_recordings),
         "audio.pause_media" => json!(cfg.audio.pause_media),

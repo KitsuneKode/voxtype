@@ -560,6 +560,15 @@ Audio sample rate in Hz. Whisper expects 16000 Hz; other rates will be resampled
 sample_rate = 16000
 ```
 
+### warm_mic_secs and pre_roll_ms
+
+After a dictation stops, `warm_mic_secs` keeps its microphone open for the
+specified number of seconds. The default is **0** (close immediately). A take
+started within that window reuses the stream and includes up to `pre_roll_ms`
+milliseconds of preceding sound (default **250**). The privacy indicator can
+stay lit until the window expires. The pre-roll is held in memory. Meeting
+recordings and soundchecks use their own capture lifetimes.
+
 ### max_duration_secs
 
 **Type:** Integer

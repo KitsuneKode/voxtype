@@ -13,6 +13,14 @@ pub struct AudioConfig {
     #[serde(default = "default_audio_sample_rate")]
     pub sample_rate: u32,
 
+    /// Seconds to keep the dictation microphone open between takes (zero disables it).
+    #[serde(default)]
+    pub warm_mic_secs: u32,
+
+    /// Milliseconds of microphone input to retain during the warm window.
+    #[serde(default = "default_pre_roll_ms")]
+    pub pre_roll_ms: u32,
+
     /// Maximum recording duration in seconds (safety limit)
     #[serde(default = "default_audio_max_duration_secs")]
     pub max_duration_secs: u32,
@@ -99,6 +107,8 @@ impl Default for AudioConfig {
         Self {
             device: default_audio_device(),
             sample_rate: default_audio_sample_rate(),
+            warm_mic_secs: 0,
+            pre_roll_ms: default_pre_roll_ms(),
             max_duration_secs: default_audio_max_duration_secs(),
             keep_failed_recordings: default_keep_failed_recordings(),
             pause_media: false,
@@ -121,6 +131,10 @@ fn default_audio_device() -> String {
 
 fn default_audio_sample_rate() -> u32 {
     16000
+}
+
+fn default_pre_roll_ms() -> u32 {
+    250
 }
 
 fn default_audio_max_duration_secs() -> u32 {

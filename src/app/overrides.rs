@@ -299,6 +299,12 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(ref device) = cli.audio_device {
         config.audio.device = device.clone();
     }
+    if let Some(value) = cli.warm_mic_secs {
+        config.audio.warm_mic_secs = value;
+    }
+    if let Some(value) = cli.pre_roll_ms {
+        config.audio.pre_roll_ms = value;
+    }
     if let Some(max_dur) = cli.max_duration {
         config.audio.max_duration_secs = max_dur;
     }

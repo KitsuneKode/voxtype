@@ -6,12 +6,13 @@
 //! Note: cpal::Stream is not Send, so we run the audio capture in a
 //! dedicated thread and communicate via channels.
 
-use super::AudioCapture;
+use super::{capture_buffer::CaptureBuffer, AudioCapture};
 use crate::config::AudioConfig;
 use crate::error::AudioError;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 
 /// How long `start()` waits for the capture thread to confirm the stream is
@@ -20,6 +21,7 @@ const STREAM_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 
 /// Commands sent to the audio capture thread
 enum CaptureCommand {
+    Resume(mpsc::Sender<Vec<f32>>, oneshot::Sender<usize>),
     Stop(oneshot::Sender<Vec<f32>>),
     /// Get current samples and clear the buffer (for continuous recording)
     GetSamples(oneshot::Sender<Vec<f32>>),
@@ -27,17 +29,30 @@ enum CaptureCommand {
 
 /// Parameters for building an audio input stream
 struct StreamBuildParams {
-    samples: Arc<Mutex<Vec<f32>>>,
-    tx: mpsc::Sender<Vec<f32>>,
+    buffer: Arc<Mutex<CaptureBuffer>>,
     source_channels: usize,
-    /// Shared with the capture thread so the tail can be flushed on stop.
-    /// The resampler lags its input by a chunk, so without this the last
-    /// ~21ms of every recording stays stuck in the delay line (#641).
-    resampler: Arc<Mutex<Option<super::resampler::StreamResampler>>>,
+}
+
+/// Only dictation captures share a warm stream. Dropping its last owner also
+/// wakes the capture thread, even when it is waiting on a long deadline.
+#[derive(Clone, Default)]
+pub(crate) struct DictationMic(Arc<Mutex<Option<std::sync::mpsc::Sender<CaptureCommand>>>>);
+
+impl DictationMic {
+    pub(crate) fn capture(
+        &self,
+        config: &AudioConfig,
+    ) -> Result<Box<dyn AudioCapture>, AudioError> {
+        let mut capture = CpalCapture::new(config)?;
+        capture.warm = (config.warm_mic_secs > 0).then(|| self.clone());
+        Ok(Box::new(capture))
+    }
 }
 
 /// cpal-based audio capture implementation
 pub struct CpalCapture {
+    warm: Option<DictationMic>,
+    prefix: usize,
     /// Audio configuration
     config: AudioConfig,
     /// Command sender to the capture thread
@@ -51,6 +66,8 @@ impl CpalCapture {
     pub fn new(config: &AudioConfig) -> Result<Self, AudioError> {
         Ok(Self {
             config: config.clone(),
+            warm: None,
+            prefix: 0,
             cmd_tx: None,
             thread_handle: None,
         })
@@ -144,6 +161,24 @@ impl AudioCapture for CpalCapture {
     async fn start(&mut self) -> Result<mpsc::Receiver<Vec<f32>>, AudioError> {
         use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
+        let (chunk_tx, chunk_rx) = mpsc::channel(64);
+        if let Some(warm) = &self.warm {
+            let sender = warm.0.lock().unwrap().take();
+            if let Some(sender) = sender {
+                let (ready, resumed) = oneshot::channel();
+                if sender
+                    .send(CaptureCommand::Resume(chunk_tx.clone(), ready))
+                    .is_ok()
+                {
+                    if let Ok(prefix) = resumed.await {
+                        self.prefix = prefix;
+                        self.cmd_tx = Some(sender);
+                        return Ok(chunk_rx);
+                    }
+                }
+            }
+        }
+        self.prefix = 0;
         // Find the device and its config before spawning the capture
         // thread. ALSA blocks forever here when a sound server's socket
         // exists but nothing answers, and this runs on the daemon's event
@@ -183,17 +218,19 @@ impl AudioCapture for CpalCapture {
         );
 
         // Create channels
-        let (chunk_tx, chunk_rx) = mpsc::channel(64);
         let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<CaptureCommand>();
         // The stream is built on the capture thread. Its outcome comes back
         // here so a device that refuses to open fails `start()` instead of
         // handing back a receiver that never yields a sample.
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
-        // Shared state
-        let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let samples_clone = samples.clone();
-
+        let warm_window = self
+            .warm
+            .as_ref()
+            .map(|_| Duration::from_secs(self.config.warm_mic_secs.into()));
+        let limit = (u64::from(source_sample_rate) * u64::from(self.config.pre_roll_ms) / 1000)
+            .try_into()
+            .unwrap_or(usize::MAX);
         // Spawn audio capture thread
         let thread_handle = thread::spawn(move || {
             // Build stream config
@@ -218,31 +255,12 @@ impl AudioCapture for CpalCapture {
                 stream_dead_for_cb.store(true, Ordering::SeqCst);
             };
 
-            // One resampler for the life of the stream, shared with the stop
-            // path so its delay line can be drained.
-            let resampler: Arc<Mutex<Option<super::resampler::StreamResampler>>> =
-                Arc::new(Mutex::new(if source_sample_rate == target_sample_rate {
-                    None
-                } else {
-                    match super::resampler::StreamResampler::new(
-                        source_sample_rate,
-                        target_sample_rate,
-                    ) {
-                        Ok(r) => Some(r),
-                        Err(e) => {
-                            tracing::error!("{e}; capture will run without rate conversion");
-                            None
-                        }
-                    }
-                }));
-            let resampler_for_stop = resampler.clone();
-
-            // Create the input stream based on sample format
+            let mut initial = CaptureBuffer::Closed;
+            initial.start(chunk_tx, source_sample_rate, target_sample_rate);
+            let buffer = Arc::new(Mutex::new(initial));
             let make_params = || StreamBuildParams {
-                samples: samples_clone.clone(),
-                tx: chunk_tx.clone(),
+                buffer: buffer.clone(),
                 source_channels,
-                resampler: resampler.clone(),
             };
 
             let stream_result = match sample_format {
@@ -277,78 +295,47 @@ impl AudioCapture for CpalCapture {
 
             tracing::debug!("Audio capture thread started");
 
-            // Handle commands in a loop
-            loop {
-                match cmd_rx.recv() {
-                    Ok(CaptureCommand::Stop(response_tx)) => {
-                        // Pause before dropping. On macOS, cpal 0.15 keeps a
-                        // clone of a non-default device's stream inside its
-                        // own disconnect listener, so dropping it alone never
-                        // stops the AudioUnit: the callback keeps appending to
-                        // `samples` after every recording and the daemon grows
-                        // without bound.
-                        let _ = stream.pause();
-                        drop(stream);
-
-                        // A stream error is terminal: cpal stops delivering
-                        // callbacks, so whatever was captured before the error
-                        // is all there is. Saying so beats handing back a
-                        // truncated recording as though it were complete
-                        // (#642).
-                        if stream_dead.load(Ordering::SeqCst) {
+            serve_stream(cmd_rx, warm_window, |cmd| {
+                let mut buffer = buffer.lock().unwrap();
+                match cmd {
+                    CaptureCommand::Stop(reply) => {
+                        let healthy = !stream_dead.load(Ordering::SeqCst);
+                        if !healthy {
                             tracing::error!(
-                                "Audio device '{}' failed during this recording; \
-                                 the transcript will be short or empty. \
-                                 Reconnect the device and record again.",
+                                "Audio device '{}' failed during this recording",
                                 device_label
                             );
                         }
-
-                        // Drain whatever the resampler still holds. Its delay
-                        // line is a chunk deep, so skipping this drops the end
-                        // of every recording.
-                        if let Ok(mut guard) = resampler_for_stop.lock() {
-                            if let Some(r) = guard.as_mut() {
-                                let tail = r.flush();
-                                if !tail.is_empty() {
-                                    if let Ok(mut s) = samples_clone.lock() {
-                                        s.extend_from_slice(&tail);
-                                    }
-                                }
-                            }
+                        let warm = warm_window.is_some() && healthy;
+                        let _ = reply.send(buffer.stop(warm.then_some(limit)));
+                        if warm {
+                            StreamState::Warm
+                        } else {
+                            StreamState::Closed
                         }
-
-                        // Hand over the collected samples. Taken, not cloned:
-                        // the capture is ending, a 30-minute recording is over
-                        // 100 MB, and on macOS a leaked stream closure can
-                        // still hold this buffer, so leave it empty.
-                        let collected = {
-                            let mut guard = samples_clone.lock().unwrap();
-                            std::mem::take(&mut *guard)
-                        };
-
-                        // Send samples back
-                        let _ = response_tx.send(collected);
-                        break;
                     }
-                    Ok(CaptureCommand::GetSamples(response_tx)) => {
-                        // Get and clear current samples (for continuous recording)
-                        let samples = {
-                            let mut guard = samples_clone.lock().unwrap();
-                            std::mem::take(&mut *guard)
-                        };
-                        let _ = response_tx.send(samples);
+                    CaptureCommand::Resume(tx, reply) => {
+                        if stream_dead.load(Ordering::SeqCst) {
+                            return StreamState::Closed;
+                        }
+                        let prefix = buffer.start(tx, source_sample_rate, target_sample_rate);
+                        if reply.send(prefix).is_ok() {
+                            StreamState::Recording
+                        } else {
+                            StreamState::Closed
+                        }
                     }
-                    Err(_) => {
-                        // Channel closed, exit thread. Pause for the same
-                        // reason as Stop: drop alone may not stop the unit.
-                        tracing::debug!("Command channel closed");
-                        let _ = stream.pause();
-                        break;
+                    CaptureCommand::GetSamples(reply) => {
+                        let _ = reply.send(buffer.drain());
+                        StreamState::Recording
                     }
                 }
-            }
-
+            });
+            // A macOS disconnect listener can hold its own stream clone.
+            // Silence that callback and release the ring before pausing.
+            *buffer.lock().unwrap() = CaptureBuffer::Closed;
+            let _ = stream.pause();
+            drop(stream);
             tracing::debug!("Audio capture thread stopped");
         });
 
@@ -378,6 +365,10 @@ impl AudioCapture for CpalCapture {
         Ok(chunk_rx)
     }
 
+    fn pre_roll_samples(&self) -> usize {
+        self.prefix
+    }
+
     async fn stop(&mut self) -> Result<Vec<f32>, AudioError> {
         // Send stop command and get samples back
         let samples = if let Some(cmd_tx) = self.cmd_tx.take() {
@@ -386,7 +377,13 @@ impl AudioCapture for CpalCapture {
             if cmd_tx.send(CaptureCommand::Stop(response_tx)).is_ok() {
                 // Wait for response (with timeout)
                 match tokio::time::timeout(std::time::Duration::from_secs(2), response_rx).await {
-                    Ok(Ok(samples)) => samples,
+                    Ok(Ok(samples)) => {
+                        if let Some(warm) = &self.warm {
+                            *warm.0.lock().unwrap() = Some(cmd_tx);
+                            self.thread_handle.take();
+                        }
+                        samples
+                    }
                     Ok(Err(_)) => {
                         return Err(AudioError::StreamError("Channel closed".to_string()))
                     }
@@ -441,6 +438,40 @@ impl AudioCapture for CpalCapture {
     }
 }
 
+enum StreamState {
+    Recording,
+    Warm,
+    Closed,
+}
+
+fn serve_stream<T>(
+    commands: std::sync::mpsc::Receiver<T>,
+    window: Option<Duration>,
+    mut handle: impl FnMut(T) -> StreamState,
+) {
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let command = match deadline {
+            Some(end) => {
+                let Some(left) = end.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                commands
+                    .recv_timeout(left)
+                    .ok()
+                    .filter(|_| Instant::now() < end)
+            }
+            None => commands.recv().ok(),
+        };
+        let Some(command) = command else { break };
+        match handle(command) {
+            StreamState::Recording => deadline = None,
+            StreamState::Warm => deadline = window.map(|w| Instant::now() + w),
+            StreamState::Closed => break,
+        }
+    }
+}
+
 /// Build an input stream for a specific sample type
 fn build_stream<T>(
     device: &cpal::Device,
@@ -455,13 +486,9 @@ where
     use cpal::traits::DeviceTrait;
 
     let StreamBuildParams {
-        samples,
-        tx,
+        buffer,
         source_channels,
-        resampler,
-        ..
     } = params;
-
     let stream = device
         .build_input_stream(
             config,
@@ -478,25 +505,9 @@ where
                     })
                     .collect();
 
-                // Resample if needed. The resampler is stateful and lives as
-                // long as the stream: converting each callback independently
-                // reset the read position ~100 times a second and produced a
-                // discontinuity at every chunk boundary (#641).
-                let resampled = match resampler.lock() {
-                    Ok(mut r) => match r.as_mut() {
-                        Some(r) => r.push(&mono_f32),
-                        None => mono_f32,
-                    },
-                    Err(_) => mono_f32,
-                };
-
-                // Store samples
-                if let Ok(mut guard) = samples.lock() {
-                    guard.extend_from_slice(&resampled);
+                if let Ok(mut buffer) = buffer.lock() {
+                    buffer.push(mono_f32);
                 }
-
-                // Send chunk for streaming (ignore errors - receiver might be gone)
-                let _ = tx.try_send(resampled);
             },
             err_fn,
             None,
@@ -510,6 +521,23 @@ where
 mod tests {
     use super::super::resampler::resample_buffer;
 
+    #[test]
+    fn warm_window_closes_without_another_command() {
+        use super::*;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (closed, done) = std::sync::mpsc::channel();
+        let window = Duration::from_millis(30);
+        let thread = thread::spawn(move || {
+            serve_stream(rx, Some(window), |()| StreamState::Warm);
+            closed.send(()).unwrap();
+        });
+        let started = Instant::now();
+        tx.send(()).unwrap();
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(started.elapsed() >= window);
+        assert!(tx.send(()).is_err());
+        thread.join().unwrap();
+    }
     // These moved off the removed linear-interpolation `resample()` and onto
     // the band-limited path (#641). They cover very short inputs, which is a
     // real case: a recording shorter than one FFT chunk still has to come out

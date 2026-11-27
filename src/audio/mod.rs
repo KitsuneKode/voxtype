@@ -3,6 +3,7 @@
 //! Provides audio recording capabilities using cpal, which works with
 //! PipeWire, PulseAudio, and ALSA backends.
 
+mod capture_buffer;
 pub mod cpal_capture;
 pub mod devices;
 pub mod dual_capture;
@@ -30,6 +31,11 @@ pub trait AudioCapture: Send + Sync {
     /// Start capturing audio
     /// Returns a channel receiver for audio chunks (f32 samples, mono, 16kHz)
     async fn start(&mut self) -> Result<mpsc::Receiver<Vec<f32>>, AudioError>;
+
+    /// Number of leading samples captured before this take was requested.
+    fn pre_roll_samples(&self) -> usize {
+        0
+    }
 
     /// Stop capturing and return all recorded samples
     async fn stop(&mut self) -> Result<Vec<f32>, AudioError>;
