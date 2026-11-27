@@ -26,9 +26,14 @@ pub enum SoundEvent {
 /// Audio feedback player
 pub struct AudioFeedback {
     _stream: OutputStream,
+    pub(crate) player: Player,
+}
+
+#[derive(Clone)]
+pub(crate) struct Player {
     stream_handle: OutputStreamHandle,
     config: AudioFeedbackConfig,
-    theme: SoundTheme,
+    theme: std::sync::Arc<SoundTheme>,
 }
 
 /// A sound theme containing audio data for different events
@@ -54,12 +59,20 @@ impl AudioFeedback {
 
         Ok(Self {
             _stream: stream,
-            stream_handle,
-            config: config.clone(),
-            theme,
+            player: Player {
+                stream_handle,
+                config: config.clone(),
+                theme: theme.into(),
+            },
         })
     }
 
+    pub fn play(&self, event: SoundEvent) {
+        self.player.play(event);
+    }
+}
+
+impl Player {
     /// Play a sound for the given event
     pub fn play(&self, event: SoundEvent) {
         let sound_data = match event {

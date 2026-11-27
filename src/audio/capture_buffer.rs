@@ -10,7 +10,7 @@ pub(super) enum CaptureBuffer {
     Recording {
         samples: Vec<f32>,
         tx: mpsc::Sender<Vec<f32>>,
-        resampler: Option<StreamResampler>,
+        resampler: Option<Box<StreamResampler>>,
     },
     Warm {
         ring: VecDeque<f32>,
@@ -37,7 +37,8 @@ impl CaptureBuffer {
                     })
                     .ok()
             })
-            .flatten();
+            .flatten()
+            .map(Box::new);
         *self = Self::Recording {
             samples: prefix,
             tx,
@@ -117,5 +118,17 @@ mod tests {
         b.stop(None);
         let (tx, _) = mpsc::channel(1);
         assert_eq!(b.start(tx, 16000, 16000), 0);
+    }
+
+    #[test]
+    fn warm_ring_with_zero_pre_roll_retains_nothing() {
+        let mut b = CaptureBuffer::Closed;
+        b.stop(Some(0));
+        b.push(vec![1., 2., 3.]);
+        let (tx, mut rx) = mpsc::channel(4);
+        assert_eq!(b.start(tx, 16000, 16000), 0);
+        b.push(vec![4., 5.]);
+        assert_eq!(rx.try_recv().unwrap(), [4., 5.]);
+        assert_eq!(b.stop(None), [4., 5.]);
     }
 }

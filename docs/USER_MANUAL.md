@@ -370,6 +370,14 @@ The setup command will:
 4. **Release the hotkey**: Your speech is transcribed
 5. **Text appears**: Either typed at cursor or copied to clipboard
 
+You can start another take while the last one is transcribing or polishing.
+Overlapping takes record immediately and wait in memory for their turn. They
+use batch transcription and reach the configured output in recording order.
+For typing and pasting, the focused window at delivery time receives the text.
+Cancel drops the current recording, or the most recently stopped take still
+waiting in the queue. The state file shows `recording` during an overlapping
+take, then `transcribing` until delivery finishes.
+
 ### Example Session
 
 ```

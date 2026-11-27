@@ -36,13 +36,21 @@ struct StreamBuildParams {
 /// Only dictation captures share a warm stream. Dropping its last owner also
 /// wakes the capture thread, even when it is waiting on a long deadline.
 #[derive(Clone, Default)]
-pub(crate) struct DictationMic(Arc<Mutex<Option<std::sync::mpsc::Sender<CaptureCommand>>>>);
+pub(crate) struct DictationMic {
+    parked: Arc<Mutex<Option<std::sync::mpsc::Sender<CaptureCommand>>>>,
+    #[cfg(test)]
+    pub(crate) fixtures: Arc<Mutex<std::collections::VecDeque<Box<dyn AudioCapture>>>>,
+}
 
 impl DictationMic {
     pub(crate) fn capture(
         &self,
         config: &AudioConfig,
     ) -> Result<Box<dyn AudioCapture>, AudioError> {
+        #[cfg(test)]
+        if let Some(capture) = self.fixtures.lock().unwrap().pop_front() {
+            return Ok(capture);
+        }
         let mut capture = CpalCapture::new(config)?;
         capture.warm = (config.warm_mic_secs > 0).then(|| self.clone());
         Ok(Box::new(capture))
@@ -163,7 +171,7 @@ impl AudioCapture for CpalCapture {
 
         let (chunk_tx, chunk_rx) = mpsc::channel(64);
         if let Some(warm) = &self.warm {
-            let sender = warm.0.lock().unwrap().take();
+            let sender = warm.parked.lock().unwrap().take();
             if let Some(sender) = sender {
                 let (ready, resumed) = oneshot::channel();
                 if sender
@@ -379,7 +387,7 @@ impl AudioCapture for CpalCapture {
                 match tokio::time::timeout(std::time::Duration::from_secs(2), response_rx).await {
                     Ok(Ok(samples)) => {
                         if let Some(warm) = &self.warm {
-                            *warm.0.lock().unwrap() = Some(cmd_tx);
+                            *warm.parked.lock().unwrap() = Some(cmd_tx);
                             self.thread_handle.take();
                         }
                         samples
@@ -536,6 +544,68 @@ mod tests {
         done.recv_timeout(Duration::from_secs(2)).unwrap();
         assert!(started.elapsed() >= window);
         assert!(tx.send(()).is_err());
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn warm_window_reuses_within_deadline_and_clears_buffer_on_expiry() {
+        use super::*;
+        let buffer = Arc::new(Mutex::new(CaptureBuffer::Closed));
+        let buf_thread = buffer.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<CaptureCommand>();
+        let (closed, done) = std::sync::mpsc::channel();
+        let window = Duration::from_millis(60);
+        let thread = thread::spawn(move || {
+            serve_stream(rx, Some(window), |cmd| {
+                let mut b = buf_thread.lock().unwrap();
+                match cmd {
+                    CaptureCommand::Stop(reply) => {
+                        let _ = reply.send(b.stop(Some(3)));
+                        StreamState::Warm
+                    }
+                    CaptureCommand::Resume(chunk_tx, reply) => {
+                        let prefix = b.start(chunk_tx, 16000, 16000);
+                        let _ = reply.send(prefix);
+                        StreamState::Recording
+                    }
+                    CaptureCommand::GetSamples(reply) => {
+                        let _ = reply.send(b.drain());
+                        StreamState::Recording
+                    }
+                }
+            });
+            *buf_thread.lock().unwrap() = CaptureBuffer::Closed;
+            closed.send(()).unwrap();
+        });
+
+        // Take 1 finishes and enters the warm window.
+        let (stop_tx, stop_rx) = oneshot::channel();
+        tx.send(CaptureCommand::Stop(stop_tx)).unwrap();
+        let _ = stop_rx.blocking_recv().unwrap();
+
+        // Ambient audio arrives while warm; only the last 3 samples survive.
+        buffer.lock().unwrap().push(vec![1., 2., 3., 4., 5.]);
+
+        // Take 2 resumes inside the warm window and receives the bounded pre-roll.
+        let (chunk_tx, mut chunk_rx) = mpsc::channel(4);
+        let (ready_tx, ready_rx) = oneshot::channel();
+        tx.send(CaptureCommand::Resume(chunk_tx, ready_tx)).unwrap();
+        assert_eq!(ready_rx.blocking_recv().unwrap(), 3);
+        buffer.lock().unwrap().push(vec![6., 7.]);
+        assert_eq!(chunk_rx.try_recv().unwrap(), vec![3., 4., 5.]);
+        assert_eq!(chunk_rx.try_recv().unwrap(), vec![6., 7.]);
+
+        // Take 2 stops and enters a fresh warm window; ambient audio arrives again.
+        let (stop_tx, stop_rx) = oneshot::channel();
+        tx.send(CaptureCommand::Stop(stop_tx)).unwrap();
+        assert_eq!(stop_rx.blocking_recv().unwrap(), vec![3., 4., 5., 6., 7.]);
+        buffer.lock().unwrap().push(vec![8., 9., 10.]);
+
+        // Without another take, the warm window expires, closes the thread, and clears the ring.
+        done.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(matches!(*buffer.lock().unwrap(), CaptureBuffer::Closed));
+        let (probe_tx, _) = mpsc::channel(1);
+        assert_eq!(buffer.lock().unwrap().start(probe_tx, 16000, 16000), 0);
         thread.join().unwrap();
     }
     // These moved off the removed linear-interpolation `resample()` and onto

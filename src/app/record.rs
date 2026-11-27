@@ -36,7 +36,10 @@ pub(crate) fn send_record_command(
             .map_err(|e| anyhow::anyhow!("Failed to write recover request: {}", e))?;
         if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
             let _ = std::fs::remove_file(&file);
-            anyhow::bail!("Failed to send signal to daemon: {}", std::io::Error::last_os_error());
+            anyhow::bail!(
+                "Failed to send signal to daemon: {}",
+                std::io::Error::last_os_error()
+            );
         }
         return Ok(());
     }
@@ -55,7 +58,8 @@ pub(crate) fn send_record_command(
                 .is_some_and(|path| state_is_cancellable(&read_state(path)));
 
         let cancel_file = runtime_dir.join("cancel");
-        std::fs::write(&cancel_file, trigger_stamp())
+        let stamp = trigger_stamp();
+        std::fs::write(&cancel_file, &stamp)
             .map_err(|e| anyhow::anyhow!("Failed to write cancel file: {}", e))?;
 
         // The daemon picks the trigger up on its next poll tick. Return only
@@ -65,7 +69,7 @@ pub(crate) fn send_record_command(
         // cancel sent while idle has nothing to wait for; its trigger is
         // consumed when the next recording starts.
         if let (true, Some(path)) = (was_active, state_file.as_deref()) {
-            if !await_cancel(&cancel_file, path, CANCEL_ACK_TIMEOUT) {
+            if !await_cancel(&cancel_file, path, CANCEL_ACK_TIMEOUT, Some(&stamp)) {
                 eprintln!(
                     "Warning: the daemon has not acknowledged the cancel after {}s",
                     CANCEL_ACK_TIMEOUT.as_secs()
@@ -75,6 +79,32 @@ pub(crate) fn send_record_command(
         return Ok(());
     }
 
+    let runtime = config::Config::runtime_dir();
+    let queued = std::fs::read_to_string(runtime.join("queue_pid"))
+        .ok()
+        .as_deref()
+        == Some(&pid.to_string());
+    // SIGUSR1/SIGUSR2 coalesce. A second CLI invocation must wait until the
+    // previous command has handed off its microphone and per-take options.
+    let command_lock = if queued {
+        let lock = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(runtime.join("record_command.lock"))?;
+        lock.lock()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while runtime.join(START_REQUEST_FILE).exists() || runtime.join("stop_requested").exists() {
+            if Instant::now() >= deadline {
+                anyhow::bail!("The daemon has not acknowledged the previous record command");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        Some(lock)
+    } else {
+        None
+    };
+    let mut options = std::collections::BTreeMap::new();
     // Subcommand --model takes priority over top-level --model. Check it
     // before writing any override file, so a typo or an undownloaded model
     // fails here rather than after the user has spoken.
@@ -88,7 +118,6 @@ pub(crate) fn send_record_command(
     // Write output mode override file if specified
     // For file mode, format is "file" or "file:/path/to/file"
     if let Some(mode_override) = action.output_mode_override() {
-        let override_file = config::Config::runtime_dir().join("output_mode_override");
         let mode_str = match mode_override {
             OutputModeOverride::Type => "type".to_string(),
             OutputModeOverride::Clipboard => "clipboard".to_string(),
@@ -101,22 +130,17 @@ pub(crate) fn send_record_command(
                 }
             }
         };
-        std::fs::write(&override_file, mode_str)
-            .map_err(|e| anyhow::anyhow!("Failed to write output mode override: {}", e))?;
+        options.insert("output_mode_override", mode_str);
     }
 
     // Write model override file if specified
     if let Some(model) = model_override {
-        let override_file = config::Config::runtime_dir().join("model_override");
-        std::fs::write(&override_file, model)
-            .map_err(|e| anyhow::anyhow!("Failed to write model override: {}", e))?;
+        options.insert("model_override", model.to_string());
     }
 
     // Write smart auto-submit override file if specified
     if let Some(enabled) = action.smart_auto_submit_override() {
-        let override_file = config::Config::runtime_dir().join("smart_auto_submit_override");
-        std::fs::write(&override_file, if enabled { "true" } else { "false" })
-            .map_err(|e| anyhow::anyhow!("Failed to write smart auto-submit override: {}", e))?;
+        options.insert("smart_auto_submit_override", enabled.to_string());
     }
 
     // Write profile override file if specified
@@ -145,24 +169,17 @@ pub(crate) fn send_record_command(
             }
             std::process::exit(1);
         }
-
-        let profile_file = config::Config::runtime_dir().join("profile_override");
-        std::fs::write(&profile_file, profile_name)
-            .map_err(|e| anyhow::anyhow!("Failed to write profile override: {}", e))?;
+        options.insert("profile_override", profile_name.to_string());
     }
 
     // Write auto_submit override file if specified
     if let Some(value) = action.auto_submit_override() {
-        let override_file = config::Config::runtime_dir().join("auto_submit_override");
-        std::fs::write(&override_file, if value { "true" } else { "false" })
-            .map_err(|e| anyhow::anyhow!("Failed to write auto_submit override: {}", e))?;
+        options.insert("auto_submit_override", value.to_string());
     }
 
     // Write shift_enter_newlines override file if specified
     if let Some(value) = action.shift_enter_newlines_override() {
-        let override_file = config::Config::runtime_dir().join("shift_enter_override");
-        std::fs::write(&override_file, if value { "true" } else { "false" })
-            .map_err(|e| anyhow::anyhow!("Failed to write shift_enter override: {}", e))?;
+        options.insert("shift_enter_override", value.to_string());
     }
 
     // Write the post-processing override. A stop only means something while
@@ -182,30 +199,15 @@ pub(crate) fn send_record_command(
                 "recording" | "streaming" | "transcribing"
             )
         {
-            let override_file = config::Config::runtime_dir().join("post_process_override");
-            std::fs::write(&override_file, if value { "true" } else { "false" })
-                .map_err(|e| anyhow::anyhow!("Failed to write post_process override: {}", e))?;
+            options.insert("post_process_override", value.to_string());
         }
-    }
-
-    // Past the recording, the daemon picks a skip request up from the
-    // sentinel while it waits on the post-process command. A stop signal
-    // would only queue behind that wait and land once the daemon is idle.
-    // --wait still goes through the signal path below, as before.
-    if matches!(action, RecordAction::Stop { wait: false, .. })
-        && action.post_process_override() == Some(false)
-        && current_state == "transcribing"
-    {
-        return Ok(());
     }
 
     // Write the OSD suppression sentinel if --no-osd was passed. Only written,
     // never cleared here: like the other overrides the daemon consumes and
     // removes it, so a stale file cannot silence a later recording.
     if action.suppress_osd() {
-        let override_file = config::Config::runtime_dir().join("no_osd_override");
-        std::fs::write(&override_file, "true")
-            .map_err(|e| anyhow::anyhow!("Failed to write no_osd override: {}", e))?;
+        options.insert("no_osd_override", "true".to_string());
     }
 
     // For toggle, we need to read current state to decide which signal to send
@@ -250,6 +252,28 @@ pub(crate) fn send_record_command(
         RecordAction::Cancel | RecordAction::Recover => unreachable!(), // Handled above
     };
 
+    if queued && signal == libc::SIGUSR1 {
+        // A finishing take may still read its own stop options. Publish start
+        // options only when the daemon actually accepts the new recording.
+        std::fs::write(runtime.join("start_options"), serde_json::to_vec(&options)?)?;
+    } else {
+        for (name, value) in &options {
+            std::fs::write(runtime.join(name), value)?;
+        }
+    }
+
+    // Past the recording, the daemon picks a skip request up from the
+    // sentinel while it waits on the post-process command. A stop signal
+    // would only queue behind that wait and land once the daemon is idle.
+    // --wait still goes through the signal path below, as before.
+    if !queued
+        && matches!(action, RecordAction::Stop { wait: false, .. })
+        && action.post_process_override() == Some(false)
+        && current_state == "transcribing"
+    {
+        return Ok(());
+    }
+
     // With --wait, clear a previous run's completion sidecar before signalling,
     // so the wait below cannot mistake it for this recording's outcome.
     let wait_target = match &action {
@@ -279,10 +303,16 @@ pub(crate) fn send_record_command(
             .map_err(|e| anyhow::anyhow!("Failed to write start request: {}", e))?;
     }
 
+    if queued && signal == libc::SIGUSR2 {
+        std::fs::write(runtime.join("stop_requested"), trigger_stamp())?;
+    }
     let result = unsafe { libc::kill(pid, signal) };
     if result != 0 {
         if signal == libc::SIGUSR1 {
             let _ = std::fs::remove_file(&start_request);
+        }
+        if queued {
+            let _ = std::fs::remove_file(runtime.join("stop_requested"));
         }
         return Err(anyhow::anyhow!(
             "Failed to send signal to daemon: {}",
@@ -290,6 +320,7 @@ pub(crate) fn send_record_command(
         ));
     }
 
+    drop(command_lock);
     if let Some(transcript) = wait_target {
         let (as_json, timeout) = match &action {
             RecordAction::Stop { json, timeout, .. } => (*json, *timeout),
@@ -509,11 +540,23 @@ fn runtime_dir_file(name: &str) -> PathBuf {
 /// Both conditions matter: a cancel that raced its start signal is consumed
 /// only once capture is live, so the state file can still read "idle" while
 /// the cancel is pending.
-fn await_cancel(cancel_file: &Path, state_file: &Path, timeout: Duration) -> bool {
+fn await_cancel(
+    cancel_file: &Path,
+    state_file: &Path,
+    timeout: Duration,
+    stamp: Option<&str>,
+) -> bool {
     const POLL: Duration = Duration::from_millis(20);
     let deadline = Instant::now() + timeout;
     loop {
-        if !cancel_file.exists() && !state_is_cancellable(&read_state(state_file)) {
+        let acknowledged = stamp.is_some_and(|value| {
+            std::fs::read_to_string(cancel_file.with_file_name("cancel_ack"))
+                .ok()
+                .as_deref()
+                == Some(value)
+        });
+        if !cancel_file.exists() && (acknowledged || !state_is_cancellable(&read_state(state_file)))
+        {
             return true;
         }
         if Instant::now() >= deadline {
@@ -545,7 +588,7 @@ mod tests {
 
         let cancel = dir.path().join("cancel");
         let started = Instant::now();
-        assert!(await_cancel(&cancel, &state, Duration::from_secs(2)));
+        assert!(await_cancel(&cancel, &state, Duration::from_secs(2), None));
         // Returned only after the simulated daemon went idle, so a
         // `record toggle` issued next reads idle and sends a start.
         assert!(started.elapsed() >= Duration::from_millis(150));
@@ -560,7 +603,12 @@ mod tests {
         std::fs::write(&state, "transcribing\n").unwrap();
 
         let cancel = dir.path().join("cancel");
-        assert!(!await_cancel(&cancel, &state, Duration::from_millis(100)));
+        assert!(!await_cancel(
+            &cancel,
+            &state,
+            Duration::from_millis(100),
+            None
+        ));
     }
 
     #[test]
@@ -585,7 +633,7 @@ mod tests {
         });
 
         let started = Instant::now();
-        assert!(await_cancel(&cancel, &state, Duration::from_secs(2)));
+        assert!(await_cancel(&cancel, &state, Duration::from_secs(2), None));
         assert!(started.elapsed() >= Duration::from_millis(200));
         assert!(!cancel.exists());
         daemon.join().unwrap();
