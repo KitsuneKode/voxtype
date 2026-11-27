@@ -461,3 +461,82 @@ async fn cancelled_queued_takes_are_kept_without_pre_roll() {
         })
         .await;
 }
+
+/// A capture whose start panics, as a poisoned lock or a driver bug would.
+struct PanickingAudio;
+#[async_trait::async_trait]
+impl AudioCapture for PanickingAudio {
+    async fn start(
+        &mut self,
+    ) -> std::result::Result<tokio::sync::mpsc::Receiver<Vec<f32>>, crate::error::AudioError> {
+        panic!("capture start panicked");
+    }
+    async fn stop(&mut self) -> std::result::Result<Vec<f32>, crate::error::AudioError> {
+        Ok(Vec::new())
+    }
+    async fn get_samples(&mut self) -> Vec<f32> {
+        Vec::new()
+    }
+}
+
+/// When the input task dies the daemon exits non-zero, so the service
+/// manager restarts it, and the state file says idle until then. It used to
+/// stay up with nothing reading the keys.
+#[test]
+fn a_dead_input_task_ends_the_daemon_with_a_failure() {
+    const NAME: &str =
+        "daemon::tests::history_contracts::a_dead_input_task_ends_the_daemon_with_a_failure";
+    if std::env::var("VOXTYPE_HISTORY_CONTRACT_CHILD").as_deref() == Ok(NAME) {
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(tokio::task::LocalSet::new().run_until(async {
+                let (mut daemon, h) = QueueHarness::new(&root, Arc::new(HeardAudio::default()));
+                daemon
+                    .mic
+                    .fixtures
+                    .lock()
+                    .unwrap()
+                    .push_back(Box::new(PanickingAudio));
+                let task = tokio::task::spawn_local(async move { daemon.run().await });
+                h.primary_transcribing().await;
+                h.press(None).await;
+                // The loop notices once it is back from the take in flight.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                h.release.send(()).unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+                panic!("the daemon stayed up without its input task");
+            }));
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let runtime = root.path().join("runtime");
+    std::fs::create_dir(&runtime).unwrap();
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", NAME, "--nocapture"])
+        .env_clear()
+        .env("HOME", root.path())
+        .env("TMPDIR", root.path())
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_DATA_HOME", root.path().join("data"))
+        .env("RUST_MIN_STACK", "16777216")
+        .env("VOXTYPE_HISTORY_CONTRACT_CHILD", NAME)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.status.code(), Some(1), "{log}");
+    assert!(log.contains("capture start panicked"), "{log}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("state")).unwrap(),
+        "idle"
+    );
+}

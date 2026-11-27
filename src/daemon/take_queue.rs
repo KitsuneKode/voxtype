@@ -76,6 +76,14 @@ impl Order {
     }
 }
 
+/// A panic while the lock was held must not take intake down with it: the
+/// guarded state is plain fields, each change a few assignments.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Default)]
 pub(super) struct TakeQueue {
     order: Mutex<Order>,
@@ -112,7 +120,7 @@ impl TakeQueue {
         }
     }
     fn change<R>(&self, change: impl FnOnce(&mut Order) -> R) -> R {
-        let mut order = self.order.lock().unwrap();
+        let mut order = lock(&self.order);
         let before = order.state();
         let result = change(&mut order);
         if order.state() != before {
@@ -142,11 +150,11 @@ impl TakeQueue {
         self.primary("transcribing");
     }
     fn accepting_overlap(&self) -> bool {
-        let q = self.order.lock().unwrap();
+        let q = lock(&self.order);
         q.processing || q.primary == "transcribing" || q.recording || !q.waiting.is_empty()
     }
     pub fn skip_post_process(&self) -> bool {
-        let mut q = self.order.lock().unwrap();
+        let mut q = lock(&self.order);
         if std::mem::take(&mut q.skip) {
             return true;
         }
@@ -156,7 +164,7 @@ impl TakeQueue {
             && read_bool_override("post_process") == Some(false)
     }
     pub fn cancel_primary(&self) -> bool {
-        let mut q = self.order.lock().unwrap();
+        let mut q = lock(&self.order);
         if std::mem::take(&mut q.cancel) {
             return true;
         }
@@ -269,7 +277,7 @@ impl Inputs {
                 _ = primary.closed() => return,
                 input = self.recv() => input,
                 _ = tick.tick(), if queueing && queue.accepting_overlap() => {
-                    if (active.is_some() || !queue.order.lock().unwrap().waiting.is_empty()) && queue.dir.join("cancel").exists() {
+                    if (active.is_some() || !lock(&queue.order).waiting.is_empty()) && queue.dir.join("cancel").exists() {
                         Input::Key(HotkeyEvent::Cancel)
                     } else if let Some(r) = &active {
                         let silent = match (&r.tracker, config.audio.external_trigger_silence_timeout_secs) {
@@ -671,6 +679,26 @@ mod tests {
         assert_eq!(read_state(), "idle");
         assert!(!queue.accepting_overlap());
         assert!(queue.next_for_delivery().is_none());
+    }
+
+    #[test]
+    fn a_panic_while_the_queue_is_locked_does_not_poison_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let queue = TakeQueue::running_in(Some(state.clone()), dir.path());
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            queue.change(|q| {
+                q.recording = true;
+                panic!("a change that panics");
+            })
+        }));
+        assert!(crashed.is_err());
+        assert!(queue.order.is_poisoned());
+        assert!(queue.accepting_overlap());
+        queue.change(|q| q.recording = false);
+        queue.primary("idle");
+        assert_eq!(std::fs::read_to_string(&state).unwrap(), "idle");
+        assert!(!queue.accepting_overlap());
     }
 
     #[test]

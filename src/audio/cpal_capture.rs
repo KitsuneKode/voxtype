@@ -33,6 +33,14 @@ struct StreamBuildParams {
     source_channels: usize,
 }
 
+/// The warm sender and the capture buffer stay usable after a panic while
+/// they were locked; a poisoned lock must not leave dictation deaf.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Only dictation captures share a warm stream. Dropping its last owner also
 /// wakes the capture thread, even when it is waiting on a long deadline.
 #[derive(Clone, Default)]
@@ -171,7 +179,7 @@ impl AudioCapture for CpalCapture {
 
         let (chunk_tx, chunk_rx) = mpsc::channel(64);
         if let Some(warm) = &self.warm {
-            let sender = warm.parked.lock().unwrap().take();
+            let sender = lock(&warm.parked).take();
             if let Some(sender) = sender {
                 let (ready, resumed) = oneshot::channel();
                 if sender
@@ -304,7 +312,7 @@ impl AudioCapture for CpalCapture {
             tracing::debug!("Audio capture thread started");
 
             serve_stream(cmd_rx, warm_window, |cmd| {
-                let mut buffer = buffer.lock().unwrap();
+                let mut buffer = lock(&buffer);
                 match cmd {
                     CaptureCommand::Stop(reply) => {
                         let healthy = !stream_dead.load(Ordering::SeqCst);
@@ -341,7 +349,7 @@ impl AudioCapture for CpalCapture {
             });
             // A macOS disconnect listener can hold its own stream clone.
             // Silence that callback and release the ring before pausing.
-            *buffer.lock().unwrap() = CaptureBuffer::Closed;
+            *lock(&buffer) = CaptureBuffer::Closed;
             let _ = stream.pause();
             drop(stream);
             tracing::debug!("Audio capture thread stopped");
@@ -387,7 +395,7 @@ impl AudioCapture for CpalCapture {
                 match tokio::time::timeout(std::time::Duration::from_secs(2), response_rx).await {
                     Ok(Ok(samples)) => {
                         if let Some(warm) = &self.warm {
-                            *warm.parked.lock().unwrap() = Some(cmd_tx);
+                            *lock(&warm.parked) = Some(cmd_tx);
                             self.thread_handle.take();
                         }
                         samples
@@ -528,6 +536,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::super::resampler::resample_buffer;
+
+    #[test]
+    fn a_poisoned_warm_sender_can_still_be_taken() {
+        use super::*;
+        let mic = DictationMic::default();
+        let parked = mic.parked.clone();
+        let _ = thread::spawn(move || {
+            let _held = parked.lock().unwrap();
+            panic!("a capture that panics while parking");
+        })
+        .join();
+        assert!(mic.parked.is_poisoned());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        *lock(&mic.parked) = Some(tx);
+        assert!(lock(&mic.parked).take().is_some());
+    }
 
     #[test]
     fn warm_window_closes_without_another_command() {

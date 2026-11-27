@@ -8101,6 +8101,7 @@ impl Daemon {
         let mut cap_warned = false;
         let mut transcribing_poll = tokio::time::interval(Duration::from_millis(100));
         transcribing_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut intake_died = false;
 
         loop {
             if state.is_idle() {
@@ -8394,7 +8395,15 @@ impl Daemon {
                     }
                 }
 
-                Some(take_queue::Routed(input, _ack)) = inputs.recv() => {
+                routed = inputs.recv() => {
+                    // Only a panic ends the input task while the daemon runs.
+                    // Without it no key, start or stop reaches this loop, so
+                    // exit and let the service manager start a working one.
+                    let Some(take_queue::Routed(input, _ack)) = routed else {
+                        tracing::error!("Dictation input stopped unexpectedly; exiting so the service restarts");
+                        intake_died = true;
+                        break;
+                    };
                     let external = matches!(input, Input::Start);
                     let start_request = external.then(StartRequest::read);
                     if matches!(input, Input::Start | Input::Stop) && cancel_applies_to(&state)
@@ -8945,9 +8954,14 @@ impl Daemon {
         // Remove override files on shutdown
         cleanup_profile_override();
 
-        // Remove state file on shutdown
+        // Remove state file on shutdown. After a failure the restart is
+        // seconds away: until then the file says idle, not what was in flight.
         if let Some(ref path) = self.state_file_path {
-            cleanup_state_file(path);
+            if intake_died {
+                write_state_file(path, "idle");
+            } else {
+                cleanup_state_file(path);
+            }
         }
 
         // Remove meeting state file on shutdown
@@ -9005,7 +9019,7 @@ impl Daemon {
         // `_exit` skips stdio flushing. Rust's stderr is unbuffered so the
         // tracing output above is already out; anything that starts buffering
         // daemon output has to flush before reaching here.
-        unsafe { libc::_exit(0) };
+        unsafe { libc::_exit(i32::from(intake_died)) };
     }
 }
 
