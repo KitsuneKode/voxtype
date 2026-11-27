@@ -378,7 +378,8 @@ the focused window at delivery time receives the text. Cancel drops the
 current recording, or the most recently stopped take still waiting in the
 queue, and keeps it for `voxtype record recover` as it does any cancelled
 take. A queued start honours `--model`, `--no-osd` and the start
-notification like any other. The state file shows `recording` during an overlapping
+notification like any other. At most 3 stopped takes wait; another start plays
+the error sound and records nothing until one is delivered. The state file shows `recording` during an overlapping
 take, then `transcribing` until delivery finishes.
 
 ### Example Session

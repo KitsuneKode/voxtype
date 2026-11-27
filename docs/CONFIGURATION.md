@@ -579,7 +579,8 @@ Environment: `VOXTYPE_WARM_MIC_SECS`, `VOXTYPE_PRE_ROLL_MS`. CLI:
 
 Lets a new dictation record while the previous one is still transcribing or
 being delivered. Each overlapping take waits in memory and is delivered in
-recording order, through batch transcription.
+recording order, through batch transcription. Up to 3 stopped takes can wait;
+a start beyond that plays the error sound and records nothing.
 
 When off, a start while a dictation is still transcribing or being delivered
 is ignored, as it always was.

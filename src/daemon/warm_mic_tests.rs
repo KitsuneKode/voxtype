@@ -540,3 +540,64 @@ fn a_dead_input_task_ends_the_daemon_with_a_failure() {
         "idle"
     );
 }
+
+/// At most `MAX_WAITING` stopped takes wait. A start beyond that opens no
+/// microphone; once the queue drains, the next start records again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_full_queue_refuses_another_start() {
+    const NAME: &str = "daemon::tests::history_contracts::a_full_queue_refuses_another_start";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let root = tempfile::tempdir().unwrap();
+            let heard = Arc::new(HeardAudio::default());
+            let (mut daemon, h) = QueueHarness::new(root.path(), heard.clone());
+            let opened: Vec<_> = (0..=take_queue::MAX_WAITING)
+                .map(|_| opened_flag())
+                .collect();
+            for flag in &opened {
+                daemon
+                    .mic
+                    .fixtures
+                    .lock()
+                    .unwrap()
+                    .push_back(Box::new(LifecycleAudio {
+                        samples: vec![0.2; 8000],
+                        started: flag.clone(),
+                    }));
+            }
+            let task = tokio::task::spawn_local(async move { daemon.run().await });
+            h.primary_transcribing().await;
+            for flag in &opened[..take_queue::MAX_WAITING] {
+                h.press(None).await;
+                until_true(|| is_set(flag) && h.says("recording")).await;
+                h.events.send(HotkeyEvent::Released).await.unwrap();
+                until_true(|| h.says("transcribing")).await;
+            }
+
+            let refused = &opened[take_queue::MAX_WAITING];
+            h.press(None).await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!is_set(refused), "a full queue opens no microphone");
+            assert!(h.says("transcribing"));
+            h.events.send(HotkeyEvent::Released).await.unwrap();
+
+            h.release.send(()).unwrap();
+            let delivered = 1 + take_queue::MAX_WAITING;
+            assert_eq!(
+                wait_for_entries(root.path(), delivered).await.len(),
+                delivered
+            );
+            until_true(|| h.says("idle")).await;
+            assert_eq!(heard.takes().len(), take_queue::MAX_WAITING);
+            h.press(None).await;
+            until_true(|| is_set(refused) && h.says("recording")).await;
+            h.events.send(HotkeyEvent::Cancel).await.unwrap();
+            until_true(|| h.says("idle")).await;
+            task.abort();
+            let _ = task.await;
+        })
+        .await;
+}

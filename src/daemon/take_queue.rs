@@ -49,6 +49,10 @@ impl Take {
     }
 }
 
+/// Stopped takes that may wait for delivery at once. Each holds its audio
+/// in memory, and a fourth means the delivery has fallen far behind.
+pub(super) const MAX_WAITING: usize = 3;
+
 #[derive(Default)]
 struct Order {
     sequence: u64,
@@ -363,6 +367,28 @@ impl Inputs {
                 Input::Key(HotkeyEvent::Released) | Input::Stop => None,
             };
             if let Some((model, profile, external)) = start {
+                let waiting = lock(&queue.order).waiting.len();
+                if waiting >= MAX_WAITING {
+                    tracing::warn!(
+                        "{waiting} dictations are waiting to be delivered; not starting another"
+                    );
+                    services.play(SoundEvent::Error);
+                    if external {
+                        let _request = StartRequest::read();
+                        apply_start_options();
+                        let options = Overrides::read();
+                        let _ = read_model_override();
+                        let _ = read_bool_override("no_osd");
+                        report_outcome(
+                            &config,
+                            &options,
+                            TranscriptOutcome::error(
+                                "Three dictations are already waiting to be delivered; try again once one is",
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 let request = external.then(StartRequest::read);
                 let older_cancel = queue.change(|q| {
                     let cancel = queue.dir.join("cancel");
