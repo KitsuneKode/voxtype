@@ -354,18 +354,6 @@ fn cleanup_pid_file(path: &PathBuf) {
     }
 }
 
-/// Check if cancel has been requested (via file trigger)
-fn check_cancel_requested() -> bool {
-    let cancel_file = Config::runtime_dir().join("cancel");
-    if cancel_file.exists() {
-        // Remove the file to acknowledge the cancel
-        let _ = std::fs::remove_file(&cancel_file);
-        true
-    } else {
-        false
-    }
-}
-
 /// Whether a pending `record cancel` has a session to act on. Idle and
 /// outputting states are left alone: a trigger written while idle is
 /// consumed when the next capture starts (#606), not by this path.

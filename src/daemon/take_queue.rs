@@ -71,6 +71,9 @@ impl Order {
 pub(super) struct TakeQueue {
     order: Mutex<Order>,
     path: Option<PathBuf>,
+    /// Where `record` leaves its control files (`cancel`, `cancel_ack`,
+    /// `start_requested`): the runtime directory, or a test's own.
+    dir: PathBuf,
     managed: bool,
     processing: watch::Sender<bool>,
     pub ready: Notify,
@@ -80,7 +83,16 @@ impl TakeQueue {
     pub fn new(path: Option<PathBuf>) -> Self {
         Self {
             path,
+            dir: Config::runtime_dir(),
             ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub fn running_in(path: Option<PathBuf>, dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            ..Self::running(path)
         }
     }
 
@@ -131,7 +143,7 @@ impl TakeQueue {
         }
         !q.recording
             && q.waiting.is_empty()
-            && !Config::runtime_dir().join(START_REQUEST_FILE).exists()
+            && !self.dir.join(START_REQUEST_FILE).exists()
             && read_bool_override("post_process") == Some(false)
     }
     pub fn cancel_primary(&self) -> bool {
@@ -142,14 +154,14 @@ impl TakeQueue {
         if q.recording || !q.waiting.is_empty() {
             return false;
         }
-        let dir = Config::runtime_dir();
+        let cancel = self.dir.join("cancel");
         if cancel_targets_start(
-            read_trigger_stamp(&dir.join(START_REQUEST_FILE)),
-            read_trigger_stamp(&dir.join("cancel")),
+            read_trigger_stamp(&self.dir.join(START_REQUEST_FILE)),
+            read_trigger_stamp(&cancel),
         ) {
             return false;
         }
-        check_cancel_requested()
+        std::fs::remove_file(cancel).is_ok()
     }
     pub fn next_for_delivery(&self) -> Option<Take> {
         self.change(|q| {
@@ -174,7 +186,7 @@ impl TakeQueue {
     fn cancel_waiting(&self) -> Option<Take> {
         self.change(|q| {
             let take = q.waiting.pop_back()?;
-            acknowledge_queue_cancel();
+            acknowledge_queue_cancel(&self.dir);
             Some(take)
         })
     }
@@ -244,7 +256,7 @@ impl Inputs {
                 _ = primary.closed() => return,
                 input = self.recv() => input,
                 _ = tick.tick(), if queue.accepting_overlap() => {
-                    if (active.is_some() || !queue.order.lock().unwrap().waiting.is_empty()) && Config::runtime_dir().join("cancel").exists() {
+                    if (active.is_some() || !queue.order.lock().unwrap().waiting.is_empty()) && queue.dir.join("cancel").exists() {
                         Input::Key(HotkeyEvent::Cancel)
                     } else if let Some(r) = &active {
                         let silent = match (&r.tracker, config.audio.external_trigger_silence_timeout_secs) {
@@ -261,7 +273,7 @@ impl Inputs {
                 None
             };
             if !queue.accepting_overlap()
-                || matches!(&input, Input::Start) && Config::runtime_dir().join("recover").exists()
+                || matches!(&input, Input::Start) && queue.dir.join("recover").exists()
             {
                 let (ack, done) = oneshot::channel();
                 processing.borrow_and_update();
@@ -330,7 +342,7 @@ impl Inputs {
             if let Some((model, profile, external)) = start {
                 let request = external.then(StartRequest::read);
                 let older_cancel = queue.change(|q| {
-                    let cancel = Config::runtime_dir().join("cancel");
+                    let cancel = queue.dir.join("cancel");
                     let mut dropped = None;
                     if cancel.exists()
                         && !cancel_targets_start(
@@ -342,7 +354,7 @@ impl Inputs {
                         if dropped.is_none() {
                             q.cancel = true;
                         }
-                        acknowledge_queue_cancel();
+                        acknowledge_queue_cancel(&queue.dir);
                     }
                     q.recording = true;
                     dropped
@@ -413,11 +425,11 @@ impl Inputs {
                 r.media.take();
                 let mut options = Overrides::read();
                 options.profile = options.profile.or(r.profile);
-                if cancelled || Config::runtime_dir().join("cancel").exists() {
+                if cancelled || queue.dir.join("cancel").exists() {
                     services.play(SoundEvent::Cancelled);
                     report_cancelled(&config, &options);
                     queue.change(|q| {
-                        acknowledge_queue_cancel();
+                        acknowledge_queue_cancel(&queue.dir);
                         q.recording = false;
                     });
                 } else if let Ok(samples) = samples {
@@ -457,8 +469,7 @@ fn report_outcome(config: &Config, options: &Overrides, outcome: TranscriptOutco
     }
 }
 
-fn acknowledge_queue_cancel() {
-    let dir = Config::runtime_dir();
+fn acknowledge_queue_cancel(dir: &Path) {
     if let Some(stamp) = read_trigger_stamp(&dir.join("cancel")) {
         let _ = std::fs::write(dir.join("cancel_ack"), stamp.to_string());
     }
@@ -526,7 +537,7 @@ mod tests {
     fn sequence_numbers_and_state_file_stay_in_order_across_overlapping_takes() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
-        let queue = TakeQueue::running(Some(state.clone()));
+        let queue = TakeQueue::running_in(Some(state.clone()), dir.path());
         let read_state = || std::fs::read_to_string(&state).unwrap();
 
         queue.primary("idle");
@@ -580,7 +591,7 @@ mod tests {
     fn active_overlapping_recording_is_not_overwritten_when_primary_finishes() {
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("state");
-        let queue = TakeQueue::running(Some(state.clone()));
+        let queue = TakeQueue::running_in(Some(state.clone()), dir.path());
         let read_state = || std::fs::read_to_string(&state).unwrap();
 
         queue.primary_finished_capture();
