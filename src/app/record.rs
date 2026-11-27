@@ -26,6 +26,21 @@ pub(crate) fn send_record_command(
     // checks in `voxtype meeting` and `voxtype status`.
     let pid = daemon_status::check_daemon_running()?;
 
+    // Recover: a trigger file, then the start signal the daemon already listens for.
+    if matches!(action, RecordAction::Recover) {
+        if !voxtype::cancelled_take::available() {
+            anyhow::bail!("No cancelled recording to bring back (one is kept for 10 minutes when it held at least 2 seconds of speech)");
+        }
+        let file = config::Config::runtime_dir().join("recover");
+        std::fs::write(&file, trigger_stamp())
+            .map_err(|e| anyhow::anyhow!("Failed to write recover request: {}", e))?;
+        if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
+            let _ = std::fs::remove_file(&file);
+            anyhow::bail!("Failed to send signal to daemon: {}", std::io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+
     // Handle cancel separately (uses file trigger instead of signal)
     if matches!(action, RecordAction::Cancel) {
         let state_file = config.resolve_state_file();
@@ -232,7 +247,7 @@ pub(crate) fn send_record_command(
                 libc::SIGUSR1 // Start
             }
         }
-        RecordAction::Cancel => unreachable!(), // Handled above
+        RecordAction::Cancel | RecordAction::Recover => unreachable!(), // Handled above
     };
 
     // With --wait, clear a previous run's completion sidecar before signalling,

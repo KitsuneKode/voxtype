@@ -562,6 +562,32 @@ async fn stream_post_process(
     }
 }
 
+/// What a cancel says when the take was kept for `voxtype record recover`.
+const KEPT_BODY: &str = "Kept for 10 minutes: voxtype record recover brings it back";
+
+/// Keep a cancelled take worth bringing back (off the async runtime), and
+/// have it removed once it is too old.
+async fn keep_cancelled_take(samples: Vec<f32>) -> bool {
+    let kept = tokio::task::spawn_blocking(move || crate::cancelled_take::keep(&samples))
+        .await
+        .unwrap_or(false);
+    if kept {
+        tracing::info!("Kept the cancelled take for `voxtype record recover`");
+        crate::cancelled_take::expire_later();
+    }
+    kept
+}
+
+/// Whether `voxtype record recover` asked for the cancelled take (consumes the trigger).
+fn take_recover_request() -> bool {
+    let file = Config::runtime_dir().join("recover");
+    let asked = file.exists();
+    if asked {
+        let _ = std::fs::remove_file(&file);
+    }
+    asked
+}
+
 /// Clean up any stale cancel file on startup
 fn cleanup_cancel_file() {
     let cancel_file = Config::runtime_dir().join("cancel");
@@ -3978,9 +4004,11 @@ impl Daemon {
         if state.is_recording() {
             tracing::info!("Recording cancelled");
 
-            // Stop recording and discard audio
+            let mut kept = false;
             if let Some(mut capture) = audio_capture.take() {
-                let _ = capture.stop().await;
+                if let Ok(samples) = capture.stop().await {
+                    kept = keep_cancelled_take(samples).await;
+                }
             }
             self.restore_recording_media();
 
@@ -4045,7 +4073,7 @@ impl Daemon {
 
             end_recording_notification(
                 "Cancelled",
-                "Recording discarded",
+                if kept { KEPT_BODY } else { "Recording discarded" },
                 &self.config.output.notification,
                 self.config.engine,
             )
@@ -4121,9 +4149,13 @@ impl Daemon {
         // Going idle writes the history entry: what it records goes first.
         self.update_state("idle");
         self.play_feedback(SoundEvent::Cancelled);
+        let mut kept = false;
         if let Some(mut c) = audio_capture.take() {
-            let _ = c.stop().await;
+            if let Ok(samples) = c.stop().await {
+                kept = keep_cancelled_take(samples).await;
+            }
         }
+        let notification_body = if kept { KEPT_BODY } else { notification_body };
         self.restore_recording_media();
         if let Some(task) = backend_task {
             let _ = task.await;
@@ -6554,6 +6586,41 @@ impl Daemon {
         }
     }
 
+    /// `voxtype record recover`: transcribe the take a cancel kept, and deliver
+    /// it like any other, through the same cleanup and output.
+    async fn recover_cancelled_take(&mut self, state: &mut State) {
+        let Some(samples) = tokio::task::spawn_blocking(crate::cancelled_take::take)
+            .await
+            .ok()
+            .flatten()
+        else {
+            tracing::info!("No cancelled take to recover");
+            return;
+        };
+        tracing::info!("Recovering a cancelled take ({:.1}s)", samples.len() as f32 / 16000.0);
+        *state = State::Transcribing { audio: samples.clone() };
+        self.history_begin(state);
+        self.history_note(|p| p.transcribing(samples.len()));
+        self.update_state("transcribing");
+        let transcriber = match self.get_transcriber_for_recording(None).await {
+            Ok(transcriber) => transcriber,
+            Err(()) => {
+                self.history_note(|p| {
+                    p.outcome(
+                        crate::history::Outcome::TranscriptionFailed,
+                        Some("the model could not be loaded".into()),
+                    )
+                });
+                self.reset_to_idle(state).await;
+                return;
+            }
+        };
+        self.active_transcriber = Some(transcriber.clone());
+        self.transcription_task = Some(tokio::task::spawn_blocking(move || {
+            transcriber.transcribe(&samples)
+        }));
+    }
+
     /// Start transcription task (non-blocking, stores JoinHandle for later completion)
     /// Returns true if transcription was started, false if skipped (too short)
     async fn start_transcription_task(
@@ -8626,6 +8693,14 @@ impl Daemon {
                             &mut streaming_chain,
                             &mut eager_transcriber,
                         ).await;
+                    }
+                    if take_recover_request() {
+                        if state.is_idle() {
+                            self.recover_cancelled_take(&mut state).await;
+                        } else {
+                            tracing::info!("Ignoring recover: daemon is {}", state);
+                        }
+                        continue;
                     }
                     if !state.is_idle() {
                         tracing::info!(

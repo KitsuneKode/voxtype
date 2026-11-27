@@ -214,6 +214,12 @@ pub enum RecordAction {
     },
     /// Cancel current recording or transcription (discard without output)
     Cancel,
+    /// Bring back the last cancelled recording and transcribe it
+    ///
+    /// A cancelled take at least 2 seconds long, with speech in it, is kept
+    /// in memory for 10 minutes. This transcribes it and delivers the text
+    /// like any other dictation. Made for a keybinding.
+    Recover,
 }
 
 /// Resolve a paired enable/disable flag set into a tri-state override.
@@ -254,7 +260,7 @@ impl RecordAction {
                 paste,
                 ..
             } => (*type_mode, *clipboard, *paste, None),
-            RecordAction::Cancel => return None,
+            RecordAction::Cancel | RecordAction::Recover => return None,
         };
 
         if type_mode {
@@ -277,7 +283,7 @@ impl RecordAction {
     pub fn file_path(&self) -> Option<&str> {
         match self {
             RecordAction::Start { file, .. } | RecordAction::Toggle { file, .. } => file.as_deref(),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel | RecordAction::Recover => None,
         }
     }
 
@@ -288,7 +294,7 @@ impl RecordAction {
             RecordAction::Start { model, .. } | RecordAction::Toggle { model, .. } => {
                 model.as_deref()
             }
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel | RecordAction::Recover => None,
         }
     }
 
@@ -299,7 +305,7 @@ impl RecordAction {
             RecordAction::Start { profile, .. } | RecordAction::Toggle { profile, .. } => {
                 profile.as_deref()
             }
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel | RecordAction::Recover => None,
         }
     }
 
@@ -317,7 +323,7 @@ impl RecordAction {
                 no_auto_submit,
                 ..
             } => override_from_flags(*auto_submit, *no_auto_submit),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel | RecordAction::Recover => None,
         }
     }
 
@@ -329,7 +335,7 @@ impl RecordAction {
     pub fn suppress_osd(&self) -> bool {
         match self {
             RecordAction::Start { no_osd, .. } | RecordAction::Toggle { no_osd, .. } => *no_osd,
-            RecordAction::Stop { .. } | RecordAction::Cancel => false,
+            RecordAction::Stop { .. } | RecordAction::Cancel | RecordAction::Recover => false,
         }
     }
 
@@ -347,7 +353,7 @@ impl RecordAction {
                 no_shift_enter_newlines,
                 ..
             } => override_from_flags(*shift_enter_newlines, *no_shift_enter_newlines),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel | RecordAction::Recover => None,
         }
     }
 
@@ -365,7 +371,7 @@ impl RecordAction {
                 no_smart_auto_submit,
                 ..
             } => override_from_flags(*smart_auto_submit, *no_smart_auto_submit),
-            RecordAction::Stop { .. } | RecordAction::Cancel => None,
+            RecordAction::Stop { .. } | RecordAction::Cancel | RecordAction::Recover => None,
         }
     }
     /// Get the post-processing override from --post-process / --no-post-process
@@ -386,7 +392,7 @@ impl RecordAction {
             RecordAction::Stop {
                 no_post_process, ..
             } => no_post_process.then_some(false),
-            RecordAction::Cancel => None,
+            RecordAction::Cancel | RecordAction::Recover => None,
         }
     }
 }
