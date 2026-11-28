@@ -1026,6 +1026,8 @@ sample_rate = 16000
 # Keep the mic ready briefly between takes (default 0 seconds).
 # warm_mic_secs = 3
 # pre_roll_ms = 250
+# Keep listening after a stop while the last word is still said (default 0 ms)
+# release_tail_ms = 400
 # Record a new take while the last one is transcribing (default false)
 # queue_dictations = false
 max_duration_secs = 60

@@ -15,6 +15,7 @@ use crate::error::VadError;
 use std::path::{Path, PathBuf};
 
 pub use energy::EnergyVad;
+pub(crate) use energy::{rms as frame_rms, speech_level};
 pub use whisper_vad::WhisperVad;
 
 /// Result of voice activity detection

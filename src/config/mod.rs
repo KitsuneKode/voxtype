@@ -28,7 +28,8 @@ mod vad;
 mod whisper;
 
 pub use audio::{
-    AudioConfig, AudioFeedbackConfig, DeadInputConfig, MAX_PRE_ROLL_MS, MAX_WARM_MIC_SECS,
+    AudioConfig, AudioFeedbackConfig, DeadInputConfig, MAX_PRE_ROLL_MS, MAX_RELEASE_TAIL_MS,
+    MAX_WARM_MIC_SECS,
 };
 pub use default_config::{
     default_config_content, generated_config_content, new_config_content, DEFAULT_CONFIG,

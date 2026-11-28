@@ -36,6 +36,8 @@ pub(super) struct Take {
     pub options: Overrides,
     pub samples: Vec<f32>,
     pub prefix: usize,
+    /// Samples the release tail added after the stop.
+    pub tail: usize,
     pub started: Instant,
     pub external: bool,
     /// `record start --no-osd`, read when the take started.
@@ -544,6 +546,18 @@ impl Inputs {
                 }
             } else if let Some(mut r) = active.take() {
                 let prefix = r.capture.pre_roll_samples();
+                let cancel = queue.dir.join("cancel");
+                let tail = if cancelled {
+                    0
+                } else {
+                    audio::release_tail::hold(
+                        r.capture.as_mut(),
+                        config.audio.release_tail(),
+                        &config.vad,
+                        || cancel.exists(),
+                    )
+                    .await
+                };
                 let samples = r.capture.stop().await;
                 r.media.take();
                 let mut options = Overrides::read();
@@ -565,6 +579,7 @@ impl Inputs {
                         sequence: 0,
                         samples,
                         prefix,
+                        tail,
                         options,
                         started: r.started,
                         external: r.external,
@@ -680,6 +695,7 @@ mod tests {
             options: Overrides::default(),
             samples: vec![tag; 160],
             prefix: 0,
+            tail: 0,
             started: Instant::now(),
             external: false,
             no_osd: false,

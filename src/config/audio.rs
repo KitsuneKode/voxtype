@@ -22,6 +22,14 @@ pub struct AudioConfig {
     #[serde(default = "default_pre_roll_ms")]
     pub pre_roll_ms: u32,
 
+    /// Milliseconds a dictation may keep listening after its stop, for the
+    /// syllable still in the air. The tail follows the audio: speech at the
+    /// stop runs until a short silence or this cap, an already silent take
+    /// ends after a brief guard. Zero (the default) stops at once. Cancel
+    /// never takes a tail.
+    #[serde(default)]
+    pub release_tail_ms: u32,
+
     /// Let a new dictation record while the previous one is still being
     /// transcribed or delivered; the takes are delivered in order. Off, a
     /// start while one is in flight is ignored, as it always was.
@@ -119,6 +127,7 @@ impl Default for AudioConfig {
             sample_rate: default_audio_sample_rate(),
             warm_mic_secs: 0,
             pre_roll_ms: default_pre_roll_ms(),
+            release_tail_ms: 0,
             queue_dictations: false,
             max_duration_secs: default_audio_max_duration_secs(),
             keep_failed_recordings: default_keep_failed_recordings(),
@@ -152,6 +161,9 @@ pub const MAX_WARM_MIC_SECS: u32 = 120;
 /// recording of the room.
 pub const MAX_PRE_ROLL_MS: u32 = 2000;
 
+/// Longest release tail, in milliseconds: the end of a word, not a pause.
+pub const MAX_RELEASE_TAIL_MS: u32 = 1000;
+
 impl AudioConfig {
     /// `warm_mic_secs`, held to [`MAX_WARM_MIC_SECS`] whatever set it.
     pub fn warm_mic_window(&self) -> std::time::Duration {
@@ -161,6 +173,11 @@ impl AudioConfig {
     /// `pre_roll_ms`, held to [`MAX_PRE_ROLL_MS`] whatever set it.
     pub fn pre_roll(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.pre_roll_ms.min(MAX_PRE_ROLL_MS).into())
+    }
+
+    /// `release_tail_ms`, held to [`MAX_RELEASE_TAIL_MS`] whatever set it.
+    pub fn release_tail(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.release_tail_ms.min(MAX_RELEASE_TAIL_MS).into())
     }
 }
 

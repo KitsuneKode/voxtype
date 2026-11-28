@@ -54,6 +54,10 @@ sample_rate = 16000
 # warm_mic_secs = 0
 # pre_roll_ms = 250
 
+# After a stop, keep listening while the last word is still being said: up
+# to release_tail_ms, ending after a short silence (0 = stop at once)
+# release_tail_ms = 0
+
 # Let a new dictation record while the last one is transcribing (default false)
 # queue_dictations = false
 

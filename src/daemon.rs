@@ -1530,6 +1530,9 @@ pub struct Daemon {
     frozen: Option<Overrides>,
     mic: audio::cpal_capture::DictationMic,
     pre_roll_samples: usize,
+    /// Samples the release tail added after this take's stop; like
+    /// pre-roll they don't count toward the too-short guard.
+    release_tail_samples: usize,
     config: Config,
     pending_language: Option<Config>,
     /// When the `record start` being handled was issued, while that start
@@ -1810,6 +1813,13 @@ impl Daemon {
 
     pub fn new(mut config: Config, config_path: Option<PathBuf>) -> Self {
         config.whisper.audio_over_stdin = config.audio.warm_mic_secs > 0;
+        if config.audio.release_tail_ms > crate::config::MAX_RELEASE_TAIL_MS {
+            tracing::warn!(
+                "release_tail_ms = {} is above its cap; using {} ms",
+                config.audio.release_tail_ms,
+                crate::config::MAX_RELEASE_TAIL_MS
+            );
+        }
         let state_file_path = config.resolve_state_file();
         let preedit = (config.output.preedit || config.output.read_field)
             .then(output::preedit::PreeditHandle::wayland)
@@ -1949,6 +1959,7 @@ impl Daemon {
             frozen: None,
             mic: Default::default(),
             pre_roll_samples: 0,
+            release_tail_samples: 0,
             start_request: None,
             config,
             config_path,
@@ -2554,6 +2565,7 @@ impl Daemon {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
                     self.pre_roll_samples = capture.pre_roll_samples();
+                    self.release_tail_samples = 0;
                     self.is_external_trigger = track_silence;
                     let speech_tracker = self.new_speech_tracker(track_silence);
                     self.silence_tracker = speech_tracker.clone();
@@ -3129,6 +3141,22 @@ impl Daemon {
         true
     }
 
+    /// Keep the take recording for its release tail (`release_tail_ms`)
+    /// before it is stopped. The state, the OSD and the streaming feed carry
+    /// on as they were, so the tail reaches the live stream, the final pass
+    /// and the batch transcript alike.
+    async fn hold_release_tail(&mut self, audio_capture: &mut Option<Box<dyn AudioCapture>>) {
+        self.release_tail_samples = 0;
+        let cap = self.config.audio.release_tail();
+        let Some(capture) = audio_capture.as_mut() else {
+            return;
+        };
+        let cancel = Config::runtime_dir().join("cancel");
+        self.release_tail_samples =
+            audio::release_tail::hold(capture.as_mut(), cap, &self.config.vad, || cancel.exists())
+                .await;
+    }
+
     /// Stop whatever recording is currently active — streaming, batch
     /// (`State::Recording`), or eager — and hand it off to transcription.
     /// Shared by the SIGUSR2 handler (explicit `record stop` / compositor
@@ -3146,6 +3174,9 @@ impl Daemon {
     ) {
         self.disarm_dead_input_guard();
 
+        if state.is_recording() {
+            self.hold_release_tail(audio_capture).await;
+        }
         // Notify an external-trigger caller that this session is ending,
         // regardless of why (stop, silence timeout, hard timeout) — it may
         // not be the one that decided to stop it — and disarm silence
@@ -4630,6 +4661,7 @@ impl Daemon {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
                     self.pre_roll_samples = capture.pre_roll_samples();
+                    self.release_tail_samples = 0;
                     let chunk_rx = self.start_incremental_final_pass(chunk_rx);
                     // Bounded; backed-up streaming backend drops chunks
                     // rather than back-pressuring the capture. Deep enough
@@ -6993,6 +7025,7 @@ impl Daemon {
     /// it like any other, through the same cleanup and output.
     async fn recover_cancelled_take(&mut self, state: &mut State) {
         self.pre_roll_samples = 0;
+        self.release_tail_samples = 0;
         let Some(samples) = tokio::task::spawn_blocking(crate::cancelled_take::take)
             .await
             .ok()
@@ -7099,8 +7132,13 @@ impl Daemon {
         self.history_note(|p| p.transcribing(samples.len()));
 
         // Skip if too short (likely accidental press). Pre-roll is sound from
-        // before the key went down, so it does not make a tap long enough.
-        let pressed = samples.len().saturating_sub(self.pre_roll_samples) as f32 / 16000.0;
+        // before the key went down and the release tail from after it came
+        // up, so neither makes a tap long enough.
+        let pressed = samples
+            .len()
+            .saturating_sub(self.pre_roll_samples + self.release_tail_samples)
+            as f32
+            / 16000.0;
         if pressed < 0.3 {
             tracing::debug!("Recording too short ({:.2}s), ignoring", pressed);
             self.publish_empty_outcome();
@@ -8639,6 +8677,7 @@ impl Daemon {
                 if let Some(take) = queue.next_for_delivery() {
                     tracing::debug!(sequence = take.sequence, "Processing queued dictation");
                     self.pre_roll_samples = take.prefix;
+                    self.release_tail_samples = take.tail;
                     self.frozen = Some(take.options);
                     self.osd_session_suppressed
                         .store(take.no_osd, std::sync::atomic::Ordering::Relaxed);

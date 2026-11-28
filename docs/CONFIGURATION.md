@@ -578,6 +578,33 @@ environment or on the command line is treated as the cap.
 Environment: `VOXTYPE_WARM_MIC_SECS`, `VOXTYPE_PRE_ROLL_MS`. CLI:
 `--warm-mic-secs`, `--pre-roll-ms`.
 
+### release_tail_ms
+
+The end-of-take buffer. A stop often arrives while the last syllable is still
+being said; with `release_tail_ms` set, a dictation keeps listening after its
+stop for a tail that follows the audio:
+
+- If the last 100 ms before the stop holds speech, it keeps listening until
+  150 ms of silence or `release_tail_ms`, whichever comes first.
+- If the take is already silent, it stops after a 70 ms guard.
+
+Speech is measured the way the energy VAD measures it: against the take's own
+noise floor, and a single key click is not speech. The OSD and the state file
+keep showing recording during the tail, and no sound is played for it. Cancel
+never takes a tail, and `voxtype record cancel` during one ends it. The tail is part of
+what is transcribed (streaming and the final pass included) but not of the
+0.3 s too-short check, so a tap stays a tap.
+
+The default is **0** (stop at once). 300 to 500 is a useful range; it is capped
+at 1000, and `voxtype config set` refuses more.
+
+Environment: `VOXTYPE_RELEASE_TAIL_MS`. CLI: `--release-tail-ms`.
+
+```toml
+[audio]
+release_tail_ms = 400
+```
+
 ### queue_dictations
 
 **Type:** Boolean

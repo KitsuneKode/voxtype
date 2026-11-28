@@ -849,3 +849,190 @@ async fn without_a_warm_mic_the_transcriber_gets_exactly_the_capture() {
     daemon.handle_transcription_result(&mut state, result).await;
     assert_eq!(heard.takes(), [captured]);
 }
+
+/// A take that has captured `captured` and, read while it records, goes on
+/// capturing `after` 10 ms at a time, then near-silence.
+struct TailAudio {
+    captured: Vec<f32>,
+    after: Vec<f32>,
+    prefix: usize,
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl TailAudio {
+    fn new(captured: Vec<f32>, after: Vec<f32>, prefix: usize) -> Self {
+        Self {
+            captured,
+            after,
+            prefix,
+            reads: Arc::default(),
+        }
+    }
+}
+#[async_trait::async_trait]
+impl AudioCapture for TailAudio {
+    async fn start(
+        &mut self,
+    ) -> std::result::Result<tokio::sync::mpsc::Receiver<Vec<f32>>, crate::error::AudioError> {
+        Ok(tokio::sync::mpsc::channel(1).1)
+    }
+    fn pre_roll_samples(&self) -> usize {
+        self.prefix
+    }
+    async fn stop(&mut self) -> std::result::Result<Vec<f32>, crate::error::AudioError> {
+        Ok(std::mem::take(&mut self.captured))
+    }
+    async fn get_samples(&mut self) -> Vec<f32> {
+        Vec::new()
+    }
+    async fn captured_since(&mut self, from: usize, at_most: usize) -> Option<(usize, Vec<f32>)> {
+        use std::sync::atomic::Ordering;
+        if self.reads.fetch_add(1, Ordering::Relaxed) > 0 {
+            let n = 160.min(self.after.len());
+            let next: Vec<f32> = self.after.drain(..n).collect();
+            if next.is_empty() {
+                self.captured.extend(std::iter::repeat_n(0.0005, 160));
+            } else {
+                self.captured.extend(next);
+            }
+        }
+        let total = self.captured.len();
+        let from = from.max(total.saturating_sub(at_most)).min(total);
+        Some((total, self.captured[from..].to_vec()))
+    }
+}
+
+/// `ms` of a speech-level tone.
+fn voiced(ms: usize) -> Vec<f32> {
+    (0..ms * 16)
+        .map(|i| 0.2 * (i as f32 * 0.07).sin())
+        .collect()
+}
+
+/// `ms` of room tone.
+fn hush(ms: usize) -> Vec<f32> {
+    vec![0.0005; ms * 16]
+}
+
+/// With `release_tail_ms` set, a stop on running speech keeps recording
+/// until the speech stops (here 200 ms of it, then the 150 ms silence) and
+/// the transcriber hears the tail. Off, and on cancel, the capture is never
+/// read for a tail and the take is exactly what was captured at the stop.
+#[tokio::test]
+async fn release_tail_reaches_the_transcript_but_never_a_cancel() {
+    const NAME: &str =
+        "daemon::tests::history_contracts::release_tail_reaches_the_transcript_but_never_a_cancel";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (mut daemon, heard) = quiet_daemon(root.path());
+    let before = [hush(1000), voiced(800)].concat();
+    let recording = || State::Recording {
+        started_at: Instant::now(),
+        model_override: None,
+    };
+
+    for (tail_ms, expected) in [(1000, before.len() + 350 * 16), (0, before.len())] {
+        daemon.config.audio.release_tail_ms = tail_ms;
+        let take = TailAudio::new(before.clone(), voiced(200), 0);
+        let reads = take.reads.clone();
+        let mut capture: Option<Box<dyn AudioCapture>> = Some(Box::new(take));
+        let mut state = recording();
+        daemon
+            .stop_active_recording(
+                &mut state,
+                &mut capture,
+                &mut None,
+                &mut None,
+                &mut None,
+            )
+            .await;
+        finish_transcription(&mut daemon).await;
+        assert_eq!(
+            heard.takes().last().unwrap().len(),
+            expected,
+            "release_tail_ms = {tail_ms}"
+        );
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed) == 0,
+            tail_ms == 0
+        );
+        daemon.reset_to_idle(&mut state).await;
+    }
+
+    daemon.config.audio.release_tail_ms = 1000;
+    let take = TailAudio::new(before.clone(), voiced(200), 0);
+    let reads = take.reads.clone();
+    let mut capture: Option<Box<dyn AudioCapture>> = Some(Box::new(take));
+    let mut state = recording();
+    daemon
+        .cancel_requested_session(
+            &mut state,
+            &mut capture,
+            &mut None,
+            &mut None,
+            &mut None,
+            &mut None,
+        )
+        .await;
+    assert!(state.is_idle());
+    assert_eq!(
+        reads.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "cancel takes no tail"
+    );
+    assert_eq!(heard.takes().len(), 2);
+}
+
+/// Pre-roll before the key and a full release tail after it don't make a
+/// 60 ms tap long enough to transcribe; a real 300 ms press with both is.
+#[tokio::test]
+async fn pre_roll_and_release_tail_dont_make_a_tap_a_take() {
+    const NAME: &str =
+        "daemon::tests::history_contracts::pre_roll_and_release_tail_dont_make_a_tap_a_take";
+    if !enter_private_case(NAME) {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let (mut daemon, heard) = quiet_daemon(root.path());
+    daemon.config.audio.release_tail_ms = 500;
+    let pre_roll = 250 * 16;
+
+    for (pressed_ms, transcribed) in [(60, false), (310, true)] {
+        let captured = [hush(250), voiced(pressed_ms)].concat();
+        let mut capture: Option<Box<dyn AudioCapture>> =
+            Some(Box::new(TailAudio::new(captured, voiced(2000), pre_roll)));
+        daemon.pre_roll_samples = pre_roll;
+        let mut state = State::Recording {
+            started_at: Instant::now(),
+            model_override: None,
+        };
+        daemon
+            .stop_active_recording(
+                &mut state,
+                &mut capture,
+                &mut None,
+                &mut None,
+                &mut None,
+            )
+            .await;
+        assert_eq!(
+            daemon.release_tail_samples,
+            500 * 16,
+            "the tail ran to its cap"
+        );
+        assert_eq!(
+            daemon.transcription_task.is_some(),
+            transcribed,
+            "{pressed_ms} ms press"
+        );
+        finish_transcription(&mut daemon).await;
+        daemon.reset_to_idle(&mut state).await;
+    }
+    let lengths: Vec<usize> = heard.takes().iter().map(Vec::len).collect();
+    assert_eq!(
+        lengths,
+        [(250 + 310 + 500) * 16],
+        "pre-roll and tail are still transcribed"
+    );
+}

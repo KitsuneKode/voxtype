@@ -295,6 +295,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     {
         config.audio.pre_roll_ms = value;
     }
+    if let Some(value) = std::env::var("VOXTYPE_RELEASE_TAIL_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        config.audio.release_tail_ms = value;
+    }
     if let Ok(val) = std::env::var("VOXTYPE_QUEUE_DICTATIONS") {
         config.audio.queue_dictations = parse_bool_env(&val);
     }

@@ -24,6 +24,7 @@ pub struct AudioState {
     pub device: String,
     pub warm_mic_secs: u32,
     pub pre_roll_ms: u32,
+    pub release_tail_ms: u32,
     pub queue_dictations: bool,
     pub max_duration_secs: u32,
     pub keep_failed_recordings: bool,
@@ -81,6 +82,7 @@ pub enum Field {
     Device,
     WarmMic,
     PreRoll,
+    ReleaseTail,
     QueueDictations,
     MaxDuration,
     KeepFailedRecordings,
@@ -101,6 +103,7 @@ impl Field {
         Field::Device,
         Field::WarmMic,
         Field::PreRoll,
+        Field::ReleaseTail,
         Field::QueueDictations,
         Field::MaxDuration,
         Field::KeepFailedRecordings,
@@ -138,6 +141,8 @@ const DEAD_INPUT_WINDOW_MAX: u32 = 30_000;
 const DEAD_INPUT_THRESHOLD_STEP: f32 = 5.0;
 const DEAD_INPUT_THRESHOLD_MIN: f32 = -120.0;
 const DEAD_INPUT_THRESHOLD_MAX: f32 = 0.0;
+const RELEASE_TAIL_STEP: i32 = 50;
+const RELEASE_TAIL_MAX: u32 = crate::config::MAX_RELEASE_TAIL_MS;
 
 impl AudioState {
     pub fn load() -> Result<Self, EditorError> {
@@ -154,6 +159,10 @@ impl AudioState {
                 .get_int("audio", "pre_roll_ms")
                 .map(|n| n.clamp(0, PRE_ROLL_MAX as i64) as u32)
                 .unwrap_or_else(|| AudioConfig::default().pre_roll_ms),
+            release_tail_ms: ed
+                .get_int("audio", "release_tail_ms")
+                .map(|n| n.clamp(0, RELEASE_TAIL_MAX as i64) as u32)
+                .unwrap_or_default(),
             queue_dictations: ed.get_bool("audio", "queue_dictations").unwrap_or(false),
             max_duration_secs: ed
                 .get_int("audio", "max_duration_secs")
@@ -269,6 +278,7 @@ impl AudioState {
         ed.set_string("audio", "device", &self.device);
         ed.set_int("audio", "warm_mic_secs", self.warm_mic_secs as i64);
         ed.set_int("audio", "pre_roll_ms", self.pre_roll_ms as i64);
+        ed.set_int("audio", "release_tail_ms", self.release_tail_ms as i64);
         ed.set_bool("audio", "queue_dictations", self.queue_dictations);
         ed.set_int("audio", "max_duration_secs", self.max_duration_secs as i64);
         ed.set_bool(
@@ -380,6 +390,10 @@ impl AudioState {
             Field::PreRoll => {
                 let next = self.pre_roll_ms as i32 + delta * PRE_ROLL_STEP;
                 self.pre_roll_ms = next.clamp(0, PRE_ROLL_MAX as i32) as u32;
+            }
+            Field::ReleaseTail => {
+                let next = self.release_tail_ms as i32 + delta * RELEASE_TAIL_STEP;
+                self.release_tail_ms = next.clamp(0, RELEASE_TAIL_MAX as i32) as u32;
             }
             Field::QueueDictations => {
                 self.queue_dictations = !self.queue_dictations;
@@ -534,6 +548,15 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
             format!("{} ms", state.pre_roll_ms),
         )
         .dimmed(state.warm_mic_secs == 0),
+        FormRowSpec::new(
+            state.field == Field::ReleaseTail,
+            "Keep listening after stop",
+            if state.release_tail_ms == 0 {
+                "off".to_string()
+            } else {
+                format!("up to {} ms", state.release_tail_ms)
+            },
+        ),
         FormRowSpec::new(
             state.field == Field::QueueDictations,
             "Record while transcribing",
@@ -710,6 +733,16 @@ fn guidance_for_field(state: &AudioState) -> Vec<Line<'_>> {
                 "How much sound from before the key a warm start keeps, so a \
                  first word spoken with the press is not clipped. 250 ms is \
                  the default.",
+            ),
+        ],
+        Field::ReleaseTail => vec![
+            heading("Keep listening after stop"),
+            Line::from(""),
+            Line::from(
+                "A stop on a word still being said keeps listening until a \
+                 short silence, at most this long, so the last syllable is \
+                 not clipped. A take that is already quiet stops after 70 ms. \
+                 Cancel never waits. Off by default.",
             ),
         ],
         Field::QueueDictations => vec![
@@ -1007,6 +1040,7 @@ mod tests {
                 Field::Device => "audio.device",
                 Field::WarmMic => "audio.warm_mic_secs",
                 Field::PreRoll => "audio.pre_roll_ms",
+                Field::ReleaseTail => "audio.release_tail_ms",
                 Field::QueueDictations => "audio.queue_dictations",
                 Field::MaxDuration => "audio.max_duration_secs",
                 Field::KeepFailedRecordings => "audio.keep_failed_recordings",

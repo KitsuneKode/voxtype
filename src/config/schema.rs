@@ -1120,6 +1120,18 @@ pub const CONFIG_KEYS: &[KeySpec] = &[
         "Audio to retain before the next warm start, in milliseconds.",
     ),
     spec(
+        "audio.release_tail_ms",
+        "audio",
+        "release_tail_ms",
+        KeyType::Int {
+            min: 0,
+            max: crate::config::MAX_RELEASE_TAIL_MS as i64,
+        },
+        "Audio",
+        "Release tail ms",
+        "Keep listening after a stop while the last word is still said, in milliseconds (0 disables).",
+    ),
+    spec(
         "audio.queue_dictations",
         "audio",
         "queue_dictations",
@@ -3763,6 +3775,7 @@ pub fn resolve(key: &str, cfg: &Config) -> Option<Json> {
         "audio.device" => json!(cfg.audio.device),
         "audio.warm_mic_secs" => json!(cfg.audio.warm_mic_secs),
         "audio.pre_roll_ms" => json!(cfg.audio.pre_roll_ms),
+        "audio.release_tail_ms" => json!(cfg.audio.release_tail_ms),
         "audio.queue_dictations" => json!(cfg.audio.queue_dictations),
         "audio.max_duration_secs" => json!(cfg.audio.max_duration_secs),
         "audio.keep_failed_recordings" => json!(cfg.audio.keep_failed_recordings),
@@ -4562,6 +4575,7 @@ mod tests {
         for (key, cap) in [
             ("audio.warm_mic_secs", crate::config::MAX_WARM_MIC_SECS),
             ("audio.pre_roll_ms", crate::config::MAX_PRE_ROLL_MS),
+            ("audio.release_tail_ms", crate::config::MAX_RELEASE_TAIL_MS),
         ] {
             assert!(validate_value(spec(key), &cap.to_string()).is_ok(), "{key}");
             assert!(
@@ -4572,12 +4586,16 @@ mod tests {
         let mut audio = crate::config::AudioConfig {
             warm_mic_secs: 3600,
             pre_roll_ms: 60_000,
+            release_tail_ms: 5_000,
             ..Default::default()
         };
+        assert_eq!(audio.release_tail(), std::time::Duration::from_millis(1000));
         assert_eq!(audio.warm_mic_window(), std::time::Duration::from_secs(120));
         assert_eq!(audio.pre_roll(), std::time::Duration::from_millis(2000));
         audio.warm_mic_secs = 3;
         audio.pre_roll_ms = 250;
+        audio.release_tail_ms = 0;
+        assert!(audio.release_tail().is_zero());
         assert_eq!(audio.warm_mic_window(), std::time::Duration::from_secs(3));
         assert_eq!(audio.pre_roll(), std::time::Duration::from_millis(250));
     }
