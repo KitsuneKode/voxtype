@@ -60,8 +60,15 @@ impl WtypeOutput {
         let mut debug_args = vec!["wtype".to_string()];
 
         // Add pre-typing delay if configured (helps prevent first character drop)
-        if self.pre_type_delay_ms > 0 && super::take::DELIVERY_TAKE.try_with(Option::is_some).unwrap_or(false) {
-            tokio::time::sleep(std::time::Duration::from_millis(self.pre_type_delay_ms.into())).await;
+        if self.pre_type_delay_ms > 0
+            && super::take::DELIVERY_TAKE
+                .try_with(Option::is_some)
+                .unwrap_or(false)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(
+                self.pre_type_delay_ms.into(),
+            ))
+            .await;
             super::take::check_target().await?;
         } else if self.pre_type_delay_ms > 0 {
             cmd.arg("-s").arg(self.pre_type_delay_ms.to_string());
@@ -214,7 +221,9 @@ impl TextOutput for WtypeOutput {
             .unwrap_or(false)
     }
 
-    fn inserts_directly(&self) -> bool { true }
+    fn inserts_directly(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &'static str {
         "wtype"

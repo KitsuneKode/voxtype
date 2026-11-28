@@ -26,8 +26,8 @@ use crate::output;
 use crate::output::post_process::PostProcessor;
 use crate::output::preview::{PreviewFile, TakePreview};
 use crate::output::streaming::StreamingSession;
-use crate::output::TextOutput;
 use crate::output::take::TakeIdentity;
+use crate::output::TextOutput;
 use crate::state::{ChunkResult, State};
 use crate::text::vocabulary::Vocabulary;
 use crate::text::TextProcessor;
@@ -553,7 +553,10 @@ async fn stream_post_process(
             }
         }
     }
-    match out.finish(post_process_marked_private(post_process_started)).await {
+    match out
+        .finish(post_process_marked_private(post_process_started))
+        .await
+    {
         Ok(delivered) => {
             tracing::info!(
                 "Post-processed (streamed): changed: {}, first text after {}ms, done after {}ms",
@@ -816,6 +819,14 @@ fn parse_output_mode_override(content: &str) -> Option<OutputOverride> {
 /// a streaming session's output chain.
 /// Whether the post-process command marked this take private (Shuush writes
 /// `pp_private` for password fields, password managers and sign-in pages).
+fn remove_last_take(runtime: &Path) {
+    if let Err(e) = std::fs::remove_file(runtime.join("last_take.wav")) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("Cannot remove a private take's audio: {e}");
+        }
+    }
+}
+
 fn post_process_marked_private(since: std::time::SystemTime) -> bool {
     std::fs::metadata(Config::runtime_dir().join("pp_private"))
         .and_then(|m| m.modified())
@@ -2194,13 +2205,23 @@ impl Daemon {
         *self.dictation.lock().unwrap_or_else(|e| e.into_inner()) = pending;
     }
 
-    /// Drop the dictation in flight from history (a private take).
+    /// The take is private: Shuush marked its own take directory, or the
+    /// focused field turned out to be a password or sensitive one.
+    fn take_is_private(&self) -> bool {
+        self.take.as_ref().is_some_and(TakeIdentity::private)
+            || self
+                .streaming_preview
+                .as_ref()
+                .is_some_and(TakePreview::suppressed)
+    }
+
+    /// Drop the dictation in flight from history and its audio (a private
+    /// take). Every `last_take.wav` writer of the take has been awaited by
+    /// the time post-processing decides it is private, so none can publish
+    /// the file again after this.
     fn forget_private_take(&self) {
         self.history_forget();
-        // All WAV writers are joined before post-processing starts.
-        if let Err(e) = std::fs::remove_file(Config::runtime_dir().join("last_take.wav")) {
-            if e.kind() != std::io::ErrorKind::NotFound { tracing::warn!("Cannot remove private take audio: {e}"); }
-        }
+        remove_last_take(&Config::runtime_dir());
     }
 
     fn history_forget(&self) {
@@ -2316,7 +2337,9 @@ impl Daemon {
             tray.update(tray_state_for(state_name, self.model_failed_at_startup));
         }
         if matches!(state_name, "idle" | "stopped") {
-            if let Some(preview) = &self.streaming_preview { preview.clear(); }
+            if let Some(preview) = &self.streaming_preview {
+                preview.clear();
+            }
         }
         self.queue.primary(state_name);
 
@@ -2468,7 +2491,9 @@ impl Daemon {
             use crate::history::Outcome;
             use osd::session::OutcomeKind;
             let decided = match outcome {
-                OutcomeKind::Ok | OutcomeKind::Delivered | OutcomeKind::ClipboardOnly => Outcome::Delivered,
+                OutcomeKind::Ok | OutcomeKind::Delivered | OutcomeKind::ClipboardOnly => {
+                    Outcome::Delivered
+                }
                 OutcomeKind::NoSpeech => Outcome::NoSpeech,
                 OutcomeKind::TooShort => Outcome::TooShort,
                 OutcomeKind::Empty => Outcome::Empty,
@@ -2477,7 +2502,10 @@ impl Daemon {
                 // seen before transcription instead of after it.
                 OutcomeKind::NoInput => Outcome::NoSpeech,
                 OutcomeKind::Error => Outcome::TranscriptionFailed,
-                OutcomeKind::OutputFailed | OutcomeKind::PrivateNotInserted | OutcomeKind::Failed | OutcomeKind::Recovered => Outcome::OutputFailed,
+                OutcomeKind::OutputFailed
+                | OutcomeKind::PrivateNotInserted
+                | OutcomeKind::Failed
+                | OutcomeKind::Recovered => Outcome::OutputFailed,
             };
             self.history_note(|p| p.outcome(decided, None));
         }
@@ -2492,7 +2520,11 @@ impl Daemon {
             &Config::runtime_dir(),
             &osd::session::OsdOutcome {
                 take_id: self.take.as_ref().map(|t| t.id.clone()),
-                outcome: if self.take.is_some() { outcome.for_identified_take() } else { outcome },
+                outcome: if self.take.is_some() {
+                    outcome.for_identified_take()
+                } else {
+                    outcome
+                },
                 session_started_at_ms: self.osd_session_started_at_ms,
                 suppressed: self
                     .osd_session_suppressed
@@ -2817,9 +2849,11 @@ impl Daemon {
         // end_streaming / cancel_streaming_to_idle clean it up otherwise.
         let output_override = peek_output_mode_override();
         let file_output_path = self.resolve_file_output_path(&output_override, None);
-        let defer_commit = self.take.is_some() || self.config.output.streaming_commit == StreamingCommit::OnStop;
+        let defer_commit =
+            self.take.is_some() || self.config.output.streaming_commit == StreamingCommit::OnStop;
         self.streaming_preview = Some(TakePreview::new(
-            self.config.output.resolve_streaming_preview_file(), &Config::runtime_dir(),
+            self.config.output.resolve_streaming_preview_file(),
+            &Config::runtime_dir(),
             self.take.as_ref().map(|t| t.dir.join("pp_private")),
             self.take.as_ref().is_some_and(|t| t.private()),
         ));
@@ -3332,7 +3366,13 @@ impl Daemon {
 
     /// [`write_last_take`](Self::write_last_take) off the runtime, without
     /// the pre-roll: only what was said after the key went down is kept.
+    /// A take already known to be private is not written, and the last
+    /// take's file is removed instead, so a replay never plays it.
     fn save_last_take(&self, audio: Arc<Vec<f32>>) -> tokio::task::JoinHandle<()> {
+        if self.take_is_private() {
+            let runtime = Config::runtime_dir();
+            return tokio::task::spawn_blocking(move || remove_last_take(&runtime));
+        }
         let rate = self.config.audio.sample_rate;
         let prefix = self.pre_roll_samples.min(audio.len());
         tokio::task::spawn_blocking(move || Self::write_last_take(&audio[prefix..], rate))
@@ -3880,7 +3920,7 @@ impl Daemon {
         let final_pass_pending = self.final_pass_task.is_some() || final_audio.is_some();
         if typed_chars == 0 && !final_pass_pending {
             if failure.is_some() && self.streaming_recovery_enabled() && !samples.is_empty() {
-                if let Some(mut p) = preview {
+                if let Some(p) = preview {
                     p.clear();
                 }
                 self.end_preedit();
@@ -3898,7 +3938,7 @@ impl Daemon {
                 && streaming_chain.is_none()
                 && !buffered.trim().is_empty()
             {
-                if let Some(mut p) = preview {
+                if let Some(p) = preview {
                     p.clear();
                 }
                 self.end_preedit();
@@ -4041,7 +4081,13 @@ impl Daemon {
                 .process_with_vocabulary(&raw_text, vocabulary);
             self.history_note(|p| p.texts(&raw_text, &final_text));
 
-            let delivery = self.deliver_file_output(&output_path, &final_text, false).await;
+            let private = self.take_is_private();
+            if private {
+                self.forget_private_take();
+            }
+            let delivery = self
+                .deliver_file_output(&output_path, &final_text, private)
+                .await;
             {
                 let (fell_back, error) = match &delivery {
                     FileDelivery::Written => (false, None),
@@ -7563,13 +7609,18 @@ impl Daemon {
                         preedit.set(&processed_text);
                     }
 
-                    let scoped_processor = self.take.as_ref().and_then(|take| processor.map(|p| p.for_take(&take.id)));
+                    let scoped_processor = self
+                        .take
+                        .as_ref()
+                        .and_then(|take| processor.map(|p| p.for_take(&take.id)));
                     let processor = scoped_processor.as_ref().or(processor);
                     let post_process_started = std::time::SystemTime::now();
                     let final_text = match processor {
                         None => processed_text,
                         Some(processor)
-                            if self.take.is_none() && processor.streaming()
+                            if self.take.is_none()
+                                && !self.take_is_private()
+                                && processor.streaming()
                                 && file_output_path.is_none()
                                 && output_config.mode == OutputMode::Type
                                 && output::config_for_text(&output_config, &processed_text)
@@ -7746,8 +7797,8 @@ impl Daemon {
 
                     // A private take (see `post_process_marked_private`) leaves
                     // no history, context, notification or undelivered copy.
-                    let private = self.take.as_ref().map_or_else(|| post_process_marked_private(post_process_started), TakeIdentity::private)
-                        || self.streaming_preview.as_ref().is_some_and(TakePreview::suppressed);
+                    let private =
+                        post_process_marked_private(post_process_started) || self.take_is_private();
                     if private {
                         self.forget_private_take();
                     }
@@ -7787,7 +7838,9 @@ impl Daemon {
                             text: final_text.clone(),
                         };
 
-                        let delivery = self.deliver_file_output(&output_path, &final_text, private).await;
+                        let delivery = self
+                            .deliver_file_output(&output_path, &final_text, private)
+                            .await;
                         {
                             use crate::history::{Outcome, OutputInfo};
                             let (fell_back, error) = match &delivery {
@@ -7857,7 +7910,11 @@ impl Daemon {
                         return;
                     }
 
-                    let long_config = if private { None } else { output::config_for_text(&output_config, &final_text) };
+                    let long_config = if private {
+                        None
+                    } else {
+                        output::config_for_text(&output_config, &final_text)
+                    };
                     if long_config.is_some() {
                         tracing::info!(
                             "Pasting {} chars instead of typing them",
@@ -7879,7 +7936,9 @@ impl Daemon {
                         );
                     }
 
-                    if private { output_chain.retain(|driver| driver.inserts_directly()); }
+                    if private {
+                        output_chain.retain(|driver| driver.inserts_directly());
+                    }
 
                     // Output the text
                     *state = State::Outputting {
@@ -7897,12 +7956,16 @@ impl Daemon {
                         ),
                     };
 
-                    let (report, delivery) = output::take::DELIVERY_TAKE.scope(self.take.clone(), output::output_with_fallback_report(
-                        &output_chain,
-                        &final_text,
-                        output_options,
-                    ))
-                    .await;
+                    let (report, delivery) = output::take::DELIVERY_TAKE
+                        .scope(
+                            self.take.clone(),
+                            output::output_with_fallback_report(
+                                &output_chain,
+                                &final_text,
+                                output_options,
+                            ),
+                        )
+                        .await;
                     {
                         use crate::history::{Outcome, OutputInfo};
                         let mode = format!("{:?}", output_config.mode).to_lowercase();
@@ -7929,24 +7992,41 @@ impl Daemon {
                     }
                     if let Err(e) = &delivery {
                         tracing::error!("Output failed: {}", e);
-                        let outcome = if matches!(e, crate::error::OutputError::TargetChanged) {
-                            self.take.as_ref().unwrap().target_lost(&final_text)
-                        } else if private { osd::session::OutcomeKind::PrivateNotInserted } else { osd::session::OutcomeKind::OutputFailed };
+                        let target_lost = matches!(e, crate::error::OutputError::TargetChanged);
+                        let outcome = match &self.take {
+                            Some(take) if target_lost => take.target_lost(&final_text),
+                            _ if private => osd::session::OutcomeKind::PrivateNotInserted,
+                            _ => osd::session::OutcomeKind::OutputFailed,
+                        };
                         self.publish_osd_outcome(outcome, 0);
-                        // Nothing typed or copied: keep the text recoverable,
-                        // unless [output] keep_undelivered_text is off.
-                        output::fallback::notify_failed(
-                            &report,
-                            &e,
-                            &final_text,
-                            self.config.output.keep_undelivered_text && !private && !matches!(e, crate::error::OutputError::TargetChanged),
-                        )
-                        .await;
+                        // A private take is only typed, never copied, and says
+                        // so in outcome.json, not in a notification. A take
+                        // whose window lost focus is saved in its directory.
+                        if !private && !target_lost {
+                            // Nothing typed or copied: keep the text recoverable,
+                            // unless [output] keep_undelivered_text is off.
+                            output::fallback::notify_failed(
+                                &report,
+                                e,
+                                &final_text,
+                                self.config.output.keep_undelivered_text,
+                            )
+                            .await;
+                        }
                     } else {
                         write_output_done(final_text.chars().count());
-                        if self.take.is_some() && delivery.as_ref().is_ok_and(|d| d.driver.starts_with("clipboard")) {
-                            self.publish_osd_outcome(osd::session::OutcomeKind::ClipboardOnly, final_text.chars().count());
-                        } else { self.publish_osd_text_outcome(&final_text); }
+                        if self.take.is_some()
+                            && delivery
+                                .as_ref()
+                                .is_ok_and(|d| d.driver.starts_with("clipboard"))
+                        {
+                            self.publish_osd_outcome(
+                                osd::session::OutcomeKind::ClipboardOnly,
+                                final_text.chars().count(),
+                            );
+                        } else {
+                            self.publish_osd_text_outcome(&final_text);
+                        }
                         self.play_feedback(SoundEvent::TranscriptionComplete);
                     }
                     // Says "copied to clipboard" (and why, once) when typing
@@ -8329,7 +8409,9 @@ impl Daemon {
         // and write_pid_file below.
         clear_previous_daemon_files(&Config::runtime_dir(), self.state_file_path.as_deref());
         let _ = std::fs::remove_file(Config::runtime_dir().join("sensitive_field"));
-        if let Some(path) = self.config.output.resolve_streaming_preview_file() { PreviewFile::new(path); }
+        if let Some(path) = self.config.output.resolve_streaming_preview_file() {
+            PreviewFile::new(path);
+        }
         mark_live_in_field(false);
         crate::cancelled_take::sweep();
         // The GGUF worker rewrites this once it has bound a backend; a report
@@ -8670,7 +8752,10 @@ impl Daemon {
             start: sigusr1,
             stop: sigusr2,
         };
-        let _control = take_queue::ControlFiles::publish(&Config::runtime_dir(), self.config.audio.queue_dictations)?;
+        let _control = take_queue::ControlFiles::publish(
+            &Config::runtime_dir(),
+            self.config.audio.queue_dictations,
+        )?;
         let mut intake_task = AbortOnDrop(Some(tokio::spawn(intake.route(
             tx,
             queue.clone(),
@@ -9954,7 +10039,9 @@ while True:
         async fn is_available(&self) -> bool {
             true
         }
-        fn inserts_directly(&self) -> bool { true }
+        fn inserts_directly(&self) -> bool {
+            true
+        }
         fn name(&self) -> &'static str {
             "recording"
         }
@@ -10979,6 +11066,117 @@ while True:
         assert!(
             store.all().unwrap_or_default().is_empty(),
             "recorded to history"
+        );
+    }
+
+    /// Copies text to the clipboard, the way paste and the clipboard
+    /// fallback do: a private take must never reach it.
+    struct ClipboardLikeOutput(Arc<std::sync::Mutex<Option<String>>>);
+
+    #[async_trait::async_trait]
+    impl TextOutput for ClipboardLikeOutput {
+        async fn output(&self, text: &str) -> std::result::Result<(), crate::error::OutputError> {
+            *self.0.lock().unwrap() = Some(text.to_string());
+            Ok(())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "clipboard"
+        }
+    }
+
+    /// A Shuush take marked private, whose only working output would copy
+    /// it: nothing is inserted or copied, outcome.json says so for that
+    /// take, and neither its audio nor a notice of it is left behind.
+    #[tokio::test]
+    async fn a_private_take_with_only_a_clipboard_output_is_not_inserted() {
+        const PROBE: &str = "private-clipboard";
+        const NAME: &str =
+            "daemon::tests::a_private_take_with_only_a_clipboard_output_is_not_inserted";
+        if std::env::var("VOXTYPE_HISTORY_METADATA_PROBE").as_deref() != Ok(PROBE) {
+            let fixture = tempfile::tempdir().unwrap();
+            let runtime = fixture.path().join("runtime");
+            std::fs::create_dir(&runtime).unwrap();
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", fixture.path())
+                .env("XDG_CONFIG_HOME", fixture.path().join("config"))
+                .env("XDG_DATA_HOME", fixture.path().join("data"))
+                .env("XDG_STATE_HOME", fixture.path().join("state"))
+                .env("XDG_RUNTIME_DIR", runtime)
+                .env("TMPDIR", fixture.path())
+                .env("RUST_MIN_STACK", "16777216")
+                .env("VOXTYPE_HISTORY_METADATA_PROBE", PROBE)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let fixture = tempfile::tempdir().unwrap();
+        let mut daemon = history_daemon(fixture.path());
+        daemon.config.engine = crate::config::TranscriptionEngine::Whisper;
+        daemon.config.output.wait_for_modifier_release = false;
+        daemon.config.output.notification.on_transcription = false;
+        let runtime = Config::runtime_dir();
+        let take_dir = runtime.join("takes").join("11");
+        std::fs::create_dir_all(&take_dir).unwrap();
+        std::fs::write(runtime.join("take_id"), "11").unwrap();
+        std::fs::write(
+            take_dir.join("target_window"),
+            r#"{"address":"0xabc","pid":4}"#,
+        )
+        .unwrap();
+        std::fs::write(take_dir.join("pp_private"), "").unwrap();
+        daemon.take = crate::output::take::TakeIdentity::capture(&runtime);
+        assert!(daemon.take.is_some());
+
+        // Audio of a take already known to be private is not kept, and the
+        // previous take's file goes too.
+        std::fs::write(runtime.join("last_take.wav"), "earlier").unwrap();
+        daemon
+            .save_last_take(Arc::new(vec![0.1; 16_000]))
+            .await
+            .unwrap();
+        assert!(
+            !runtime.join("last_take.wav").exists(),
+            "a private take's audio was kept"
+        );
+
+        let copied = Arc::new(std::sync::Mutex::new(None));
+        daemon.history_test_output_chain =
+            Some(vec![Box::new(ClipboardLikeOutput(copied.clone()))]);
+        daemon.begin_osd_session(&State::Recording {
+            started_at: std::time::Instant::now(),
+            model_override: None,
+        });
+        let mut state = State::Transcribing { audio: Vec::new() };
+        daemon
+            .handle_transcription_result(&mut state, Ok(Ok("hunter two".into())))
+            .await;
+
+        assert!(state.is_idle());
+        assert_eq!(*copied.lock().unwrap(), None, "a private take was copied");
+        let outcome: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(runtime.join("outcome.json")).unwrap())
+                .unwrap();
+        assert_eq!(outcome["outcome"], "private_not_inserted");
+        assert_eq!(outcome["take_id"], "11");
+        assert!(!take_dir.join("recovered.txt").exists());
+        assert!(daemon.last_dictation.is_none());
+        let undelivered = crate::output::fallback::undelivered_dir();
+        assert!(
+            std::fs::read_dir(&undelivered).map_or(true, |mut d| d.next().is_none()),
+            "a private take was kept as undelivered text"
         );
     }
 

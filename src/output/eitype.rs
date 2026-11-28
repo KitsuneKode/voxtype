@@ -263,7 +263,9 @@ impl TextOutput for EitypeOutput {
             .unwrap_or(false)
     }
 
-    fn inserts_directly(&self) -> bool { true }
+    fn inserts_directly(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &'static str {
         "eitype"

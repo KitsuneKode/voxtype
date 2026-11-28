@@ -658,7 +658,9 @@ impl ControlFiles {
         if enabled {
             std::fs::write(&marker, std::process::id().to_string())?;
         } else if let Err(e) = std::fs::remove_file(&marker) {
-            if e.kind() != std::io::ErrorKind::NotFound { return Err(e); }
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(e);
+            }
         }
         Ok(Self(marker))
     }
@@ -702,11 +704,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid = dir.path().join("queue_pid");
         std::fs::write(&pid, "stale").unwrap();
-        let off = ControlFiles::publish(dir.path(), Config::default().audio.queue_dictations).unwrap();
+        let off =
+            ControlFiles::publish(dir.path(), Config::default().audio.queue_dictations).unwrap();
         assert!(!pid.exists());
         drop(off);
         let on = ControlFiles::publish(dir.path(), true).unwrap();
-        assert_eq!(std::fs::read_to_string(&pid).unwrap(), std::process::id().to_string());
+        assert_eq!(
+            std::fs::read_to_string(&pid).unwrap(),
+            std::process::id().to_string()
+        );
         drop(on);
         assert!(!pid.exists());
     }

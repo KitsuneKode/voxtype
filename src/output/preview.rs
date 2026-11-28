@@ -28,33 +28,56 @@ struct TakePreviewState {
 }
 
 impl TakePreview {
-    pub fn new(file: Option<PathBuf>, runtime: &Path, private_marker: Option<PathBuf>, private: bool) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(TakePreviewState {
-            file: file.map(PreviewFile::new), marker: runtime.join("sensitive_field"),
-            hidden: false, suppressed: private, ended: false, private_marker,
-        })))
+    pub fn new(
+        file: Option<PathBuf>,
+        runtime: &Path,
+        private_marker: Option<PathBuf>,
+        private: bool,
+    ) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(
+            TakePreviewState {
+                file: file.map(PreviewFile::new),
+                marker: runtime.join("sensitive_field"),
+                hidden: false,
+                suppressed: private,
+                ended: false,
+                private_marker,
+            },
+        )))
     }
 
     pub fn field_changed(&self, sensitive: bool) {
         let mut s = self.0.lock().unwrap();
-        if s.ended || sensitive == s.hidden { return; }
+        if s.ended || sensitive == s.hidden {
+            return;
+        }
         s.hidden = sensitive;
         if sensitive {
             s.suppressed = true;
-            if let Some(file) = &mut s.file { file.clear(); }
-            if let Some(path) = &s.private_marker { let _ = std::fs::write(path, b"1"); }
-            if let Err(e) = std::fs::write(&s.marker, b"1") { tracing::warn!("Cannot publish sensitive field: {e}"); }
+            if let Some(file) = &mut s.file {
+                file.clear();
+            }
+            if let Some(path) = &s.private_marker {
+                let _ = std::fs::write(path, b"1");
+            }
+            if let Err(e) = std::fs::write(&s.marker, b"1") {
+                tracing::warn!("Cannot publish sensitive field: {e}");
+            }
         } else {
             let _ = std::fs::remove_file(&s.marker);
         }
     }
 
-    pub fn suppressed(&self) -> bool { self.0.lock().unwrap().suppressed }
+    pub fn suppressed(&self) -> bool {
+        self.0.lock().unwrap().suppressed
+    }
 
     pub fn update(&self, text: &str) {
         let mut s = self.0.lock().unwrap();
         if !s.suppressed && !s.ended {
-            if let Some(file) = &mut s.file { file.update(text); }
+            if let Some(file) = &mut s.file {
+                file.update(text);
+            }
         }
     }
 
@@ -63,14 +86,20 @@ impl TakePreview {
     }
 
     pub fn flush(&self) {
-        if let Some(file) = &mut self.0.lock().unwrap().file { file.flush(); }
+        if let Some(file) = &mut self.0.lock().unwrap().file {
+            file.flush();
+        }
     }
 
     pub fn clear(&self) {
         let mut s = self.0.lock().unwrap();
-        if s.ended { return; }
+        if s.ended {
+            return;
+        }
         s.ended = true;
-        if let Some(mut file) = s.file.take() { file.clear(); }
+        if let Some(mut file) = s.file.take() {
+            file.clear();
+        }
         let _ = std::fs::remove_file(&s.marker);
     }
 }
@@ -237,5 +266,75 @@ mod tests {
         assert_eq!(read(&path), "");
         assert!(preview.flush_deadline().is_none());
         assert!(!path.with_file_name("live_text.tmp").exists());
+    }
+
+    #[test]
+    fn a_sensitive_field_empties_the_preview_and_publishes_the_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live_text");
+        let private = dir.path().join("pp_private");
+        let marker = dir.path().join("sensitive_field");
+        let preview =
+            TakePreview::new(Some(live.clone()), dir.path(), Some(private.clone()), false);
+        preview.update("my name is");
+        assert_eq!(read(&live), "my name is");
+
+        preview.field_changed(true);
+        assert!(marker.exists(), "the sensitive field is not published");
+        assert!(private.exists(), "the take is not marked private");
+        assert_eq!(read(&live), "");
+        assert!(preview.suppressed());
+
+        std::thread::sleep(MIN_WRITE_INTERVAL);
+        preview.update("my name is hunter two");
+        preview.flush();
+        assert_eq!(
+            read(&live),
+            "",
+            "words reached the preview after the field turned sensitive"
+        );
+
+        preview.field_changed(false);
+        assert!(!marker.exists(), "the marker outlives the sensitive field");
+        preview.update("my name is hunter two and more");
+        assert_eq!(
+            read(&live),
+            "",
+            "the take's words came back after leaving the field"
+        );
+
+        preview.field_changed(true);
+        preview.clear();
+        assert!(!marker.exists(), "the marker outlives the take");
+        preview.field_changed(true);
+        assert!(
+            !marker.exists(),
+            "a field change after the take published the marker"
+        );
+    }
+
+    #[test]
+    fn a_private_take_never_writes_the_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live_text");
+        let preview = TakePreview::new(Some(live.clone()), dir.path(), None, true);
+        preview.update("secret words");
+        preview.flush();
+        assert_eq!(read(&live), "");
+        assert!(preview.suppressed());
+    }
+
+    #[test]
+    fn an_ordinary_field_leaves_the_preview_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live_text");
+        let preview = TakePreview::new(Some(live.clone()), dir.path(), None, false);
+        preview.field_changed(false);
+        preview.update("hello");
+        assert_eq!(read(&live), "hello");
+        assert!(!dir.path().join("sensitive_field").exists());
+        assert!(!preview.suppressed());
+        preview.clear();
+        assert_eq!(read(&live), "");
     }
 }

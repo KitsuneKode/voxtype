@@ -543,7 +543,9 @@ pub(super) async fn run_chain(
         if let Some(context) = history_context {
             context.capture().await;
         }
-        if let Err(e) = super::take::check_target().await { return (report, Err(e)); }
+        if let Err(e) = super::take::check_target().await {
+            return (report, Err(e));
+        }
         let attempt = output.output(text).await;
         if let Some(context) = history_context {
             context.capture().await;

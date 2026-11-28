@@ -145,7 +145,9 @@ impl PreeditHandle {
     /// Bind the input method for a take, starting the backend thread if
     /// needed. A compositor without input-method-v2 disables preedit for the
     /// rest of the daemon's life (the backend logs why, once).
-    pub fn begin(&self) { self.begin_with_preview(None); }
+    pub fn begin(&self) {
+        self.begin_with_preview(None);
+    }
 
     pub fn begin_with_preview(&self, preview: Option<super::preview::TakePreview>) {
         if self.inner.disabled.load(Ordering::Relaxed) {
@@ -523,7 +525,9 @@ impl TextOutput for PreeditOutput {
         true
     }
 
-    fn inserts_directly(&self) -> bool { true }
+    fn inserts_directly(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &'static str {
         // Auto-submit presses Enter, so it counts as a keystroke method and
@@ -685,6 +689,36 @@ mod tests {
         output_with_fallback(&chain, text, options()).await.unwrap();
         let typed = typed.lock().unwrap().clone();
         typed
+    }
+
+    #[tokio::test]
+    async fn a_password_field_hides_the_takes_preview_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live_text");
+        let marker = dir.path().join("sensitive_field");
+        let preview = crate::output::preview::TakePreview::new(
+            Some(live.clone()),
+            dir.path(),
+            Some(dir.path().join("pp_private")),
+            false,
+        );
+        let fake = Fake::new(true, true);
+        fake.handle.begin_with_preview(Some(preview.clone()));
+        fake.settle().await;
+        fake.focus();
+        preview.update("my password is");
+        assert!(!marker.exists(), "an ordinary field was called sensitive");
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "my password is");
+
+        fake.event(Event::ContentHidden(true));
+        fake.event(Event::Done);
+        assert!(marker.exists(), "the password field was not published");
+        assert_eq!(std::fs::read_to_string(&live).unwrap(), "");
+        assert!(preview.suppressed());
+
+        fake.unfocus();
+        assert!(!marker.exists(), "the marker outlived the password field");
+        preview.clear();
     }
 
     #[tokio::test]

@@ -190,6 +190,36 @@ mod tests {
     }
 
     #[test]
+    fn an_identified_take_names_its_id_and_a_terminal_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        for (kind, word) in [
+            (OutcomeKind::Ok, "delivered"),
+            (OutcomeKind::NoSpeech, "cancelled"),
+            (OutcomeKind::OutputFailed, "failed"),
+            (OutcomeKind::ClipboardOnly, "clipboard_only"),
+            (OutcomeKind::Recovered, "recovered"),
+            (OutcomeKind::PrivateNotInserted, "private_not_inserted"),
+        ] {
+            write_outcome(
+                dir.path(),
+                &OsdOutcome {
+                    outcome: kind.for_identified_take(),
+                    take_id: Some("17".into()),
+                    session_started_at_ms: 7,
+                    suppressed: false,
+                    chars: 0,
+                    limit_reached: false,
+                    at_ms: 42,
+                },
+            );
+            let text = std::fs::read_to_string(dir.path().join(OUTCOME_FILE)).unwrap();
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["outcome"], word);
+            assert_eq!(json["take_id"], "17");
+        }
+    }
+
+    #[test]
     fn outcome_kinds_serialize_snake_case() {
         let dir = tempfile::tempdir().unwrap();
         write_outcome(

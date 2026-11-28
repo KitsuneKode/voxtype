@@ -143,6 +143,10 @@ impl TextOutput for XdotoolOutput {
         which_result.map(|s| s.success()).unwrap_or(false)
     }
 
+    fn inserts_directly(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> &'static str {
         "xdotool"
     }

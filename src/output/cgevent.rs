@@ -251,7 +251,9 @@ impl TextOutput for CGEventOutput {
         true
     }
 
-    fn inserts_directly(&self) -> bool { true }
+    fn inserts_directly(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &'static str {
         "cgevent (macOS native)"

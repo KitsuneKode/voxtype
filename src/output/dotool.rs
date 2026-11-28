@@ -369,7 +369,9 @@ impl TextOutput for DotoolOutput {
             .unwrap_or(false)
     }
 
-    fn inserts_directly(&self) -> bool { true }
+    fn inserts_directly(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &'static str {
         "dotool"

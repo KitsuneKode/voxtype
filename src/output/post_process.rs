@@ -242,7 +242,11 @@ impl PostProcessor {
 
     /// Mark this processor as running a profile's `post_process_command`, so
     /// failure notices point at the profile's settings.
-    pub fn for_take(&self, id: &str) -> Self { let mut processor = self.clone(); processor.take_id = Some(id.to_owned()); processor }
+    pub fn for_take(&self, id: &str) -> Self {
+        let mut processor = self.clone();
+        processor.take_id = Some(id.to_owned());
+        processor
+    }
 
     pub fn for_profile(mut self, name: &str) -> Self {
         self.origin = Origin::Profile(name.to_string());
@@ -525,7 +529,9 @@ impl PostProcessor {
 
         // Always clear to prevent inheriting stale context from parent environment
         cmd.env_remove("VOXTYPE_TAKE_ID");
-        if let Some(id) = &self.take_id { cmd.env("VOXTYPE_TAKE_ID", id); }
+        if let Some(id) = &self.take_id {
+            cmd.env("VOXTYPE_TAKE_ID", id);
+        }
         cmd.env_remove("VOXTYPE_CONTEXT");
         cmd.env_remove("VOXTYPE_STREAM_OUTPUT");
         if let Some(ctx) = context {
@@ -1408,6 +1414,19 @@ mod tests {
         let result = processor.process_with_context("text", None).await;
         std::env::remove_var("VOXTYPE_CONTEXT");
         assert_eq!(result, "unset");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_take_id_reaches_the_command_and_a_stale_one_never_does() {
+        std::env::set_var("VOXTYPE_TAKE_ID", "999");
+        let config = make_config("echo \"take:${VOXTYPE_TAKE_ID:-unset}\"", 5000);
+        let processor = PostProcessor::new(&config);
+        let scoped = processor.for_take("42");
+        let with = scoped.process("text").await;
+        let without = processor.process("text").await;
+        std::env::remove_var("VOXTYPE_TAKE_ID");
+        assert_eq!(with, "take:42");
+        assert_eq!(without, "take:unset");
     }
 
     async fn collect_stream(

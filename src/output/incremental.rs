@@ -309,7 +309,9 @@ impl<'a> IncrementalOutput<'a> {
         for (i, out) in chain.iter().enumerate() {
             // After a partial typing run, only a method that does not type
             // can take the rest without mixing it into the typed text.
-            if private && !out.inserts_directly() { continue; }
+            if private && !out.inserts_directly() {
+                continue;
+            }
             if (partial || self.skip_keystrokes) && super::is_keystroke_method(out.name()) {
                 continue;
             }
@@ -493,6 +495,18 @@ mod tests {
             vec!["wtype[first]:One.", "clipboard[last]: Two. Three."]
         );
         assert_eq!(text, "One. Two. Three.");
+    }
+
+    #[tokio::test]
+    async fn a_private_take_never_sends_the_rest_to_the_clipboard() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let mut out = IncrementalOutput::new(factory(log.clone(), Some(1)), opts(), true);
+        out.begin().await;
+        for p in ["One.", " Two.", " Three."] {
+            out.push(p).await;
+        }
+        assert!(out.finish(true).await.is_err());
+        assert_eq!(*log.lock().unwrap(), vec!["wtype[first]:One."]);
     }
 
     #[tokio::test]

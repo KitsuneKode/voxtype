@@ -155,7 +155,9 @@ tell application "System Events" to key code 36"#,
                 .unwrap_or(false)
     }
 
-    fn inserts_directly(&self) -> bool { true }
+    fn inserts_directly(&self) -> bool {
+        true
+    }
 
     fn name(&self) -> &'static str {
         "osascript (macOS)"
