@@ -335,8 +335,6 @@ pub struct PasteOutput {
     keystroke: PasteKeystroke,
     /// Delay between key events in milliseconds
     type_delay_ms: u32,
-    /// Delay before pasting (after clipboard copy) in milliseconds
-    pre_type_delay_ms: u32,
     /// Whether to restore clipboard content after paste
     restore_clipboard: bool,
     /// Delay after paste before restoring clipboard (milliseconds)
@@ -359,7 +357,6 @@ impl PasteOutput {
         paste_keys_terminal: Option<String>,
         driver_order: Option<Vec<OutputDriver>>,
         type_delay_ms: u32,
-        pre_type_delay_ms: u32,
         restore_clipboard: bool,
         restore_clipboard_delay_ms: u32,
     ) -> Self {
@@ -376,7 +373,6 @@ impl PasteOutput {
             append_text,
             keystroke,
             type_delay_ms,
-            pre_type_delay_ms,
             restore_clipboard,
             restore_clipboard_delay_ms,
             driver_order,
@@ -737,6 +733,16 @@ impl PasteOutput {
     }
 }
 
+/// The shortest wait after the paste keystroke before the clipboard is
+/// restored: the focused app reads the clipboard when it handles the
+/// keystroke, which can come after the keystroke tool exits.
+const MIN_RESTORE_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// How long after the paste the original clipboard is put back.
+fn restore_settle(restore_clipboard_delay_ms: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(restore_clipboard_delay_ms.into()).max(MIN_RESTORE_SETTLE)
+}
+
 #[async_trait::async_trait]
 impl TextOutput for PasteOutput {
     async fn output(&self, text: &str) -> Result<(), OutputError> {
@@ -776,28 +782,15 @@ impl TextOutput for PasteOutput {
         super::take::check_target().await?;
         self.copy_to_clipboard(&text_to_paste).await?;
 
-        // Pre-paste delay to ensure clipboard is set before pasting
-        // Default to 100ms if not configured (minimum needed for reliability)
-        let delay = if self.pre_type_delay_ms > 0 {
-            self.pre_type_delay_ms
-        } else {
-            100
-        };
-        let pre_paste_delay = tokio::time::sleep(std::time::Duration::from_millis(delay as u64));
-
-        // Step 2: Pick and simulate the paste keystroke. The focused-window
-        // query runs during the pre-paste delay, so it costs no extra time.
+        // Step 2: Pick and simulate the paste keystroke at once: wl-copy
+        // returns only after it owns the selection, so the clipboard is set.
+        // The wait that matters is after the paste, before any restore (the
+        // app reads the clipboard when it handles the keystroke); a wait
+        // here cost every paste 100 ms.
         let keystroke = match &self.keystroke {
-            PasteKeystroke::Fixed(keystroke) => {
-                pre_paste_delay.await;
-                keystroke
-            }
+            PasteKeystroke::Fixed(keystroke) => keystroke,
             terminal_aware => {
-                let (is_terminal, ()) = tokio::join!(
-                    super::active_window::focused_window_is_terminal(),
-                    pre_paste_delay
-                );
-                terminal_aware.select(is_terminal)
+                terminal_aware.select(super::active_window::focused_window_is_terminal().await)
             }
         };
         super::take::check_target().await?;
@@ -815,7 +808,7 @@ impl TextOutput for PasteOutput {
             clipboard_restore::schedule_restore(
                 original,
                 text_to_paste.as_bytes().to_vec(),
-                std::time::Duration::from_millis(self.restore_clipboard_delay_ms as u64),
+                restore_settle(self.restore_clipboard_delay_ms),
             );
         }
 
@@ -905,21 +898,21 @@ mod tests {
 
     #[test]
     fn test_new_stores_restore_clipboard_fields() {
-        let output = PasteOutput::new(false, None, None, None, None, 10, 100, true, 300);
+        let output = PasteOutput::new(false, None, None, None, None, 10, true, 300);
         assert!(output.restore_clipboard);
         assert_eq!(output.restore_clipboard_delay_ms, 300);
     }
 
     #[test]
     fn test_new_defaults_restore_clipboard_disabled() {
-        let output = PasteOutput::new(false, None, None, None, None, 10, 100, false, 200);
+        let output = PasteOutput::new(false, None, None, None, None, 10, false, 200);
         assert!(!output.restore_clipboard);
         assert_eq!(output.restore_clipboard_delay_ms, 200);
     }
 
     #[test]
     fn test_driver_order_defaults_to_wtype_eitype_ydotool() {
-        let output = PasteOutput::new(false, None, None, None, None, 10, 100, false, 200);
+        let output = PasteOutput::new(false, None, None, None, None, 10, false, 200);
         assert_eq!(
             output.driver_order,
             vec![
@@ -942,7 +935,6 @@ mod tests {
             None,
             Some(vec![OutputDriver::Ydotool, OutputDriver::Wtype]),
             10,
-            100,
             false,
             200,
         );
@@ -964,7 +956,6 @@ mod tests {
             None,
             Some(vec![OutputDriver::Dotool, OutputDriver::Clipboard]),
             10,
-            100,
             false,
             200,
         );
@@ -1133,6 +1124,10 @@ mod tests {
         }
 
         fn output(delay_ms: u32) -> PasteOutput {
+            output_restoring(true, delay_ms)
+        }
+
+        fn output_restoring(restore: bool, delay_ms: u32) -> PasteOutput {
             PasteOutput::new(
                 false,
                 None,
@@ -1140,8 +1135,7 @@ mod tests {
                 None,
                 None,
                 0,
-                1,
-                true,
+                restore,
                 delay_ms,
             )
         }
@@ -1273,6 +1267,17 @@ mod tests {
             output(50).output("second").await.unwrap();
             assert_eq!(wait_pending().await, Some(RestoreOutcome::Restored));
             assert_eq!(clipboard(&clip, plain), "orig");
+
+            // The paste keystroke follows wl-copy at once: no wait before it
+            // (it used to be 100 ms at least, on every paste).
+            let started = Instant::now();
+            output_restoring(false, 0).output("quick").await.unwrap();
+            assert!(
+                started.elapsed() < Duration::from_millis(100),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(clipboard(&clip, plain), "quick");
         }
     }
 }

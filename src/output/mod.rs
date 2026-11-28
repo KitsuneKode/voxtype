@@ -28,8 +28,8 @@ pub mod deferred_notice;
 pub mod dotool;
 pub mod eitype;
 pub mod fallback;
-pub mod incremental;
 pub mod hyprland;
+pub mod incremental;
 // modifier_guard is evdev-based; macOS has its own osascript modifier handling.
 #[cfg(target_os = "linux")]
 pub mod modifier_guard;
@@ -313,7 +313,9 @@ pub trait TextOutput: Send + Sync {
     async fn is_available(&self) -> bool;
 
     /// True only for drivers that insert directly without touching a clipboard.
-    fn inserts_directly(&self) -> bool { false }
+    fn inserts_directly(&self) -> bool {
+        false
+    }
 
     /// Deliver the start of `text` and return how many bytes of it went in;
     /// the chain hands the rest to the next method. A method that can only
@@ -534,7 +536,6 @@ pub fn create_output_chain_with_override(
                 config.paste_keys_terminal.clone(),
                 config.driver_order.clone(),
                 config.type_delay_ms,
-                pre_type_delay_ms,
                 config.restore_clipboard,
                 config.restore_clipboard_delay_ms,
             )));
@@ -1054,7 +1055,11 @@ mod paste_over_chars_tests {
     use crate::config::OutputMode;
 
     fn typed(limit: Option<usize>) -> OutputConfig {
-        OutputConfig { mode: OutputMode::Type, paste_over_chars: limit, ..OutputConfig::default() }
+        OutputConfig {
+            mode: OutputMode::Type,
+            paste_over_chars: limit,
+            ..OutputConfig::default()
+        }
     }
 
     #[test]
@@ -1069,8 +1074,15 @@ mod paste_over_chars_tests {
         let long = config_for_text(&c, &"x".repeat(301)).expect("over the limit pastes");
         assert_eq!(long.mode, OutputMode::Paste);
         assert!(!long.restore_clipboard);
-        let asked = OutputConfig { restore_clipboard: true, ..c };
-        assert!(config_for_text(&asked, &"x".repeat(301)).unwrap().restore_clipboard);
+        let asked = OutputConfig {
+            restore_clipboard: true,
+            ..c
+        };
+        assert!(
+            config_for_text(&asked, &"x".repeat(301))
+                .unwrap()
+                .restore_clipboard
+        );
     }
 
     #[test]
@@ -1081,7 +1093,11 @@ mod paste_over_chars_tests {
     #[test]
     fn other_modes_are_left_alone() {
         for mode in [OutputMode::Paste, OutputMode::Clipboard] {
-            let c = OutputConfig { mode, paste_over_chars: Some(1), ..OutputConfig::default() };
+            let c = OutputConfig {
+                mode,
+                paste_over_chars: Some(1),
+                ..OutputConfig::default()
+            };
             assert!(config_for_text(&c, "a long enough text").is_none());
         }
     }
