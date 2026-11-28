@@ -50,42 +50,38 @@ impl WtypeOutput {
         }
     }
 
+    /// wtype's options for typing text, before the `--`.
+    fn type_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.pre_type_delay_ms > 0 {
+            args.extend(["-s".to_string(), self.pre_type_delay_ms.to_string()]);
+        }
+        if self.type_delay_ms > 0 {
+            args.extend(["-d".to_string(), self.type_delay_ms.to_string()]);
+        }
+        // Shift first prevents the first CJK character drop in some apps.
+        if self.shift_prefix {
+            args.extend(["-P", "Shift_L", "-p", "Shift_L"].map(String::from));
+        }
+        args
+    }
+
     /// Type a string of text using wtype
     async fn type_text(&self, text: &str) -> Result<(), OutputError> {
         if text.is_empty() {
             return Ok(());
         }
 
+        // A take whose window lost focus is not typed into. The delay is
+        // wtype's own `-s`: it waits after connecting its virtual keyboard,
+        // which is what keeps the compositor from dropping the first key.
+        // Sleeping before starting wtype left that race in place.
+        super::take::check_target().await?;
+        let args = self.type_args();
         let mut cmd = Command::new("wtype");
+        cmd.args(&args);
         let mut debug_args = vec!["wtype".to_string()];
-
-        // Add pre-typing delay if configured (helps prevent first character drop)
-        if self.pre_type_delay_ms > 0
-            && super::take::DELIVERY_TAKE
-                .try_with(Option::is_some)
-                .unwrap_or(false)
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(
-                self.pre_type_delay_ms.into(),
-            ))
-            .await;
-            super::take::check_target().await?;
-        } else if self.pre_type_delay_ms > 0 {
-            cmd.arg("-s").arg(self.pre_type_delay_ms.to_string());
-            debug_args.push(format!("-s {}", self.pre_type_delay_ms));
-        }
-
-        // Add inter-keystroke delay if configured
-        if self.type_delay_ms > 0 {
-            cmd.arg("-d").arg(self.type_delay_ms.to_string());
-            debug_args.push(format!("-d {}", self.type_delay_ms));
-        }
-
-        // Add Shift prefix to prevent first CJK character drop in some apps
-        if self.shift_prefix {
-            cmd.arg("-P").arg("Shift_L").arg("-p").arg("Shift_L");
-            debug_args.push("-P Shift_L -p Shift_L".to_string());
-        }
+        debug_args.extend(args);
 
         debug_args.push("--".to_string());
         debug_args.push(format!("\"{}\"", text.chars().take(20).collect::<String>()));
@@ -262,6 +258,20 @@ mod tests {
         let output = WtypeOutput::new(false, None, 0, 200, false, false);
         assert_eq!(output.type_delay_ms, 0);
         assert_eq!(output.pre_type_delay_ms, 200);
+    }
+
+    /// The pre-type delay is wtype's own `-s`, inside a take or not: a
+    /// sleep before starting wtype still let the first key drop.
+    #[test]
+    fn the_pre_type_delay_is_passed_to_wtype() {
+        let output = WtypeOutput::new(false, None, 5, 200, false, true);
+        assert_eq!(
+            output.type_args(),
+            ["-s", "200", "-d", "5", "-P", "Shift_L", "-p", "Shift_L"]
+        );
+        assert!(WtypeOutput::new(false, None, 0, 0, false, false)
+            .type_args()
+            .is_empty());
     }
 
     #[test]
