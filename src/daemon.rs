@@ -7107,6 +7107,23 @@ impl Daemon {
 
     /// `voxtype record recover`: transcribe the take a cancel kept, and deliver
     /// it like any other, through the same cleanup and output.
+    /// Start the recovered take as a take of its own: its outcome is
+    /// published again, though the cancel that kept it already published
+    /// "cancelled".
+    fn begin_recovered_take(&mut self, state: &mut State, samples: &[f32]) {
+        // The take's options are settled now, as at any stop: a queued take
+        // that starts while this one transcribes reads its own.
+        self.freeze_take();
+        *state = State::Transcribing {
+            audio: samples.to_vec(),
+        };
+        self.osd_outcome_sent
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.history_begin(state);
+        self.history_note(|p| p.transcribing(samples.len()));
+        self.update_state("transcribing");
+    }
+
     async fn recover_cancelled_take(&mut self, state: &mut State) {
         self.pre_roll_samples = 0;
         self.release_tail_samples = 0;
@@ -7122,15 +7139,7 @@ impl Daemon {
             "Recovering a cancelled take ({:.1}s)",
             samples.len() as f32 / 16000.0
         );
-        // The take's options are settled now, as at any stop: a queued take
-        // that starts while this one transcribes reads its own.
-        self.freeze_take();
-        *state = State::Transcribing {
-            audio: samples.clone(),
-        };
-        self.history_begin(state);
-        self.history_note(|p| p.transcribing(samples.len()));
-        self.update_state("transcribing");
+        self.begin_recovered_take(state, &samples);
         let transcriber = match self.get_transcriber_for_recording(None).await {
             Ok(transcriber) => transcriber,
             Err(()) => {
@@ -10724,6 +10733,34 @@ while True:
             crate::history::Outcome::TranscriptionFailed
         );
         assert!(!entries[0].delivered);
+    }
+
+    /// `voxtype record recover` after a cancel: the recovered take's
+    /// outcome is published, not swallowed by the cancel's.
+    #[tokio::test]
+    async fn a_recovered_take_publishes_its_own_outcome() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut daemon = history_daemon(fixture.path());
+        let mut state = State::Recording {
+            started_at: std::time::Instant::now(),
+            model_override: None,
+        };
+        daemon.begin_osd_session(&state);
+        daemon.publish_osd_outcome(osd::session::OutcomeKind::Cancelled, 0);
+        // What the cancel leaves behind when outcome.json is written (this
+        // daemon writes no runtime files).
+        daemon
+            .osd_outcome_sent
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        daemon.update_state("idle");
+        daemon.begin_recovered_take(&mut state, &[0.25; 1600]);
+        assert!(
+            !daemon
+                .osd_outcome_sent
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "the cancel's outcome still blocks the recovered take's"
+        );
+        assert!(matches!(state, State::Transcribing { .. }));
     }
 
     #[tokio::test]
