@@ -36,6 +36,50 @@ use crate::setup;
 pub const GGUF_STATUS_ENV: &str = "VOXTYPE_GGUF_STATUS_FILE";
 pub const GGUF_STATUS_FILE: &str = "gguf_backend.json";
 
+/// Runtime-dir file the daemon writes when it loads a Parakeet model: what
+/// the model runs on ("GPU (CUDA)", or "CPU" when it fell back). The
+/// installed binary's variant cannot tell that, nor can a private build.
+pub const ENGINE_BACKEND_FILE: &str = "engine_backend";
+
+/// Write [`ENGINE_BACKEND_FILE`] (staged, then renamed into place).
+pub fn publish_engine_backend(runtime_dir: &std::path::Path, backend: &str) {
+    let path = runtime_dir.join(ENGINE_BACKEND_FILE);
+    let staged = runtime_dir.join(format!(".{ENGINE_BACKEND_FILE}.{}", std::process::id()));
+    if let Err(e) = std::fs::write(&staged, format!("{backend}\n"))
+        .and_then(|()| std::fs::rename(&staged, &path))
+    {
+        tracing::debug!("Cannot publish the engine backend: {}", e);
+        let _ = std::fs::remove_file(&staged);
+    }
+}
+
+/// The backend a running daemon published for its Parakeet model, when the
+/// configured engine is Parakeet and the report is not older than the
+/// daemon (the `version` file it writes at startup).
+fn published_engine_backend(
+    config: &config::Config,
+    daemon_running: bool,
+    runtime_dir: &std::path::Path,
+) -> Option<String> {
+    if !daemon_running || config.engine != config::TranscriptionEngine::Parakeet {
+        return None;
+    }
+    let modified = |name: &str| {
+        std::fs::metadata(runtime_dir.join(name))
+            .and_then(|m| m.modified())
+            .ok()
+    };
+    let started = modified("version")?;
+    let path = runtime_dir.join(ENGINE_BACKEND_FILE);
+    let written = std::fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+    if written < started {
+        return None;
+    }
+    let label = std::fs::read_to_string(path).ok()?;
+    let label = label.trim();
+    (!label.is_empty() && label.len() <= 40).then(|| label.to_string())
+}
+
 /// Tooltip line shown while an offer is open (not declined).
 pub const MODEL_UPDATE_LINE: &str = "Model update available";
 
@@ -95,6 +139,13 @@ impl ExtendedStatusInfo {
             inv.daemon_pid.is_some(),
             &config::Config::runtime_dir(),
         )
+        .or_else(|| {
+            published_engine_backend(
+                config,
+                inv.daemon_pid.is_some(),
+                &config::Config::runtime_dir(),
+            )
+        })
         .unwrap_or_else(|| {
             daemon_backend_label(inv.running_variant, daemon_exe.as_deref(), &inv.binary_path)
                 .unwrap_or_else(|| install_backend_label(&inv))
@@ -386,6 +437,57 @@ fn json_str(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// The daemon's own report of what its Parakeet model runs on wins
+    /// over the install's variant ("GPU (Vulkan)" for an ONNX/CUDA build);
+    /// a report from an earlier daemon, another engine, or no daemon does not.
+    #[test]
+    fn extended_status_reports_the_parakeet_backend_the_daemon_loaded() {
+        let runtime = tempfile::tempdir().unwrap();
+        let mut config = config::Config {
+            engine: config::TranscriptionEngine::Parakeet,
+            ..Default::default()
+        };
+        std::fs::write(runtime.path().join("version"), "1.3.2").unwrap();
+        assert_eq!(
+            published_engine_backend(&config, true, runtime.path()),
+            None
+        );
+        publish_engine_backend(runtime.path(), "GPU (CUDA)");
+        assert_eq!(
+            published_engine_backend(&config, true, runtime.path()).as_deref(),
+            Some("GPU (CUDA)")
+        );
+        publish_engine_backend(runtime.path(), "CPU");
+        assert_eq!(
+            published_engine_backend(&config, true, runtime.path()).as_deref(),
+            Some("CPU")
+        );
+        assert_eq!(
+            published_engine_backend(&config, false, runtime.path()),
+            None
+        );
+
+        // A daemon started after the report: the report is stale.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(runtime.path().join("version"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        assert_eq!(
+            published_engine_backend(&config, true, runtime.path()),
+            None
+        );
+
+        config.engine = config::TranscriptionEngine::Whisper;
+        publish_engine_backend(runtime.path(), "GPU (CUDA)");
+        assert_eq!(
+            published_engine_backend(&config, true, runtime.path()),
+            None
+        );
+    }
+
     use super::*;
     use std::path::Path;
 

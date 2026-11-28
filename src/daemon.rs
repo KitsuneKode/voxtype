@@ -3015,6 +3015,7 @@ impl Daemon {
         let transcriber = match loaded {
             Ok(Ok(t)) => {
                 self.transcriber_preloaded = Some(t.clone());
+                self.publish_engine_backend();
                 self.touch_transcriber_used();
                 if state.is_streaming() {
                     self.active_transcriber = Some(t.clone());
@@ -5347,6 +5348,7 @@ impl Daemon {
                                 let t: Arc<dyn Transcriber> = Arc::from(t);
                                 t.set_vocabulary(&vocabulary);
                                 self.transcriber_preloaded = Some(t.clone());
+                                self.publish_engine_backend();
                                 self.touch_transcriber_used();
                                 Ok(t)
                             }
@@ -6800,6 +6802,26 @@ impl Daemon {
         self.take.as_ref().and_then(TakeIdentity::ime_committed)
     }
 
+    /// Write what the loaded Parakeet model runs on for `voxtype status
+    /// --extended` (see [`crate::status_json::ENGINE_BACKEND_FILE`]): the
+    /// execution provider chosen at load, which the installed binary's
+    /// variant cannot tell.
+    fn publish_engine_backend(&self) {
+        if self.state_file_path.is_none()
+            || self.config.engine != crate::config::TranscriptionEngine::Parakeet
+        {
+            return;
+        }
+        let Some(backend) = self
+            .transcriber_preloaded
+            .as_ref()
+            .and_then(|t| t.runtime_metadata().backend)
+        else {
+            return;
+        };
+        crate::status_json::publish_engine_backend(&Config::runtime_dir(), &backend);
+    }
+
     fn publish_empty_outcome(&self) {
         if let Some(path) = self.frozen.as_ref().map_or_else(
             || peek_file_output_path(&self.config),
@@ -8225,6 +8247,7 @@ impl Daemon {
                     self.transcriber_preloaded = Some(Arc::from(
                         crate::transcribe::create_transcriber(&self.config)?,
                     ));
+                    self.publish_engine_backend();
                 } else {
                     // Use model manager for Whisper
                     model_manager.preload_primary()?;
@@ -8245,6 +8268,7 @@ impl Daemon {
                 self.transcriber_preloaded = Some(Arc::from(
                     crate::transcribe::create_transcriber(&self.config)?,
                 ));
+                self.publish_engine_backend();
             }
         }
         Ok(())

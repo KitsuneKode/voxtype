@@ -47,6 +47,8 @@ pub struct ParakeetTranscriber {
     max_window: usize,
     /// Audio shared between consecutive windows, in samples.
     window_overlap: usize,
+    /// What the model runs on (see [`execution_label`]).
+    backend: &'static str,
 }
 
 impl ParakeetTranscriber {
@@ -73,7 +75,9 @@ impl ParakeetTranscriber {
         let start = std::time::Instant::now();
 
         // Configure execution provider based on feature flags
-        let exec_config = Some(final_execution_config(config));
+        let exec = final_execution_config(config);
+        let backend = execution_label(&exec);
+        let exec_config = Some(exec);
 
         let model = match model_type {
             ParakeetModelType::Ctc => {
@@ -103,6 +107,7 @@ impl ParakeetTranscriber {
             model_type,
             max_window: (config.max_window_secs.max(0.0) * SAMPLE_RATE as f32) as usize,
             window_overlap: (config.window_overlap_secs.max(0.0) * SAMPLE_RATE as f32) as usize,
+            backend,
         })
     }
 }
@@ -110,6 +115,13 @@ impl ParakeetTranscriber {
 impl Transcriber for ParakeetTranscriber {
     fn short_clips_are_cheap(&self) -> bool {
         true
+    }
+
+    fn runtime_metadata(&self) -> super::RuntimeMetadata {
+        super::RuntimeMetadata {
+            backend: Some(self.backend.to_string()),
+            ..Default::default()
+        }
     }
 
     fn transcribe(&self, samples: &[f32]) -> Result<String, TranscribeError> {
@@ -283,10 +295,31 @@ pub(super) fn final_execution_config(config: &ParakeetConfig) -> ExecutionConfig
         None => {
             // [parakeet.cpu] threads, else upstream's [parakeet] threads, else
             // one per performance core.
-            let threads = config.cpu.threads.or(config.threads).unwrap_or_else(performance_cores);
+            let threads = config
+                .cpu
+                .threads
+                .or(config.threads)
+                .unwrap_or_else(performance_cores);
             tracing::info!("Parakeet on CPU with {} threads", threads);
             no_spin(ExecutionConfig::new().with_intra_threads(threads))
         }
+    }
+}
+
+/// What a session built from `config` runs the model on, as status and
+/// history show it: the execution provider chosen at load, so "CPU" when
+/// the GPU runtime was missing and the model fell back.
+pub(super) fn execution_label(config: &ExecutionConfig) -> &'static str {
+    #[allow(unreachable_patterns)]
+    match config.execution_provider {
+        parakeet_rs::ExecutionProvider::Cpu => "CPU",
+        #[cfg(feature = "parakeet-cuda")]
+        parakeet_rs::ExecutionProvider::Cuda => "GPU (CUDA)",
+        #[cfg(feature = "parakeet-tensorrt")]
+        parakeet_rs::ExecutionProvider::TensorRT => "GPU (TensorRT)",
+        #[cfg(feature = "parakeet-migraphx")]
+        parakeet_rs::ExecutionProvider::MIGraphX => "GPU (MIGraphX)",
+        _ => "GPU",
     }
 }
 
@@ -318,7 +351,10 @@ pub(super) fn performance_cores() -> usize {
     for e in entries.flatten() {
         let name = e.file_name();
         let name = name.to_string_lossy();
-        if !name.starts_with("cpu") || !name[3..].chars().all(|c| c.is_ascii_digit()) || name.len() == 3 {
+        if !name.starts_with("cpu")
+            || !name[3..].chars().all(|c| c.is_ascii_digit())
+            || name.len() == 3
+        {
             continue;
         }
         let read = |rel: &str| {
@@ -359,7 +395,11 @@ pub(super) fn performance_cores() -> usize {
 pub(super) fn build_execution_config(threads: Option<usize>) -> Option<ExecutionConfig> {
     let config = provider_execution_config().map(no_spin);
     match threads {
-        Some(n) => Some(config.unwrap_or_else(|| no_spin(ExecutionConfig::default())).with_intra_threads(n)),
+        Some(n) => Some(
+            config
+                .unwrap_or_else(|| no_spin(ExecutionConfig::default()))
+                .with_intra_threads(n),
+        ),
         None => config,
     }
 }
@@ -594,6 +634,19 @@ pub(super) fn resolve_model_path(model: &str) -> Result<PathBuf, TranscribeError
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_backend_label_names_the_execution_provider_chosen_at_load() {
+        assert_eq!(execution_label(&ExecutionConfig::new()), "CPU");
+        #[cfg(feature = "parakeet-cuda")]
+        assert_eq!(
+            execution_label(
+                &ExecutionConfig::new()
+                    .with_execution_provider(parakeet_rs::ExecutionProvider::Cuda)
+            ),
+            "GPU (CUDA)"
+        );
+    }
+
     use super::*;
     use std::fs;
 

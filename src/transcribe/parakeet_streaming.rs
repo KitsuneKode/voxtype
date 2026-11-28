@@ -70,6 +70,8 @@ pub struct ParakeetStreamingTranscriber {
     /// `[parakeet] vocabulary_file` / `corrections_file` (None = off).
     vocabulary: Option<TermSource>,
     vocabulary_boost: f32,
+    /// What the model runs on (see [`super::parakeet::execution_label`]).
+    backend: &'static str,
 }
 
 impl ParakeetStreamingTranscriber {
@@ -128,6 +130,7 @@ impl ParakeetStreamingTranscriber {
             tracing::info!("Parakeet on CPU with {} threads", threads);
             super::parakeet::no_spin(ExecutionConfig::new().with_intra_threads(threads))
         });
+        let backend = super::parakeet::execution_label(&final_exec);
         let handle = ParakeetUnifiedHandle::load(&model_path, Some(final_exec)).map_err(|e| {
             TranscribeError::InitFailed(format!(
                 "Parakeet streaming (ParakeetUnified) init failed: {}\n\n\
@@ -206,6 +209,7 @@ impl ParakeetStreamingTranscriber {
                 config.corrections_file.as_deref(),
             ),
             vocabulary_boost: config.vocabulary_boost,
+            backend,
         })
     }
 }
@@ -237,6 +241,13 @@ impl Transcriber for ParakeetStreamingTranscriber {
     fn set_vocabulary(&self, terms: &[String]) {
         if let Some(vocabulary) = &self.vocabulary {
             vocabulary.set_profile_terms(terms);
+        }
+    }
+
+    fn runtime_metadata(&self) -> super::RuntimeMetadata {
+        super::RuntimeMetadata {
+            backend: Some(self.backend.to_string()),
+            ..Default::default()
         }
     }
 }
