@@ -521,6 +521,31 @@ impl TextOutput for PreeditOutput {
         Ok(())
     }
 
+    /// A text with a line break: the part before it is committed in place of
+    /// the preedit, in the same commit that removes the preedit, and the next
+    /// method types or pastes the rest. Clearing the preedit first and
+    /// handing over the whole text left the field empty until the paste
+    /// landed (about 200 ms in an Electron composer).
+    async fn output_prefix(&self, text: &str) -> Result<usize, OutputError> {
+        let mut full = text.to_string();
+        if let Some(append) = &self.append_text {
+            full.push_str(append);
+        }
+        let cut = text.find(char::is_control).unwrap_or(text.len());
+        if committable(&full) || cut == 0 || cut == text.len() || cut > state::MAX_STRING_BYTES {
+            return self.output(text).await.map(|()| text.len());
+        }
+        match self.handle.commit(&text[..cut]).await {
+            CommitOutcome::Committed => Ok(cut),
+            outcome => {
+                self.handle.clear_now().await;
+                Err(OutputError::InjectionFailed(format!(
+                    "input method commit not possible ({outcome:?})"
+                )))
+            }
+        }
+    }
+
     async fn is_available(&self) -> bool {
         true
     }
@@ -783,7 +808,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn newlines_clear_the_preedit_before_typing() {
+    async fn the_first_line_replaces_the_preedit_and_the_rest_is_typed() {
         let fake = Fake::new(true, true);
         fake.handle.begin();
         fake.settle().await;
@@ -792,11 +817,120 @@ mod tests {
         fake.settle().await;
         fake.log();
         let typed = deliver(&fake, &Default::default(), "Line one.\nLine two.").await;
-        assert_eq!(typed, ["Line one.\nLine two."]);
+        assert_eq!(typed, ["\nLine two."]);
         assert_eq!(
             fake.log(),
-            ["preedit:", "commit:1"],
-            "cleared, nothing committed"
+            ["preedit:", "commit_string:Line one.", "commit:1"],
+            "the preedit is replaced by the first line in one commit"
+        );
+    }
+
+    /// Stands in for paste or wtype and writes into the sink's log, so the
+    /// test sees one timeline of what the field went through.
+    struct FieldTypist(Arc<Mutex<(Driver, RecSink)>>, bool);
+
+    #[async_trait::async_trait]
+    impl TextOutput for FieldTypist {
+        async fn output(&self, text: &str) -> Result<(), OutputError> {
+            self.0.lock().unwrap().1.log.push(format!("typed:{text}"));
+            Ok(())
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        fn inserts_directly(&self) -> bool {
+            self.1
+        }
+        fn name(&self) -> &'static str {
+            if self.1 {
+                "wtype"
+            } else {
+                "paste"
+            }
+        }
+    }
+
+    /// What the field shows after each step: the committed text plus the
+    /// preedit. Input method requests take effect at their `commit`, typed
+    /// text at once. Returns every state from the preedit on.
+    fn field_states(preedit: &str, log: &[String]) -> Vec<String> {
+        let (mut committed, mut shown) = (String::new(), preedit.to_string());
+        let (mut pending_preedit, mut pending_commit) = (None, String::new());
+        let mut states = vec![shown.clone()];
+        for line in log {
+            if let Some(t) = line.strip_prefix("preedit:") {
+                pending_preedit = Some(t.to_string());
+            } else if let Some(t) = line.strip_prefix("commit_string:") {
+                pending_commit.push_str(t);
+            } else if line.starts_with("commit:") {
+                committed.push_str(&std::mem::take(&mut pending_commit));
+                if let Some(p) = pending_preedit.take() {
+                    shown = p;
+                }
+                states.push(format!("{committed}{shown}"));
+            } else if let Some(t) = line.strip_prefix("typed:") {
+                committed.push_str(t);
+                states.push(format!("{committed}{shown}"));
+            }
+        }
+        states
+    }
+
+    #[tokio::test]
+    async fn a_line_break_never_leaves_the_field_empty() {
+        for (text, paste) in [
+            ("First line.\nSecond line.", true),
+            ("First line.\n\nSecond.\nThird.", true),
+            ("One.\tTwo.", false),
+        ] {
+            let fake = Fake::new(true, true);
+            fake.handle.begin();
+            fake.settle().await;
+            fake.focus();
+            fake.handle.set("first line second line");
+            fake.settle().await;
+            fake.log();
+            let chain: Vec<Box<dyn TextOutput>> = vec![
+                Box::new(PreeditOutput::new(fake.handle.clone(), &Default::default())),
+                Box::new(FieldTypist(fake.driver.clone(), !paste)),
+            ];
+            output_with_fallback(&chain, text, options()).await.unwrap();
+            let states = field_states("first line second line", &fake.log());
+            assert!(
+                states.iter().all(|s| !s.is_empty()),
+                "{text:?}: the field went empty: {states:?}"
+            );
+            assert_eq!(states.last().unwrap(), text, "{states:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_private_takes_other_lines_are_typed_never_pasted() {
+        let fake = Fake::new(true, true);
+        fake.handle.begin();
+        fake.settle().await;
+        fake.focus();
+        fake.handle.set("user name password");
+        fake.settle().await;
+        fake.log();
+        let mut chain: Vec<Box<dyn TextOutput>> = vec![
+            Box::new(PreeditOutput::new(fake.handle.clone(), &Default::default())),
+            Box::new(FieldTypist(fake.driver.clone(), false)),
+            Box::new(FieldTypist(fake.driver.clone(), true)),
+        ];
+        // What the daemon does for a private take.
+        chain.retain(|d| d.inserts_directly());
+        output_with_fallback(&chain, "User name.\nPassword.", options())
+            .await
+            .unwrap();
+        assert_eq!(
+            fake.log(),
+            [
+                "preedit:",
+                "commit_string:User name.",
+                "commit:1",
+                "typed:\nPassword."
+            ]
         );
     }
 

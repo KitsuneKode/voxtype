@@ -6,14 +6,14 @@
 //! time the way a streaming take does, then delivers the final text the way
 //! the daemon does for a long take: the preedit shows the transcript while the
 //! cleanup runs, then [`PreeditOutput`] commits it, or the paste chain takes it
-//! when the commit is not possible.
+//! when the commit is not possible. A text with line breaks has its first line
+//! committed in place of the preedit and the rest pasted.
 //!
 //! Environment: `TICK_MS` (320), `WORDS_PER_TICK` (1), `PP_MS` (800),
 //! `DELIVERY` (`preedit` or `paste`).
 use std::time::{Duration, Instant};
 use voxtype::config::{OutputConfig, OutputMode};
 use voxtype::output::preedit::{PreeditHandle, PreeditOutput};
-use voxtype::output::TextOutput;
 
 fn env_u64(name: &str, default: u64) -> u64 {
     std::env::var(name)
@@ -133,14 +133,29 @@ async fn main() {
             }
         }
     } else {
-        let out = PreeditOutput::new(preedit.clone(), &config);
         let rest = if keep > 0 {
             words[committed..].join(" ")
         } else {
             final_text.clone()
         };
-        let r = out.output(&rest).await;
-        stamp(&format!("delivered via preedit: {r:?}"));
+        // The daemon's chain for a long take: the preedit first, then paste
+        // for what it cannot commit (a text with line breaks).
+        let mut paste = config.clone();
+        paste.mode = OutputMode::Paste;
+        let mut chain = voxtype::output::create_output_chain(&paste);
+        chain.insert(0, Box::new(PreeditOutput::new(preedit.clone(), &config)));
+        let options = voxtype::output::OutputOptions {
+            history_context: None,
+            pre_output_command: None,
+            post_output_command: None,
+            wait_for_modifier_release: false,
+            modifier_release_timeout: Duration::ZERO,
+        };
+        let (_, r) = voxtype::output::output_with_fallback_report(&chain, &rest, options).await;
+        stamp(&format!(
+            "delivered via {:?}",
+            r.map(|d| d.driver).map_err(|e| e.to_string())
+        ));
     }
     preedit.release_now().await;
     stamp("released");

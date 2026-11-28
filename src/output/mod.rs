@@ -315,6 +315,15 @@ pub trait TextOutput: Send + Sync {
     /// True only for drivers that insert directly without touching a clipboard.
     fn inserts_directly(&self) -> bool { false }
 
+    /// Deliver the start of `text` and return how many bytes of it went in;
+    /// the chain hands the rest to the next method. A method that can only
+    /// put part of the text in the field uses it so the field never looks
+    /// empty while the next method delivers the rest. By default a method
+    /// delivers all of the text or none of it.
+    async fn output_prefix(&self, text: &str) -> Result<usize, OutputError> {
+        self.output(text).await.map(|()| text.len())
+    }
+
     /// Human-readable name for logging
     fn name(&self) -> &'static str;
 }

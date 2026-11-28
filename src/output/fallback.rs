@@ -522,6 +522,7 @@ pub(super) async fn run_chain(
         ..Default::default()
     };
     let mut result = Err(OutputError::AllMethodsFailed);
+    let mut rest = text;
     for (position, output) in chain.iter().enumerate() {
         if skip_keystroke_methods && is_keystroke_method(output.name()) {
             tracing::debug!(
@@ -546,12 +547,19 @@ pub(super) async fn run_chain(
         if let Err(e) = super::take::check_target().await {
             return (report, Err(e));
         }
-        let attempt = output.output(text).await;
+        let attempt = output.output_prefix(rest).await;
         if let Some(context) = history_context {
             context.capture().await;
         }
         match attempt {
-            Ok(()) => {
+            Ok(n) if n < rest.len() => {
+                tracing::debug!(
+                    "{} delivered the text up to a line break; the next method takes the rest",
+                    output.name()
+                );
+                rest = &rest[n..];
+            }
+            Ok(_) => {
                 tracing::debug!("Text output via {}", output.name());
                 report.delivered_by = Some(output.name());
                 result = Ok(Delivered {

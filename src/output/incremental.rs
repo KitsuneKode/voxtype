@@ -292,6 +292,19 @@ impl<'a> IncrementalOutput<'a> {
         result
     }
 
+    /// [`attempt`](Self::attempt) for a method that may deliver only the
+    /// start of the text, returning how much of it went in.
+    async fn attempt_prefix(&self, out: &dyn TextOutput, text: &str) -> Result<usize, OutputError> {
+        if let Some(context) = self.options.history_context {
+            context.capture().await;
+        }
+        let result = out.output_prefix(text).await;
+        if let Some(context) = self.options.history_context {
+            context.capture().await;
+        }
+        result
+    }
+
     async fn deliver_collected(&mut self, private: bool) -> Result<(), OutputError> {
         if self.collected.is_empty() {
             return if self.typed_any || self.at_start {
@@ -301,6 +314,7 @@ impl<'a> IncrementalOutput<'a> {
             };
         }
         let normalized = normalize_quotes(&self.collected).into_owned();
+        let mut rest = normalized.as_str();
         let partial = self.typed_any;
         let chain = (self.chain_for)(Position {
             first: !partial,
@@ -318,8 +332,9 @@ impl<'a> IncrementalOutput<'a> {
             if !out.is_available().await {
                 continue;
             }
-            match self.attempt(out.as_ref(), &normalized).await {
-                Ok(()) => {
+            match self.attempt_prefix(out.as_ref(), rest).await {
+                Ok(n) if n < rest.len() => rest = &rest[n..],
+                Ok(_) => {
                     self.driver = Some((out.name(), partial || i > 0));
                     if partial {
                         tracing::warn!("Rest of the text delivered via {}", out.name());
@@ -507,6 +522,53 @@ mod tests {
         }
         assert!(out.finish(true).await.is_err());
         assert_eq!(*log.lock().unwrap(), vec!["wtype[first]:One."]);
+    }
+
+    /// Commits up to the first line break, the way the preedit does.
+    struct FirstLine(Arc<Mutex<Vec<String>>>);
+
+    #[async_trait::async_trait]
+    impl TextOutput for FirstLine {
+        async fn output(&self, _: &str) -> Result<(), OutputError> {
+            Err(OutputError::AllMethodsFailed)
+        }
+        async fn output_prefix(&self, text: &str) -> Result<usize, OutputError> {
+            let cut = text.find('\n').unwrap_or(text.len());
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("preedit:{}", &text[..cut]));
+            Ok(cut)
+        }
+        async fn is_available(&self) -> bool {
+            true
+        }
+        fn name(&self) -> &'static str {
+            "preedit"
+        }
+    }
+
+    #[tokio::test]
+    async fn collected_text_split_at_a_line_break_goes_on_to_the_next_method() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let base = factory(log.clone(), Some(0));
+        let first = log.clone();
+        let chain: ChainFactory<'static> = Box::new(move |pos| {
+            let mut chain = base(pos);
+            chain.insert(0, Box::new(FirstLine(first.clone())));
+            chain
+        });
+        let mut out = IncrementalOutput::new(chain, opts(), true);
+        out.begin().await;
+        for p in ["One.", "\nTwo."] {
+            out.push(p).await;
+        }
+        let delivered = out.finish(false).await.unwrap();
+        assert_eq!(delivered.text, "One.\nTwo.");
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec!["preedit:One.", "clipboard[first+last]:\nTwo."]
+        );
     }
 
     #[tokio::test]
