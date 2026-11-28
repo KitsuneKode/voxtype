@@ -342,7 +342,10 @@ impl Driver {
                 let lingering = self.linger_until.take().is_some();
                 match self.ime.as_mut() {
                     // Still on the field the last take went into: keep it.
-                    Some(ime) if lingering && ime.active() => sink.send(ime.clear()),
+                    Some(ime) if lingering && ime.active() => {
+                        ime.begin_take();
+                        sink.send(ime.clear());
+                    }
                     // A take that never ended, or a binding with no field.
                     _ => {
                         self.release(sink);
@@ -777,6 +780,57 @@ mod tests {
         // The binding stays on the field until focus leaves it.
         fake.unfocus();
         assert_eq!(fake.log(), ["unbind"]);
+    }
+
+    #[tokio::test]
+    async fn takes_into_a_field_ending_a_sentence_join_it_with_a_space() {
+        let fake = Fake::new(true, true);
+        fake.handle.begin();
+        fake.settle().await;
+        fake.event(Event::Activate);
+        let field = "as well as in here.";
+        fake.event(Event::Surrounding {
+            text: field.into(),
+            cursor: field.len() as u32,
+        });
+        fake.event(Event::Done);
+        fake.handle.set("What is going on");
+        fake.settle().await;
+        assert!(
+            deliver(&fake, &Default::default(), "What is going on right now?")
+                .await
+                .is_empty()
+        );
+        fake.handle.end();
+        fake.settle().await;
+        assert_eq!(
+            fake.log(),
+            [
+                "bind:true",
+                "preedit: What is going on",
+                "commit:1",
+                "preedit:",
+                "commit_string: What is going on right now?",
+                "commit:1",
+            ]
+        );
+
+        // The next take on the same field (the binding lingered) joins too.
+        let field = "as well as in here. What is going on right now?";
+        fake.event(Event::Surrounding {
+            text: field.into(),
+            cursor: field.len() as u32,
+        });
+        fake.event(Event::Done);
+        fake.handle.begin();
+        fake.handle.set("Okay");
+        fake.settle().await;
+        assert!(deliver(&fake, &Default::default(), "Okay.")
+            .await
+            .is_empty());
+        let log = fake.log();
+        assert!(log.contains(&"preedit: Okay".to_string()), "{log:?}");
+        assert!(log.contains(&"commit_string: Okay.".to_string()), "{log:?}");
     }
 
     #[tokio::test]

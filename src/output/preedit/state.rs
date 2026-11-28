@@ -87,11 +87,72 @@ pub struct Ime {
     awaiting_field: bool,
     /// Byte offset in the daemon's text where the shown tail starts.
     tail_start: usize,
+    /// This take already committed text, so later commits (live deltas,
+    /// a sub-word piece among them) join as they are.
+    take_committed: bool,
+}
+
+/// Characters after which dictated text starts without a space: opening
+/// brackets and quotes, and the joiners of paths, handles and tags.
+const NO_SPACE_AFTER: &[char] = &[
+    '(', '[', '{', '<', '\u{201C}', '\u{2018}', '\u{00AB}', '\u{00BF}', '\u{00A1}', '/', '\\', '@',
+    '#', '_', '-', '\u{2014}',
+];
+
+/// Whether `text`, dictated at a cursor with `before` in front of it, needs a
+/// space to join it: the field's last character is not whitespace and does
+/// not open something, and `text` starts with a word character. A straight
+/// quote opens when whitespace, an opening bracket or nothing precedes it.
+/// Case is left as it is.
+pub fn needs_leading_space(before: &str, text: &str) -> bool {
+    if !text.chars().next().is_some_and(char::is_alphanumeric) {
+        return false;
+    }
+    let mut rest = before.chars().rev();
+    let Some(last) = rest.next() else {
+        return false;
+    };
+    if last.is_whitespace() || NO_SPACE_AFTER.contains(&last) {
+        return false;
+    }
+    if last == '"' || last == '\'' {
+        return rest
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && !NO_SPACE_AFTER.contains(&c));
+    }
+    true
 }
 
 impl Ime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A new take starts on this binding: its first text joins the field's.
+    pub fn begin_take(&mut self) {
+        self.take_committed = false;
+    }
+
+    /// The field's text before the cursor, without our preedit.
+    fn before_cursor(&self) -> Option<&str> {
+        match &self.base {
+            Some(base) => Some(base),
+            None => self.field().map(|(before, _)| before),
+        }
+    }
+
+    /// The space `text` needs in front to join the field's text, while the
+    /// take has committed nothing yet.
+    fn join(&self, text: &str) -> &'static str {
+        let join = !self.take_committed
+            && self
+                .before_cursor()
+                .is_some_and(|before| needs_leading_space(before, text));
+        if join {
+            " "
+        } else {
+            ""
+        }
     }
 
     /// Whether a text-input-v3 field is focused and listening to us.
@@ -190,7 +251,8 @@ impl Ime {
     /// Show `text` as the preedit, or its tail when long (see
     /// [`PREEDIT_TAIL_BYTES`]).
     pub fn set(&mut self, text: &str) -> Vec<Request> {
-        self.text = self.tail(text);
+        let join = self.join(text.trim_start());
+        self.text = format!("{join}{}", self.tail(text));
         self.sync()
     }
 
@@ -295,9 +357,13 @@ impl Ime {
             self.warn_if_kept();
             return (CommitOutcome::NotActive, Vec::new());
         }
+        let joined = format!("{}{text}", self.join(text));
+        if !text.is_empty() {
+            self.take_committed = true;
+        }
         let mut requests = Vec::new();
         let mut first = true;
-        for chunk in chunks(text) {
+        for chunk in chunks(&joined) {
             if first {
                 requests.push(Request::Preedit(String::new()));
                 first = false;
@@ -490,6 +556,102 @@ mod tests {
     }
 
     const LIVE: &str = "Also it's very weird";
+
+    #[test]
+    fn dictated_text_joins_the_field_with_a_space_only_where_one_is_missing() {
+        let cases = [
+            ("as well as in here.", "What is", true),
+            ("word", "next", true),
+            ("He said \"hi\"", "then", true),
+            ("it's the dogs'", "bowl", true),
+            ("Done. ", "Next", false),
+            ("Done.\n", "Next", false),
+            ("", "Start", false),
+            ("call(", "x", false),
+            ("a [", "b", false),
+            ("say \"", "hi", false),
+            ("(\"", "hi", false),
+            ("\u{201C}", "hi", false),
+            ("~/src/", "main", false),
+            ("mail me@", "example", false),
+            ("well-", "known", false),
+            ("here.", ", and", false),
+            ("here.", " What", false),
+            ("here.", "", false),
+            ("here.", "\u{2026}", false),
+        ];
+        for (before, text, want) in cases {
+            assert_eq!(
+                needs_leading_space(before, text),
+                want,
+                "{before:?} + {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_take_after_a_sentence_shows_and_commits_with_a_space() {
+        let mut ime = showing("as well as in here.", "What is going on");
+        assert_eq!(ime.shown, " What is going on");
+        let (_, requests) = ime.commit("What is going on right now?");
+        assert!(
+            requests.contains(&Request::CommitString(
+                " What is going on right now?".into()
+            )),
+            "{requests:?}"
+        );
+    }
+
+    #[test]
+    fn a_take_keeps_the_cleanups_own_space_and_case() {
+        let mut ime = showing("in here.", "what is");
+        let (_, requests) = ime.commit(" what is it?");
+        assert!(requests.contains(&Request::CommitString(" what is it?".into())));
+    }
+
+    #[test]
+    fn a_field_that_never_reported_its_text_gets_no_space() {
+        let mut ime = activated();
+        assert_eq!(ime.set("What"), preedit("What", 1));
+        let (_, requests) = ime.commit("What now?");
+        assert!(requests.contains(&Request::CommitString("What now?".into())));
+    }
+
+    #[test]
+    fn the_space_appears_once_a_late_field_reports_its_text() {
+        let mut ime = activated();
+        ime.set("What");
+        ime.on_event(surrounding("in here."));
+        ime.on_event(Event::Done);
+        assert_eq!(ime.set("What is"), preedit(" What is", 2));
+    }
+
+    #[test]
+    fn only_the_takes_first_commit_joins() {
+        let mut ime = showing("in here.", "wor");
+        let (_, first) = ime.commit("wor");
+        assert!(first.contains(&Request::CommitString(" wor".into())));
+        ime.on_event(surrounding("in here. wor"));
+        ime.on_event(Event::Done);
+        let (_, second) = ime.commit("ld");
+        assert!(
+            second.contains(&Request::CommitString("ld".into())),
+            "{second:?}"
+        );
+        ime.begin_take();
+        let (_, next) = ime.commit("Next.");
+        assert!(
+            next.contains(&Request::CommitString(" Next.".into())),
+            "{next:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_takes_tail_keeps_its_joining_space() {
+        let long = "word ".repeat(80);
+        let ime = showing("here.", long.trim_end());
+        assert!(ime.shown.starts_with(" \u{2026}"), "{:?}", &ime.shown[..8]);
+    }
 
     fn removes_and_reshows(serial: u32) -> Vec<Request> {
         vec![
