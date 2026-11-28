@@ -447,8 +447,10 @@ async fn stream_post_process(
         wait_for_modifier_release: output_config.wait_for_modifier_release,
         modifier_release_timeout: Duration::from_millis(output_config.modifier_release_timeout_ms),
     };
-    // With a preedit, the cleaned text replaces it as it streams in and is
+    // With a preedit, the transcript stays in it until the cleaned text is
     // committed once at the end (the preedit driver collects the pieces).
+    // Showing the cleanup as it streamed in cut the preedit back to its first
+    // sentence: the field emptied and refilled (219, 35, 177, 213 characters).
     let chain_for: ChainFactory = match preedit {
         None => chain_factory(output_config),
         Some(preedit) => {
@@ -470,7 +472,6 @@ async fn stream_post_process(
             })
         }
     };
-    let mut shown = String::new();
     let mut out = IncrementalOutput::new(chain_for, options, processor.trims());
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let run = processor.process_streaming(text, context, tx);
@@ -503,12 +504,6 @@ async fn stream_post_process(
                     if !piece.trim().is_empty() {
                         printed = true;
                         first_piece_ms.get_or_insert_with(|| started.elapsed().as_millis());
-                    }
-                    if let Some(preedit) = preedit {
-                        shown.push_str(&piece);
-                        if !shown.trim().is_empty() {
-                            preedit.set(shown.trim());
-                        }
                     }
                     out.push(&piece).await;
                 }
@@ -12557,5 +12552,110 @@ while True:
 
         // A bare SIGUSR1 carries no stamp and keeps working.
         assert!(!daemon.start_request_predates_idle(None));
+    }
+
+    /// Records what the input method would send, for [`stream_post_process`].
+    #[derive(Default)]
+    struct PreeditLog(Vec<String>);
+
+    impl output::preedit::Sink for PreeditLog {
+        fn bind(&mut self) -> bool {
+            true
+        }
+        fn unbind(&mut self) {}
+        fn send(&mut self, requests: Vec<output::preedit::state::Request>) {
+            use output::preedit::state::Request;
+            for r in requests {
+                match r {
+                    Request::Preedit(t) => self.0.push(format!("preedit:{t}")),
+                    Request::CommitString(t) => self.0.push(format!("commit_string:{t}")),
+                    Request::DeleteBefore(_) | Request::Commit(_) => {}
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_streamed_cleanup_keeps_the_transcript_in_the_preedit_until_it_commits() {
+        use output::preedit::state::Event;
+        use output::preedit::{Ack, Backend, Driver, PreeditHandle, Shared};
+        let shared = Arc::new(Shared::default());
+        let driver = Arc::new(std::sync::Mutex::new((
+            Driver::new(shared.clone()),
+            PreeditLog::default(),
+        )));
+        let d = driver.clone();
+        let preedit = PreeditHandle::with_spawner(Box::new(move || {
+            let (tx, rx) = std::sync::mpsc::channel();
+            shared
+                .alive
+                .store(true, std::sync::atomic::Ordering::Release);
+            let d = d.clone();
+            std::thread::spawn(move || {
+                while let Ok(cmd) = rx.recv() {
+                    let mut guard = d.lock().unwrap();
+                    let (driver, sink) = &mut *guard;
+                    match driver.command(cmd, sink) {
+                        Ack::None => {}
+                        Ack::Cleared(tx) => {
+                            let _ = tx.send(());
+                        }
+                        Ack::Committed(tx, outcome) => {
+                            let _ = tx.send(outcome);
+                        }
+                    }
+                }
+            });
+            Ok(Backend::new(tx, Arc::new(|| {}), shared.clone()))
+        }));
+        preedit.begin();
+        preedit.flush().await;
+        {
+            let mut guard = driver.lock().unwrap();
+            let (driver, sink) = &mut *guard;
+            driver.event(Event::Activate, sink);
+            driver.event(Event::Done, sink);
+        }
+        let transcript = "so um the first thing and then the second thing";
+        preedit.set(transcript);
+
+        let processor =
+            crate::output::post_process::PostProcessor::new(&crate::config::PostProcessConfig {
+                command: "printf 'The first thing.'; sleep 0.2; printf ' Then the second.'"
+                    .to_string(),
+                timeout_ms: 5000,
+                trim: true,
+                fallback_on_empty: true,
+                streaming: true,
+                edit_list: false,
+                ..Default::default()
+            });
+        let config = crate::config::OutputConfig {
+            wait_for_modifier_release: false,
+            ..Default::default()
+        };
+        let queue = TakeQueue::new(None);
+        let delivery = stream_post_process(
+            &queue,
+            &processor,
+            transcript,
+            None,
+            &config,
+            Some(&preedit),
+            None,
+        )
+        .await;
+        let StreamedDelivery::Delivered(delivered) = delivery else {
+            panic!("not delivered");
+        };
+        assert_eq!(delivered.driver, "preedit");
+        assert_eq!(
+            driver.lock().unwrap().1 .0,
+            [
+                format!("preedit:{transcript}"),
+                "preedit:".to_string(),
+                "commit_string:The first thing. Then the second.".to_string(),
+            ]
+        );
     }
 }
