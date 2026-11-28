@@ -13,6 +13,7 @@ pub mod enhance;
 pub mod feedback;
 pub mod levels;
 pub mod media;
+pub mod release_tail;
 pub mod resampler;
 
 pub use dual_capture::{AudioSourceType, DualCapture, DualSamples, SourcedSample};
@@ -35,6 +36,14 @@ pub trait AudioCapture: Send + Sync {
     /// Number of leading samples captured before this take was requested.
     fn pre_roll_samples(&self) -> usize {
         0
+    }
+
+    /// While a take records, how many samples it holds and a copy of them
+    /// from index `from` on, at most the last `at_most`. Nothing is drained.
+    /// `None` when this capture can't be read while it records, which
+    /// leaves a release tail out.
+    async fn captured_since(&mut self, _from: usize, _at_most: usize) -> Option<(usize, Vec<f32>)> {
+        None
     }
 
     /// Stop capturing and return all recorded samples

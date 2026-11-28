@@ -77,6 +77,17 @@ impl CaptureBuffer {
         }
     }
 
+    pub(super) fn captured_since(&self, from: usize, at_most: usize) -> Option<(usize, Vec<f32>)> {
+        match self {
+            Self::Recording { samples, .. } => {
+                let total = samples.len();
+                let from = from.max(total.saturating_sub(at_most)).min(total);
+                Some((total, samples[from..].to_vec()))
+            }
+            _ => None,
+        }
+    }
+
     pub(super) fn stop(&mut self, warm_limit: Option<usize>) -> Vec<f32> {
         let next = warm_limit.map_or(Self::Closed, |limit| Self::Warm {
             ring: VecDeque::new(),
@@ -136,6 +147,21 @@ mod tests {
         assert_eq!(b.stop(None), [1., 2., 3.]);
         b.push(vec![4.]);
         assert!(matches!(b, CaptureBuffer::Closed));
+    }
+
+    /// A release tail reads the take while it records without draining it.
+    #[test]
+    fn captured_since_copies_without_draining() {
+        let mut b = CaptureBuffer::Closed;
+        assert_eq!(b.captured_since(0, 10), None);
+        let (tx, _rx) = mpsc::channel(4);
+        b.start(tx, 16000, 16000);
+        b.push(vec![1., 2., 3., 4.]);
+        assert_eq!(b.captured_since(0, 2), Some((4, vec![3., 4.])));
+        b.push(vec![5.]);
+        assert_eq!(b.captured_since(4, usize::MAX), Some((5, vec![5.])));
+        assert_eq!(b.captured_since(9, usize::MAX), Some((5, vec![])));
+        assert_eq!(b.stop(None), [1., 2., 3., 4., 5.]);
     }
 
     #[test]

@@ -54,6 +54,9 @@ impl EnergyVad {
     /// setting chosen to ignore quiet background speech still means
     /// something in a quiet room. Never below the most sensitive setting.
     fn effective_threshold(&self, frame_rms: &[f32]) -> f32 {
+        if frame_rms.is_empty() {
+            return self.threshold;
+        }
         let mut sorted = frame_rms.to_vec();
         sorted.sort_by(|a, b| a.total_cmp(b));
         let floor = sorted[((sorted.len() - 1) as f32 * NOISE_FLOOR_PERCENTILE) as usize];
@@ -62,6 +65,17 @@ impl EnergyVad {
             .max(MIN_ENERGY_THRESHOLD)
             .min(self.threshold)
     }
+}
+
+/// The RMS level above which a frame of `recent` audio counts as speech,
+/// set the way [`EnergyVad`] sets it for a whole recording.
+pub(crate) fn speech_level(config: &VadConfig, frame_rms: &[f32]) -> f32 {
+    EnergyVad::new(config).effective_threshold(frame_rms)
+}
+
+/// RMS of one frame of samples (zero for none).
+pub(crate) fn rms(samples: &[f32]) -> f32 {
+    EnergyVad::calculate_rms(samples)
 }
 
 /// Speech must be this many times louder than the recording's noise floor

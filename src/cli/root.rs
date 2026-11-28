@@ -298,6 +298,16 @@ pub struct Cli {
     )]
     pub pre_roll_ms: Option<u32>,
 
+    /// Keep listening up to this long after a stop while speech is still
+    /// running, in milliseconds (0 = stop at once)
+    #[arg(
+        long,
+        value_name = "MS",
+        help_heading = "Audio",
+        hide_short_help = true
+    )]
+    pub release_tail_ms: Option<u32>,
+
     /// Record a new dictation while the last one is still being transcribed
     #[arg(long, help_heading = "Audio", hide_short_help = true)]
     pub queue_dictations: bool,

@@ -25,6 +25,8 @@ enum CaptureCommand {
     Stop(oneshot::Sender<Vec<f32>>),
     /// Get current samples and clear the buffer (for continuous recording)
     GetSamples(oneshot::Sender<Vec<f32>>),
+    /// Copy the take from an index on without draining it (release tail)
+    Peek(usize, usize, oneshot::Sender<Option<(usize, Vec<f32>)>>),
 }
 
 /// Parameters for building an audio input stream
@@ -374,6 +376,10 @@ impl AudioCapture for CpalCapture {
                         let _ = reply.send(buffer.drain());
                         StreamState::Recording
                     }
+                    CaptureCommand::Peek(from, at_most, reply) => {
+                        let _ = reply.send(buffer.captured_since(from, at_most));
+                        StreamState::Recording
+                    }
                 }
             });
             // A macOS disconnect listener can hold its own stream clone.
@@ -460,6 +466,18 @@ impl AudioCapture for CpalCapture {
         }
 
         Ok(samples)
+    }
+
+    async fn captured_since(&mut self, from: usize, at_most: usize) -> Option<(usize, Vec<f32>)> {
+        let cmd_tx = self.cmd_tx.as_ref()?;
+        let (reply, response) = oneshot::channel();
+        cmd_tx
+            .send(CaptureCommand::Peek(from, at_most, reply))
+            .ok()?;
+        tokio::time::timeout(Duration::from_millis(500), response)
+            .await
+            .ok()?
+            .ok()?
     }
 
     async fn get_samples(&mut self) -> Vec<f32> {
@@ -670,6 +688,10 @@ mod tests {
                     }
                     CaptureCommand::GetSamples(reply) => {
                         let _ = reply.send(b.drain());
+                        StreamState::Recording
+                    }
+                    CaptureCommand::Peek(from, at_most, reply) => {
+                        let _ = reply.send(b.captured_since(from, at_most));
                         StreamState::Recording
                     }
                 }

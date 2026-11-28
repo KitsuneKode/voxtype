@@ -305,6 +305,9 @@ pub(crate) fn apply_cli_overrides(config: &mut config::Config, cli: &Cli) -> Opt
     if let Some(value) = cli.pre_roll_ms {
         config.audio.pre_roll_ms = value;
     }
+    if let Some(value) = cli.release_tail_ms {
+        config.audio.release_tail_ms = value;
+    }
     apply_bool_override(
         &mut config.audio.queue_dictations,
         cli.queue_dictations,
