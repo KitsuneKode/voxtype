@@ -8,6 +8,16 @@
 /// (the protocol allows 4000; leave room for the message header).
 pub const MAX_STRING_BYTES: usize = 3900;
 
+/// The preedit shows at most this much of the take's tail. A field redoes the
+/// whole composition on every update (layout, and in ProseMirror editors a
+/// transaction and a re-render), so the cost grows with the take: in T3 Code
+/// an update took 10 ms to reach the screen early in a take, 30 ms at 1500
+/// characters and 57 ms at 3000; showing only the tail keeps it near 10 ms.
+/// The whole take is still committed at the end. When the tail outgrows this
+/// it restarts at a word about half as far back, so the text in the field
+/// moves every dozen words or so, not on every update.
+pub const PREEDIT_TAIL_BYTES: usize = 240;
+
 /// A compositor event, already reduced to what the model cares about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
@@ -75,6 +85,8 @@ pub struct Ime {
     /// Reactivated with `lost` pending and no field text yet: nothing is
     /// shown until the field reports what it kept.
     awaiting_field: bool,
+    /// Byte offset in the daemon's text where the shown tail starts.
+    tail_start: usize,
 }
 
 impl Ime {
@@ -171,10 +183,34 @@ impl Ime {
         Some(text.split_at(at))
     }
 
-    /// Show `text` as the preedit (trimmed to its tail when too long).
+    /// Show `text` as the preedit, or its tail when long (see
+    /// [`PREEDIT_TAIL_BYTES`]).
     pub fn set(&mut self, text: &str) -> Vec<Request> {
-        self.text = fit_tail(text);
+        self.text = self.tail(text);
         self.sync()
+    }
+
+    fn tail(&mut self, text: &str) -> String {
+        let mut start = self.tail_start.min(text.len());
+        if text.len() - start > PREEDIT_TAIL_BYTES {
+            start = text.len() - PREEDIT_TAIL_BYTES / 2;
+        }
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        if start > 0 && !text[..start].ends_with(char::is_whitespace) {
+            if let Some(space) = text[start..].find(char::is_whitespace) {
+                start += space;
+            }
+        }
+        let body = text[start..].trim_start();
+        start = text.len() - body.len();
+        self.tail_start = start;
+        if start == 0 {
+            body.to_string()
+        } else {
+            format!("\u{2026}{body}")
+        }
     }
 
     /// An empty commit, for a field that reports its text only in answer to
@@ -191,6 +227,7 @@ impl Ime {
     /// Remove the preedit.
     pub fn clear(&mut self) -> Vec<Request> {
         self.text.clear();
+        self.tail_start = 0;
         self.warn_if_kept();
         self.lost.clear();
         self.sync()
@@ -269,6 +306,7 @@ impl Ime {
             requests.push(Request::Commit(self.serial));
         }
         self.text.clear();
+        self.tail_start = 0;
         self.shown.clear();
         self.lost.clear();
         self.base = None;
@@ -294,20 +332,6 @@ impl Ime {
             Request::Commit(self.serial),
         ]
     }
-}
-
-/// The last [`MAX_STRING_BYTES`] of `text`, cut at a char boundary and
-/// marked with a leading ellipsis when anything was dropped.
-fn fit_tail(text: &str) -> String {
-    if text.len() <= MAX_STRING_BYTES {
-        return text.to_string();
-    }
-    let budget = MAX_STRING_BYTES - '…'.len_utf8();
-    let mut start = text.len() - budget;
-    while !text.is_char_boundary(start) {
-        start += 1;
-    }
-    format!("…{}", &text[start..])
 }
 
 /// `text` in pieces of at most [`MAX_STRING_BYTES`], cut at char boundaries.
@@ -594,6 +618,71 @@ mod tests {
             None,
             "a new focus starts with no text until the field sends it"
         );
+    }
+
+    fn shown(requests: &[Request]) -> &str {
+        match requests.first() {
+            Some(Request::Preedit(text)) => text,
+            other => panic!("expected a preedit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_long_take_shows_its_tail_from_a_word_start() {
+        let mut ime = activated();
+        let words: Vec<String> = (0..300).map(|i| format!("word{i}")).collect();
+        let take = words.join(" ");
+        let requests = ime.set(&take);
+        let tail = shown(&requests);
+        assert!(tail.len() <= PREEDIT_TAIL_BYTES + '\u{2026}'.len_utf8(), "{tail}");
+        let body = tail.strip_prefix('\u{2026}').expect("marked as cut");
+        assert!(take.ends_with(body));
+        assert!(take.contains(&format!(" {body}")), "starts at a word: {body}");
+
+        // The whole take still goes into the field at the end.
+        let (_, requests) = ime.commit(&take);
+        assert!(requests.contains(&Request::CommitString(take.clone())));
+    }
+
+    #[test]
+    fn the_tail_start_moves_every_few_words_not_on_every_update() {
+        let mut ime = activated();
+        let words: Vec<String> = (0..300).map(|i| format!("word{i}")).collect();
+        let mut starts = Vec::new();
+        for n in 1..=words.len() {
+            let requests = ime.set(&words[..n].join(" "));
+            let body = shown(&requests).trim_start_matches('\u{2026}').to_string();
+            let first = body.split(' ').next().unwrap().to_string();
+            if starts.last() != Some(&first) {
+                starts.push(first);
+            }
+        }
+        // About 120 bytes (~17 of these words) between moves.
+        assert!(starts.len() < words.len() / 10, "{} moves", starts.len());
+    }
+
+    #[test]
+    fn a_new_take_starts_showing_from_its_first_word() {
+        let mut ime = activated();
+        ime.set(&"long take ".repeat(60));
+        ime.commit("Long take.");
+        assert_eq!(ime.set("next"), preedit("next", 1));
+        ime.set(&"another long take ".repeat(30));
+        ime.clear();
+        assert_eq!(ime.set("again"), preedit("again", 1));
+    }
+
+    #[test]
+    fn a_revised_take_keeps_a_word_aligned_tail() {
+        let mut ime = activated();
+        let take = "alpha beta gamma delta ".repeat(20);
+        ime.set(&take);
+        // The final pass rewrites the take: the old cut lands mid-word.
+        let revised = "Alpha, beta; gamma! delta? ".repeat(20);
+        let requests = ime.set(&revised);
+        let body = shown(&requests).trim_start_matches('\u{2026}');
+        assert!(revised.ends_with(body));
+        assert!(revised.contains(&format!(" {body}")), "{body}");
     }
 
     #[test]

@@ -424,3 +424,7 @@ required-features = ["parakeet"]
 [[example]]
 name = "preedit_probe"
 required-features = ["preedit"]
+
+[[example]]
+name = "preedit_replay"
+required-features = ["preedit"]
