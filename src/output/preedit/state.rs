@@ -634,10 +634,16 @@ mod tests {
         let take = words.join(" ");
         let requests = ime.set(&take);
         let tail = shown(&requests);
-        assert!(tail.len() <= PREEDIT_TAIL_BYTES + '\u{2026}'.len_utf8(), "{tail}");
+        assert!(
+            tail.len() <= PREEDIT_TAIL_BYTES + '\u{2026}'.len_utf8(),
+            "{tail}"
+        );
         let body = tail.strip_prefix('\u{2026}').expect("marked as cut");
         assert!(take.ends_with(body));
-        assert!(take.contains(&format!(" {body}")), "starts at a word: {body}");
+        assert!(
+            take.contains(&format!(" {body}")),
+            "starts at a word: {body}"
+        );
 
         // The whole take still goes into the field at the end.
         let (_, requests) = ime.commit(&take);

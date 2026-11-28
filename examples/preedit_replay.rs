@@ -16,7 +16,10 @@ use voxtype::output::preedit::{PreeditHandle, PreeditOutput};
 use voxtype::output::TextOutput;
 
 fn env_u64(name: &str, default: u64) -> u64 {
-    std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 #[tokio::main]
@@ -32,7 +35,12 @@ async fn main() {
     let take = take.trim().to_string();
     let final_text = args
         .next()
-        .map(|p| std::fs::read_to_string(p).expect("read final").trim().to_string())
+        .map(|p| {
+            std::fs::read_to_string(p)
+                .expect("read final")
+                .trim()
+                .to_string()
+        })
         .unwrap_or_else(|| take.clone());
     let tick = Duration::from_millis(env_u64("TICK_MS", 320));
     let per_tick = env_u64("WORDS_PER_TICK", 1) as usize;
@@ -54,7 +62,12 @@ async fn main() {
     }
     println!("REPLAY active={}", preedit.text_input_active());
     let start = Instant::now();
-    let stamp = |what: &str| println!("REPLAY {:>8.1} {what}", start.elapsed().as_secs_f64() * 1000.0);
+    let stamp = |what: &str| {
+        println!(
+            "REPLAY {:>8.1} {what}",
+            start.elapsed().as_secs_f64() * 1000.0
+        )
+    };
 
     let words: Vec<&str> = take.split_whitespace().collect();
     let mut n = 0;
@@ -82,7 +95,11 @@ async fn main() {
         }
         tokio::time::sleep(tick).await;
     }
-    stamp(&format!("stop words={} chars={}", words.len(), take.chars().count()));
+    stamp(&format!(
+        "stop words={} chars={}",
+        words.len(),
+        take.chars().count()
+    ));
     // The daemon shows the transcript while the cleanup runs.
     if keep == 0 && cap == 0 {
         preedit.set(&take);
@@ -117,7 +134,11 @@ async fn main() {
         }
     } else {
         let out = PreeditOutput::new(preedit.clone(), &config);
-        let rest = if keep > 0 { words[committed..].join(" ") } else { final_text.clone() };
+        let rest = if keep > 0 {
+            words[committed..].join(" ")
+        } else {
+            final_text.clone()
+        };
         let r = out.output(&rest).await;
         stamp(&format!("delivered via preedit: {r:?}"));
     }
