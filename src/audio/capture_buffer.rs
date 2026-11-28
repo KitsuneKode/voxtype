@@ -6,11 +6,36 @@ use super::resampler::{resample_buffer, StreamResampler};
 use std::collections::VecDeque;
 use tokio::sync::mpsc;
 
+/// Device samples that were exactly zero since a take started, until its
+/// first sample of sound. A working microphone is never digitally silent
+/// for long; a stream that a sound server stopped feeding is.
+#[derive(Debug, Default)]
+pub(super) struct DigitalSilence {
+    zeros: usize,
+    sound: bool,
+}
+
+impl DigitalSilence {
+    fn feed(&mut self, mono: &[f32]) {
+        if self.sound {
+            return;
+        }
+        match mono.iter().position(|&s| s != 0.0) {
+            Some(at) => {
+                self.zeros += at;
+                self.sound = true;
+            }
+            None => self.zeros += mono.len(),
+        }
+    }
+}
+
 pub(super) enum CaptureBuffer {
     Recording {
         samples: Vec<f32>,
         tx: mpsc::Sender<Vec<f32>>,
         resampler: Option<Box<StreamResampler>>,
+        silence: DigitalSilence,
     },
     Warm {
         ring: VecDeque<f32>,
@@ -43,8 +68,18 @@ impl CaptureBuffer {
             samples: prefix,
             tx,
             resampler,
+            silence: DigitalSilence::default(),
         };
         len
+    }
+
+    /// Device samples of exact zeros this take has delivered with no sound
+    /// yet, or `None` once it delivered sound (or is not recording).
+    pub(super) fn digital_silence(&self) -> Option<usize> {
+        match self {
+            Self::Recording { silence, .. } if !silence.sound => Some(silence.zeros),
+            _ => None,
+        }
     }
 
     pub(super) fn push(&mut self, mono: Vec<f32>) {
@@ -53,7 +88,9 @@ impl CaptureBuffer {
                 samples,
                 tx,
                 resampler,
+                silence,
             } => {
+                silence.feed(&mono);
                 let chunk = match resampler {
                     Some(r) => r.push(&mono),
                     None => mono,
@@ -162,6 +199,31 @@ mod tests {
         assert_eq!(b.captured_since(4, usize::MAX), Some((5, vec![5.])));
         assert_eq!(b.captured_since(9, usize::MAX), Some((5, vec![])));
         assert_eq!(b.stop(None), [1., 2., 3., 4., 5.]);
+    }
+
+    #[test]
+    fn digital_silence_counts_zeros_until_the_first_sound() {
+        let mut b = CaptureBuffer::Closed;
+        assert_eq!(b.digital_silence(), None);
+        b.stop(Some(4));
+        b.push(vec![0.5; 4]);
+        let (tx, _rx) = mpsc::channel(8);
+        b.start(tx, 16000, 16000);
+        assert_eq!(
+            b.digital_silence(),
+            Some(0),
+            "the warm pre-roll does not count"
+        );
+        b.push(vec![0.0; 3]);
+        b.push(vec![0.0; 2]);
+        assert_eq!(b.digital_silence(), Some(5));
+        b.push(vec![0.0, 0.001, 0.0]);
+        assert_eq!(b.digital_silence(), None, "a quiet sample is sound");
+        b.push(vec![0.0; 100]);
+        assert_eq!(b.digital_silence(), None);
+        let (tx, _rx) = mpsc::channel(8);
+        b.start(tx, 16000, 16000);
+        assert_eq!(b.digital_silence(), Some(0), "every take starts over");
     }
 
     #[test]

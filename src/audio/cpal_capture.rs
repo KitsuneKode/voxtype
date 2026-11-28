@@ -295,54 +295,75 @@ impl AudioCapture for CpalCapture {
             // The flag is read by `is_stream_dead` so `start()` can rebuild
             // rather than hand back a stream that will never produce a sample.
             let stream_dead = Arc::new(AtomicBool::new(false));
-            let stream_dead_for_cb = stream_dead.clone();
             let device_label = device_name.clone();
-            let err_fn = move |err| {
-                tracing::error!("Audio stream error, capture is now dead: {}", err);
-                stream_dead_for_cb.store(true, Ordering::SeqCst);
-            };
 
             let mut initial = CaptureBuffer::Closed;
             initial.start(chunk_tx, source_sample_rate, target_sample_rate);
             let buffer = Arc::new(Mutex::new(initial));
-            let make_params = || StreamBuildParams {
-                buffer: buffer.clone(),
-                source_channels,
+
+            let open = || -> Result<cpal::Stream, String> {
+                let dead = stream_dead.clone();
+                let err_fn = move |err| {
+                    tracing::error!("Audio stream error, capture is now dead: {}", err);
+                    dead.store(true, Ordering::SeqCst);
+                };
+                let params = StreamBuildParams {
+                    buffer: buffer.clone(),
+                    source_channels,
+                };
+                let stream = match sample_format {
+                    cpal::SampleFormat::F32 => {
+                        build_stream::<f32>(&device, &stream_config, params, err_fn)
+                    }
+                    cpal::SampleFormat::I16 => {
+                        build_stream::<i16>(&device, &stream_config, params, err_fn)
+                    }
+                    cpal::SampleFormat::U16 => {
+                        build_stream::<u16>(&device, &stream_config, params, err_fn)
+                    }
+                    format => return Err(format!("unsupported sample format {format:?}")),
+                }
+                .map_err(|e| format!("could not open the input stream: {e}"))?;
+                stream
+                    .play()
+                    .map_err(|e| format!("could not start the input stream: {e}"))?;
+                Ok(stream)
             };
 
-            let stream_result = match sample_format {
-                cpal::SampleFormat::F32 => {
-                    build_stream::<f32>(&device, &stream_config, make_params(), err_fn)
-                }
-                cpal::SampleFormat::I16 => {
-                    build_stream::<i16>(&device, &stream_config, make_params(), err_fn)
-                }
-                cpal::SampleFormat::U16 => {
-                    build_stream::<u16>(&device, &stream_config, make_params(), err_fn)
-                }
-                format => {
-                    let _ = ready_tx.send(Err(format!("unsupported sample format {format:?}")));
+            let mut stream = match open() {
+                Ok(stream) => stream,
+                Err(message) => {
+                    let _ = ready_tx.send(Err(message));
                     return;
                 }
             };
-
-            let stream = match stream_result {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = ready_tx.send(Err(format!("could not open the input stream: {e}")));
-                    return;
-                }
-            };
-
-            if let Err(e) = stream.play() {
-                let _ = ready_tx.send(Err(format!("could not start the input stream: {e}")));
-                return;
-            }
             let _ = ready_tx.send(Ok(()));
 
             tracing::debug!("Audio capture thread started");
 
-            serve_stream(cmd_rx, warm_window, |cmd| {
+            let reopened = std::cell::Cell::new(false);
+            let needed = digital_silence_limit(source_sample_rate);
+            let reopen_if_silent = || {
+                let silence = lock(&buffer).digital_silence();
+                if !should_reopen(&reopened, silence, needed) {
+                    return;
+                }
+                match open() {
+                    Ok(fresh) => {
+                        let old = std::mem::replace(&mut stream, fresh);
+                        let _ = old.pause();
+                        drop(old);
+                        stream_dead.store(false, Ordering::SeqCst);
+                        tell_microphone_reopened(&device_label);
+                    }
+                    Err(e) => tracing::error!(
+                        "The microphone gave only digital silence and could not be reopened: {}",
+                        e
+                    ),
+                }
+            };
+
+            serve_stream_ticking(cmd_rx, warm_window, SILENCE_POLL, reopen_if_silent, |cmd| {
                 let mut buffer = lock(&buffer);
                 match cmd {
                     CaptureCommand::Stop(reply) => {
@@ -365,6 +386,7 @@ impl AudioCapture for CpalCapture {
                         if stream_dead.load(Ordering::SeqCst) {
                             return StreamState::Closed;
                         }
+                        reopened.set(false);
                         let prefix = buffer.start(tx, source_sample_rate, target_sample_rate);
                         if reply.send(prefix).is_ok() {
                             StreamState::Recording
@@ -509,9 +531,65 @@ enum StreamState {
     Closed,
 }
 
+/// How long a take may deliver nothing but exact zeros before its stream is
+/// reopened. A sound server that stopped feeding a stream (seen after a warm
+/// stream was resumed) delivers zeros for the whole take; a noise gate in
+/// front of the microphone can too while nobody speaks, so the reopen
+/// happens at most once a take and costs only silence.
+const DIGITAL_SILENCE: Duration = Duration::from_millis(300);
+
+/// How often a recording take's stream is checked for digital silence.
+const SILENCE_POLL: Duration = Duration::from_millis(100);
+
+/// [`DIGITAL_SILENCE`] in device samples.
+fn digital_silence_limit(sample_rate: u32) -> usize {
+    (u64::from(sample_rate) * DIGITAL_SILENCE.as_millis() as u64 / 1000) as usize
+}
+
+/// Whether to reopen the stream now: the take has delivered `silence`
+/// samples of exact zeros and no sound, at least `needed`, and has not been
+/// reopened yet.
+fn should_reopen(reopened: &std::cell::Cell<bool>, silence: Option<usize>, needed: usize) -> bool {
+    if reopened.get() || !silence.is_some_and(|zeros| zeros >= needed) {
+        return false;
+    }
+    reopened.set(true);
+    true
+}
+
+static TOLD_MICROPHONE_REOPENED: AtomicBool = AtomicBool::new(false);
+
+/// Log every reopen; tell the user the first time in this run.
+fn tell_microphone_reopened(device: &str) {
+    tracing::warn!(
+        "Audio device '{}' gave only digital silence for {}ms; reopened it",
+        device,
+        DIGITAL_SILENCE.as_millis()
+    );
+    if !TOLD_MICROPHONE_REOPENED.swap(true, Ordering::SeqCst) {
+        crate::notification::send_sync(
+            "Microphone gave no sound; reopened it",
+            "If your first words are missing, say them again.",
+        );
+    }
+}
+
+#[cfg(test)]
 fn serve_stream<T>(
     commands: std::sync::mpsc::Receiver<T>,
     window: Option<Duration>,
+    handle: impl FnMut(T) -> StreamState,
+) {
+    serve_stream_ticking(commands, window, Duration::MAX, || {}, handle);
+}
+
+/// Serve the capture thread's commands until the stream closes. While a
+/// take records, `tick` runs every `poll` without a command.
+fn serve_stream_ticking<T>(
+    commands: std::sync::mpsc::Receiver<T>,
+    window: Option<Duration>,
+    poll: Duration,
+    mut tick: impl FnMut(),
     mut handle: impl FnMut(T) -> StreamState,
 ) {
     let mut deadline: Option<Instant> = None;
@@ -526,7 +604,15 @@ fn serve_stream<T>(
                     .ok()
                     .filter(|_| Instant::now() < end)
             }
-            None => commands.recv().ok(),
+            None if poll == Duration::MAX => commands.recv().ok(),
+            None => match commands.recv_timeout(poll) {
+                Ok(command) => Some(command),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    tick();
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+            },
         };
         let Some(command) = command else { break };
         match handle(command) {
@@ -618,6 +704,86 @@ mod tests {
         assert_eq!(cold.pre_roll_samples(), 0);
         config.warm_mic_secs = 3;
         assert!(mic.cpal(&config).unwrap().warm.is_some());
+    }
+
+    /// The 22:19 take: a resumed warm stream delivered nothing but zeros.
+    /// Fed through the real buffer, the take is reopened once after 300 ms
+    /// of exact zeros, never before, and never again in that take; a take
+    /// that delivers any sound first is left alone.
+    #[test]
+    fn a_take_of_digital_silence_is_reopened_once() {
+        use super::super::capture_buffer::CaptureBuffer;
+        use super::*;
+        let needed = digital_silence_limit(48000);
+        assert_eq!(needed, 14400);
+        let reopened = std::cell::Cell::new(false);
+        let mut buffer = CaptureBuffer::Closed;
+        buffer.stop(Some(4800));
+        buffer.push(vec![0.2; 4800]);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        buffer.start(tx, 48000, 48000);
+        for _ in 0..14 {
+            buffer.push(vec![0.0; 1000]);
+            assert!(!should_reopen(&reopened, buffer.digital_silence(), needed));
+        }
+        buffer.push(vec![0.0; 1000]);
+        assert!(should_reopen(&reopened, buffer.digital_silence(), needed));
+        buffer.push(vec![0.0; 48000]);
+        assert!(
+            !should_reopen(&reopened, buffer.digital_silence(), needed),
+            "once a take"
+        );
+
+        reopened.set(false);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        buffer.start(tx, 48000, 48000);
+        buffer.push(vec![0.0; 1000]);
+        buffer.push(vec![0.01; 10]);
+        buffer.push(vec![0.0; 48000]);
+        assert!(
+            !should_reopen(&reopened, buffer.digital_silence(), needed),
+            "a pause after speech"
+        );
+    }
+
+    /// The silence check runs while a take records, never while the
+    /// stream is parked warm.
+    #[test]
+    fn the_silence_check_runs_only_while_recording() {
+        use super::*;
+        let (commands, rx) = std::sync::mpsc::channel::<bool>();
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let recording = Arc::new(AtomicBool::new(true));
+        let (t, r) = (ticks.clone(), recording.clone());
+        let thread = thread::spawn(move || {
+            serve_stream_ticking(
+                rx,
+                Some(Duration::from_secs(3600)),
+                Duration::from_millis(5),
+                || t.lock().unwrap().push(r.load(Ordering::SeqCst)),
+                |warm: bool| {
+                    r.store(!warm, Ordering::SeqCst);
+                    if warm {
+                        StreamState::Warm
+                    } else {
+                        StreamState::Recording
+                    }
+                },
+            )
+        });
+        thread::sleep(Duration::from_millis(40));
+        commands.send(true).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        let parked = ticks.lock().unwrap().len();
+        thread::sleep(Duration::from_millis(40));
+        assert_eq!(ticks.lock().unwrap().len(), parked, "no checks while warm");
+        commands.send(false).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        drop(commands);
+        thread.join().unwrap();
+        let ticks = ticks.lock().unwrap();
+        assert!(ticks.len() > parked, "checks again after the resume");
+        assert!(ticks.iter().all(|&recording| recording));
     }
 
     /// Shutdown closes a warm stream and waits for its thread, instead of
