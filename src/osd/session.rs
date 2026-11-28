@@ -61,11 +61,29 @@ pub enum OutcomeKind {
     Error,
     /// Transcription succeeded but no output method could deliver it.
     OutputFailed,
+    Delivered,
+    ClipboardOnly,
+    Recovered,
+    Failed,
+    PrivateNotInserted,
+}
+
+impl OutcomeKind {
+    pub(crate) fn for_identified_take(self) -> Self {
+        match self {
+            Self::Ok => Self::Delivered,
+            Self::Empty | Self::NoSpeech | Self::TooShort => Self::Cancelled,
+            Self::Error | Self::OutputFailed => Self::Failed,
+            terminal => terminal,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OsdOutcome {
     pub outcome: OutcomeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub take_id: Option<String>,
     /// Identity of the recording that produced this result.
     pub session_started_at_ms: u64,
     /// Durable --no-osd policy, including after frontend restart/hotplug.
@@ -178,6 +196,7 @@ mod tests {
             dir.path(),
             &OsdOutcome {
                 outcome: OutcomeKind::NoSpeech,
+                take_id: None,
                 session_started_at_ms: 7,
                 suppressed: false,
                 chars: 0,

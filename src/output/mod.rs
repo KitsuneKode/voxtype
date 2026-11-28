@@ -43,6 +43,7 @@ pub mod preedit;
 pub mod preview;
 pub mod session;
 pub mod streaming;
+pub(crate) mod take;
 pub mod wtype;
 pub mod xclip;
 pub mod xdotool;
@@ -310,6 +311,9 @@ pub trait TextOutput: Send + Sync {
 
     /// Check if this output method is available
     async fn is_available(&self) -> bool;
+
+    /// True only for drivers that insert directly without touching a clipboard.
+    fn inserts_directly(&self) -> bool { false }
 
     /// Human-readable name for logging
     fn name(&self) -> &'static str;

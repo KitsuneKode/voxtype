@@ -45,7 +45,7 @@ pub const LINGER: Duration = Duration::from_secs(120);
 /// A command for the backend thread.
 pub enum Cmd {
     /// Bind the input method for a take.
-    Begin,
+    Begin(Option<super::preview::TakePreview>),
     Set(String),
     /// Remove the preedit; the ack fires once the compositor has it.
     Clear(Option<oneshot::Sender<()>>),
@@ -145,7 +145,9 @@ impl PreeditHandle {
     /// Bind the input method for a take, starting the backend thread if
     /// needed. A compositor without input-method-v2 disables preedit for the
     /// rest of the daemon's life (the backend logs why, once).
-    pub fn begin(&self) {
+    pub fn begin(&self) { self.begin_with_preview(None); }
+
+    pub fn begin_with_preview(&self, preview: Option<super::preview::TakePreview>) {
         if self.inner.disabled.load(Ordering::Relaxed) {
             return;
         }
@@ -166,7 +168,7 @@ impl PreeditHandle {
             }
         }
         if let Some(b) = backend.as_ref() {
-            b.send(Cmd::Begin);
+            b.send(Cmd::Begin(preview));
         }
     }
 
@@ -257,6 +259,7 @@ pub trait Sink {
 /// Applies commands and compositor events to the current binding. Shared by
 /// the Wayland thread and the tests' fake backend.
 pub struct Driver {
+    preview: Option<super::preview::TakePreview>,
     ime: Option<Ime>,
     shared: Arc<Shared>,
     /// Set while bound after a take ended (no preedit, field reading only).
@@ -275,6 +278,7 @@ const FIELD_ASK: Duration = Duration::from_millis(500);
 impl Driver {
     pub fn new(shared: Arc<Shared>) -> Self {
         Self {
+            preview: None,
             ime: None,
             shared,
             linger_until: None,
@@ -331,7 +335,8 @@ impl Driver {
 
     pub fn command(&mut self, cmd: Cmd, sink: &mut dyn Sink) -> Ack {
         let ack = match cmd {
-            Cmd::Begin => {
+            Cmd::Begin(preview) => {
+                self.preview = preview;
                 let lingering = self.linger_until.take().is_some();
                 match self.ime.as_mut() {
                     // Still on the field the last take went into: keep it.
@@ -430,6 +435,9 @@ impl Driver {
     fn publish(&mut self) {
         let active = self.ime.as_ref().is_some_and(Ime::active);
         self.shared.active.store(active, Ordering::Release);
+        if let Some(preview) = &self.preview {
+            preview.field_changed(self.ime.as_ref().is_some_and(Ime::sensitive));
+        }
         let field = self
             .ime
             .as_ref()
@@ -514,6 +522,8 @@ impl TextOutput for PreeditOutput {
     async fn is_available(&self) -> bool {
         true
     }
+
+    fn inserts_directly(&self) -> bool { true }
 
     fn name(&self) -> &'static str {
         // Auto-submit presses Enter, so it counts as a keystroke method and

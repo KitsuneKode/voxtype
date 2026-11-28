@@ -99,6 +99,8 @@ impl Ime {
         self.active && !self.unavailable
     }
 
+    pub fn sensitive(&self) -> bool { self.active() && self.hidden }
+
     pub fn unavailable(&self) -> bool {
         self.unavailable
     }

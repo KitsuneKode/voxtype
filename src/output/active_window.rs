@@ -116,6 +116,29 @@ fn detect_compositor() -> Option<Compositor> {
 /// Returns `None` when that can't be determined: unsupported compositor,
 /// missing tool, timeout, nothing focused, or unparseable output.
 pub async fn focused_window_is_terminal() -> Option<bool> {
+    let (compositor, json) = query_window().await?;
+    match compositor {
+        Compositor::Hyprland => hyprland_is_terminal(&json),
+        Compositor::Sway => sway_is_terminal(&json),
+        Compositor::Niri => niri_is_terminal(&json),
+    }
+}
+
+pub(crate) async fn focused_identity() -> Option<(String, Option<u64>)> {
+    let (compositor, json) = query_window().await?;
+    let window: Value = serde_json::from_str(&json).ok()?;
+    let (address, pid) = match compositor {
+        Compositor::Hyprland => (window["address"].as_str()?.to_owned(), window["pid"].as_u64()),
+        Compositor::Niri => (window["id"].as_u64()?.to_string(), window["pid"].as_u64()),
+        Compositor::Sway => {
+            let node = find_focused_sway_node(&window)?;
+            (node["id"].as_u64()?.to_string(), node["pid"].as_u64())
+        }
+    };
+    Some((address, pid))
+}
+
+async fn query_window() -> Option<(Compositor, String)> {
     let compositor = detect_compositor()?;
     let (program, args): (&str, &[&str]) = match compositor {
         Compositor::Hyprland => ("hyprctl", &["activewindow", "-j"]),
@@ -147,18 +170,7 @@ pub async fn focused_window_is_terminal() -> Option<bool> {
         }
     };
 
-    let json = String::from_utf8_lossy(&output.stdout);
-    let result = match compositor {
-        Compositor::Hyprland => hyprland_is_terminal(&json),
-        Compositor::Sway => sway_is_terminal(&json),
-        Compositor::Niri => niri_is_terminal(&json),
-    };
-    tracing::debug!(
-        "Focused window terminal check via {}: {:?}",
-        program,
-        result
-    );
-    result
+    Some((compositor, String::from_utf8(output.stdout).ok()?))
 }
 
 /// Parse `hyprctl activewindow -j`. A window tagged `terminal` (dynamic

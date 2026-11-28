@@ -24,9 +24,10 @@ use crate::notification::{self, Lifetime};
 use crate::osd;
 use crate::output;
 use crate::output::post_process::PostProcessor;
-use crate::output::preview::PreviewFile;
+use crate::output::preview::{PreviewFile, TakePreview};
 use crate::output::streaming::StreamingSession;
 use crate::output::TextOutput;
+use crate::output::take::TakeIdentity;
 use crate::state::{ChunkResult, State};
 use crate::text::vocabulary::Vocabulary;
 use crate::text::TextProcessor;
@@ -440,6 +441,7 @@ async fn stream_post_process(
     use crate::output::incremental::{chain_factory, ChainFactory, IncrementalOutput, Position};
     use crate::output::post_process::StreamEnd;
 
+    let post_process_started = std::time::SystemTime::now();
     let options = output::OutputOptions {
         history_context,
         pre_output_command: output_config.pre_output_command.as_deref(),
@@ -551,7 +553,7 @@ async fn stream_post_process(
             }
         }
     }
-    match out.finish().await {
+    match out.finish(post_process_marked_private(post_process_started)).await {
         Ok(delivered) => {
             tracing::info!(
                 "Post-processed (streamed): changed: {}, first text after {}ms, done after {}ms",
@@ -1583,7 +1585,8 @@ pub struct Daemon {
     /// Live transcript mirror for the active streaming session
     /// (`[output] streaming_preview_file`). `None` when not configured or
     /// no session is running.
-    streaming_preview: Option<PreviewFile>,
+    streaming_preview: Option<TakePreview>,
+    take: Option<TakeIdentity>,
     /// Input-method preedit backend (`[output] preedit`), `None` when off.
     preedit: Option<output::preedit::PreeditHandle>,
     /// The current take shows a preedit: deliver through it, end it after.
@@ -1976,6 +1979,7 @@ impl Daemon {
             is_external_trigger: false,
             streaming_drain_pump: None,
             streaming_preview: None,
+            take: None,
             preedit,
             preedit_take: false,
             field_take: false,
@@ -2191,6 +2195,14 @@ impl Daemon {
     }
 
     /// Drop the dictation in flight from history (a private take).
+    fn forget_private_take(&self) {
+        self.history_forget();
+        // All WAV writers are joined before post-processing starts.
+        if let Err(e) = std::fs::remove_file(Config::runtime_dir().join("last_take.wav")) {
+            if e.kind() != std::io::ErrorKind::NotFound { tracing::warn!("Cannot remove private take audio: {e}"); }
+        }
+    }
+
     fn history_forget(&self) {
         self.dictation
             .lock()
@@ -2302,6 +2314,9 @@ impl Daemon {
         #[cfg(target_os = "linux")]
         if let Some(tray) = &self.tray {
             tray.update(tray_state_for(state_name, self.model_failed_at_startup));
+        }
+        if matches!(state_name, "idle" | "stopped") {
+            if let Some(preview) = &self.streaming_preview { preview.clear(); }
         }
         self.queue.primary(state_name);
 
@@ -2453,7 +2468,7 @@ impl Daemon {
             use crate::history::Outcome;
             use osd::session::OutcomeKind;
             let decided = match outcome {
-                OutcomeKind::Ok => Outcome::Delivered,
+                OutcomeKind::Ok | OutcomeKind::Delivered | OutcomeKind::ClipboardOnly => Outcome::Delivered,
                 OutcomeKind::NoSpeech => Outcome::NoSpeech,
                 OutcomeKind::TooShort => Outcome::TooShort,
                 OutcomeKind::Empty => Outcome::Empty,
@@ -2462,11 +2477,11 @@ impl Daemon {
                 // seen before transcription instead of after it.
                 OutcomeKind::NoInput => Outcome::NoSpeech,
                 OutcomeKind::Error => Outcome::TranscriptionFailed,
-                OutcomeKind::OutputFailed => Outcome::OutputFailed,
+                OutcomeKind::OutputFailed | OutcomeKind::PrivateNotInserted | OutcomeKind::Failed | OutcomeKind::Recovered => Outcome::OutputFailed,
             };
             self.history_note(|p| p.outcome(decided, None));
         }
-        if self.state_file_path.is_none()
+        if (self.state_file_path.is_none() && self.take.is_none())
             || self
                 .osd_outcome_sent
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
@@ -2476,7 +2491,8 @@ impl Daemon {
         osd::session::write_outcome(
             &Config::runtime_dir(),
             &osd::session::OsdOutcome {
-                outcome,
+                take_id: self.take.as_ref().map(|t| t.id.clone()),
+                outcome: if self.take.is_some() { outcome.for_identified_take() } else { outcome },
                 session_started_at_ms: self.osd_session_started_at_ms,
                 suppressed: self
                     .osd_session_suppressed
@@ -2617,9 +2633,9 @@ impl Daemon {
 
     /// File-mode delivery with the daemon's clipboard fallback. Tells the
     /// user when the transcript didn't land at the path they asked for.
-    async fn deliver_file_output(&self, path: &Path, text: &str) -> FileDelivery {
+    async fn deliver_file_output(&self, path: &Path, text: &str, private: bool) -> FileDelivery {
         let cfg = &self.config.output;
-        let fallback = if cfg.fallback_to_clipboard {
+        let fallback = if cfg.fallback_to_clipboard && !private {
             let mut clipboard = cfg.clone();
             clipboard.mode = OutputMode::Clipboard;
             output::create_output_chain(&clipboard)
@@ -2801,12 +2817,12 @@ impl Daemon {
         // end_streaming / cancel_streaming_to_idle clean it up otherwise.
         let output_override = peek_output_mode_override();
         let file_output_path = self.resolve_file_output_path(&output_override, None);
-        let defer_commit = self.config.output.streaming_commit == StreamingCommit::OnStop;
-        self.streaming_preview = self
-            .config
-            .output
-            .resolve_streaming_preview_file()
-            .map(PreviewFile::new);
+        let defer_commit = self.take.is_some() || self.config.output.streaming_commit == StreamingCommit::OnStop;
+        self.streaming_preview = Some(TakePreview::new(
+            self.config.output.resolve_streaming_preview_file(), &Config::runtime_dir(),
+            self.take.as_ref().map(|t| t.dir.join("pp_private")),
+            self.take.as_ref().is_some_and(|t| t.private()),
+        ));
         let output_config = apply_output_override(&self.config.output, output_override);
         let typed = output_config.mode == OutputMode::Type;
         self.preedit_take = false;
@@ -2815,10 +2831,10 @@ impl Daemon {
             // Live sessions type finalized text mid-take, which the preedit
             // would sit on top of; only deferred delivery uses it.
             if self.config.output.preedit && defer_commit && file_output_path.is_none() && typed {
-                preedit.begin();
+                preedit.begin_with_preview(self.streaming_preview.clone());
                 self.preedit_take = true;
             } else if self.config.output.read_field && file_output_path.is_none() && typed {
-                preedit.begin();
+                preedit.begin_with_preview(self.streaming_preview.clone());
                 self.field_take = true;
             }
         }
@@ -3010,7 +3026,7 @@ impl Daemon {
             let _ = c.stop().await;
         }
         self.restore_recording_media();
-        if let Some(mut preview) = self.streaming_preview.take() {
+        if let Some(preview) = self.streaming_preview.take() {
             preview.clear();
         }
         self.release_preedit();
@@ -3033,7 +3049,6 @@ impl Daemon {
     ) {
         let secs = captured.len() as f32 / self.config.audio.sample_rate as f32;
         let captured = Arc::new(captured);
-        self.save_last_take(Arc::clone(&captured));
         let transcriber_retry = transcriber.clone();
         self.final_pass_task = Some(tokio::spawn(async move {
             let started = std::time::Instant::now();
@@ -3457,7 +3472,6 @@ impl Daemon {
                         secs
                     );
                     let captured = Arc::new(captured);
-                    self.save_last_take(Arc::clone(&captured));
                     self.final_pass_task =
                         Some(tokio::spawn(async move { (Some(text), captured) }));
                     self.update_state("transcribing");
@@ -3822,7 +3836,7 @@ impl Daemon {
         self.streaming_feed = None;
         let final_audio = self.streaming_final_audio.take();
         if let Some(ref audio) = final_audio {
-            self.save_last_take(Arc::new(audio.clone()));
+            let _ = self.save_last_take(Arc::new(audio.clone())).await;
         }
         if let Some(handle) = streaming_handle.take() {
             let _ = handle.cancel.send(());
@@ -3832,7 +3846,7 @@ impl Daemon {
         self.streaming_stop_deadline = None;
         let samples = std::mem::take(&mut self.streaming_recovery_audio);
         // Final text the backend flushed after the last throttled write.
-        let mut preview = self.streaming_preview.take();
+        let mut preview = self.streaming_preview.clone();
         if let (Some(p), Some(s)) = (preview.as_mut(), streaming_session.as_ref()) {
             p.update(&s.live_text());
             p.flush();
@@ -3931,6 +3945,7 @@ impl Daemon {
             if let Some(task) = self.final_pass_task.take() {
                 let (final_text, audio) =
                     task.await.unwrap_or_else(|_| (None, Arc::new(Vec::new())));
+                let _ = self.save_last_take(audio.clone()).await;
                 if let Some(final_text) = final_text {
                     if text.is_empty() {
                         let no_speech = match &self.vad {
@@ -3948,7 +3963,7 @@ impl Daemon {
                         if let Some(result) = no_speech {
                             self.history_transcribed();
                             self.report_no_speech(&result).await;
-                            if let Some(mut p) = preview {
+                            if let Some(p) = preview {
                                 p.clear();
                             }
                             self.end_preedit();
@@ -3966,7 +3981,7 @@ impl Daemon {
 
             if text.is_empty() {
                 tracing::debug!("Streaming session produced no text");
-                if let Some(mut p) = preview {
+                if let Some(p) = preview {
                     p.clear();
                 }
                 self.end_preedit();
@@ -3987,13 +4002,13 @@ impl Daemon {
                 None => text,
             };
             self.handle_transcription_result(state, Ok(Ok(text))).await;
-            if let Some(mut p) = preview {
+            if let Some(p) = preview {
                 p.clear();
             }
             self.end_preedit();
             return;
         }
-        if let Some(mut p) = preview {
+        if let Some(p) = preview {
             p.clear();
         }
         self.end_preedit();
@@ -4026,7 +4041,7 @@ impl Daemon {
                 .process_with_vocabulary(&raw_text, vocabulary);
             self.history_note(|p| p.texts(&raw_text, &final_text));
 
-            let delivery = self.deliver_file_output(&output_path, &final_text).await;
+            let delivery = self.deliver_file_output(&output_path, &final_text, false).await;
             {
                 let (fell_back, error) = match &delivery {
                     FileDelivery::Written => (false, None),
@@ -4484,7 +4499,7 @@ impl Daemon {
             }
         }
         self.stop_streaming_drain_pump();
-        if let Some(mut preview) = self.streaming_preview.take() {
+        if let Some(preview) = self.streaming_preview.take() {
             preview.clear();
         }
         self.release_preedit();
@@ -7548,11 +7563,13 @@ impl Daemon {
                         preedit.set(&processed_text);
                     }
 
+                    let scoped_processor = self.take.as_ref().and_then(|take| processor.map(|p| p.for_take(&take.id)));
+                    let processor = scoped_processor.as_ref().or(processor);
                     let post_process_started = std::time::SystemTime::now();
                     let final_text = match processor {
                         None => processed_text,
                         Some(processor)
-                            if processor.streaming()
+                            if self.take.is_none() && processor.streaming()
                                 && file_output_path.is_none()
                                 && output_config.mode == OutputMode::Type
                                 && output::config_for_text(&output_config, &processed_text)
@@ -7579,7 +7596,7 @@ impl Daemon {
                                 .and_then(|t| t.last_detected_language());
                             let private = post_process_marked_private(post_process_started);
                             if private {
-                                self.history_forget();
+                                self.forget_private_take();
                             }
                             match delivery {
                                 StreamedDelivery::Delivered(delivered) => {
@@ -7729,9 +7746,10 @@ impl Daemon {
 
                     // A private take (see `post_process_marked_private`) leaves
                     // no history, context, notification or undelivered copy.
-                    let private = post_process_marked_private(post_process_started);
+                    let private = self.take.as_ref().map_or_else(|| post_process_marked_private(post_process_started), TakeIdentity::private)
+                        || self.streaming_preview.as_ref().is_some_and(TakePreview::suppressed);
                     if private {
-                        self.history_forget();
+                        self.forget_private_take();
                     }
                     // Track last dictation for context in subsequent post-processing
                     self.last_dictation = (!private).then(|| (final_text.clone(), Instant::now()));
@@ -7757,12 +7775,19 @@ impl Daemon {
                         });
                     }
 
+                    if let Some(outcome) = self.take.as_ref().and_then(TakeIdentity::disposition) {
+                        self.publish_osd_outcome(outcome, 0);
+                        self.publish_empty_outcome();
+                        *state = State::Idle;
+                        self.update_state("idle");
+                        return;
+                    }
                     if let Some(output_path) = file_output_path {
                         *state = State::Outputting {
                             text: final_text.clone(),
                         };
 
-                        let delivery = self.deliver_file_output(&output_path, &final_text).await;
+                        let delivery = self.deliver_file_output(&output_path, &final_text, private).await;
                         {
                             use crate::history::{Outcome, OutputInfo};
                             let (fell_back, error) = match &delivery {
@@ -7832,7 +7857,7 @@ impl Daemon {
                         return;
                     }
 
-                    let long_config = output::config_for_text(&output_config, &final_text);
+                    let long_config = if private { None } else { output::config_for_text(&output_config, &final_text) };
                     if long_config.is_some() {
                         tracing::info!(
                             "Pasting {} chars instead of typing them",
@@ -7854,6 +7879,8 @@ impl Daemon {
                         );
                     }
 
+                    if private { output_chain.retain(|driver| driver.inserts_directly()); }
+
                     // Output the text
                     *state = State::Outputting {
                         text: final_text.clone(),
@@ -7870,11 +7897,11 @@ impl Daemon {
                         ),
                     };
 
-                    let (report, delivery) = output::output_with_fallback_report(
+                    let (report, delivery) = output::take::DELIVERY_TAKE.scope(self.take.clone(), output::output_with_fallback_report(
                         &output_chain,
                         &final_text,
                         output_options,
-                    )
+                    ))
                     .await;
                     {
                         use crate::history::{Outcome, OutputInfo};
@@ -7902,19 +7929,24 @@ impl Daemon {
                     }
                     if let Err(e) = &delivery {
                         tracing::error!("Output failed: {}", e);
-                        self.publish_osd_outcome(osd::session::OutcomeKind::OutputFailed, 0);
+                        let outcome = if matches!(e, crate::error::OutputError::TargetChanged) {
+                            self.take.as_ref().unwrap().target_lost(&final_text)
+                        } else if private { osd::session::OutcomeKind::PrivateNotInserted } else { osd::session::OutcomeKind::OutputFailed };
+                        self.publish_osd_outcome(outcome, 0);
                         // Nothing typed or copied: keep the text recoverable,
                         // unless [output] keep_undelivered_text is off.
                         output::fallback::notify_failed(
                             &report,
                             &e,
                             &final_text,
-                            self.config.output.keep_undelivered_text && !private,
+                            self.config.output.keep_undelivered_text && !private && !matches!(e, crate::error::OutputError::TargetChanged),
                         )
                         .await;
                     } else {
                         write_output_done(final_text.chars().count());
-                        self.publish_osd_text_outcome(&final_text);
+                        if self.take.is_some() && delivery.as_ref().is_ok_and(|d| d.driver.starts_with("clipboard")) {
+                            self.publish_osd_outcome(osd::session::OutcomeKind::ClipboardOnly, final_text.chars().count());
+                        } else { self.publish_osd_text_outcome(&final_text); }
                         self.play_feedback(SoundEvent::TranscriptionComplete);
                     }
                     // Says "copied to clipboard" (and why, once) when typing
@@ -8296,6 +8328,8 @@ impl Daemon {
         // triggers and state word. Must stay between the instance lock above
         // and write_pid_file below.
         clear_previous_daemon_files(&Config::runtime_dir(), self.state_file_path.as_deref());
+        let _ = std::fs::remove_file(Config::runtime_dir().join("sensitive_field"));
+        if let Some(path) = self.config.output.resolve_streaming_preview_file() { PreviewFile::new(path); }
         mark_live_in_field(false);
         crate::cancelled_take::sweep();
         // The GGUF worker rewrites this once it has bound a backend; a report
@@ -8636,7 +8670,7 @@ impl Daemon {
             start: sigusr1,
             stop: sigusr2,
         };
-        let _control = take_queue::ControlFiles::publish()?;
+        let _control = take_queue::ControlFiles::publish(&Config::runtime_dir(), self.config.audio.queue_dictations)?;
         let mut intake_task = AbortOnDrop(Some(tokio::spawn(intake.route(
             tx,
             queue.clone(),
@@ -8669,8 +8703,11 @@ impl Daemon {
         loop {
             if state.is_idle() {
                 self.frozen = None;
+                self.take = None;
+                self.streaming_preview = None;
                 if let Some(take) = queue.next_for_delivery() {
                     tracing::debug!(sequence = take.sequence, "Processing queued dictation");
+                    self.take = take.identity;
                     self.pre_roll_samples = take.prefix;
                     self.release_tail_samples = take.tail;
                     self.frozen = Some(take.options);
@@ -8693,7 +8730,7 @@ impl Daemon {
             let preview_deadline = self
                 .streaming_preview
                 .as_ref()
-                .and_then(PreviewFile::flush_deadline);
+                .and_then(TakePreview::flush_deadline);
             self.apply_pending_language(state.is_idle());
             tokio::select! {
                 Some(language) = async {
@@ -9022,6 +9059,7 @@ impl Daemon {
                     }
                     if state.is_idle() {
                         if external { take_queue::apply_start_options(); }
+                        self.take = TakeIdentity::capture(&Config::runtime_dir());
                         // Read model override from file (set by `voxtype record start --model X`)
                         let model_override = model_override.or_else(read_model_override);
                         if let Some(name) = profile_override { write_profile_override(&name); }
@@ -9916,6 +9954,7 @@ while True:
         async fn is_available(&self) -> bool {
             true
         }
+        fn inserts_directly(&self) -> bool { true }
         fn name(&self) -> &'static str {
             "recording"
         }

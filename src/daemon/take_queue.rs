@@ -31,6 +31,7 @@ impl Overrides {
 }
 
 pub(super) struct Take {
+    pub identity: Option<TakeIdentity>,
     pub sequence: u64,
     pub model: Option<String>,
     pub options: Overrides,
@@ -283,6 +284,7 @@ pub(super) enum Input {
 pub(super) struct Routed(pub Input, pub oneshot::Sender<()>);
 
 struct Recording {
+    identity: Option<TakeIdentity>,
     capture: Box<dyn AudioCapture>,
     model: Option<String>,
     profile: Option<String>,
@@ -418,6 +420,7 @@ impl Inputs {
                 Input::Key(HotkeyEvent::Released) | Input::Stop => None,
             };
             if let Some((model, profile, external)) = start {
+                let identity = TakeIdentity::capture(&queue.dir);
                 let waiting = lock(&queue.order).waiting.len();
                 if waiting >= MAX_WAITING {
                     tracing::warn!(
@@ -515,6 +518,7 @@ impl Inputs {
                         audio::levels::spawn_silence_tracker(chunks, t);
                     }
                     Ok::<_, crate::error::AudioError>(Recording {
+                        identity,
                         capture,
                         model,
                         profile,
@@ -576,6 +580,7 @@ impl Inputs {
                 } else if let Ok(samples) = samples {
                     services.play(SoundEvent::RecordingStop);
                     queue.finish(Take {
+                        identity: r.identity,
                         sequence: 0,
                         samples,
                         prefix,
@@ -643,20 +648,24 @@ fn acknowledge_queue_cancel(dir: &Path) {
     let _ = std::fs::remove_file(dir.join("cancel"));
 }
 
-pub(super) struct ControlFiles;
+pub(super) struct ControlFiles(PathBuf);
 impl ControlFiles {
-    pub fn publish() -> std::io::Result<Self> {
-        let dir = Config::runtime_dir();
+    pub fn publish(dir: &Path, enabled: bool) -> std::io::Result<Self> {
         for key in ["stop_requested", "start_options", "cancel_ack"] {
             let _ = std::fs::remove_file(dir.join(key));
         }
-        std::fs::write(dir.join("queue_pid"), std::process::id().to_string())?;
-        Ok(Self)
+        let marker = dir.join("queue_pid");
+        if enabled {
+            std::fs::write(&marker, std::process::id().to_string())?;
+        } else if let Err(e) = std::fs::remove_file(&marker) {
+            if e.kind() != std::io::ErrorKind::NotFound { return Err(e); }
+        }
+        Ok(Self(marker))
     }
 }
 impl Drop for ControlFiles {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(Config::runtime_dir().join("queue_pid"));
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 struct StopAck;
@@ -688,8 +697,23 @@ pub(super) fn apply_start_options() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn queue_pid_matches_the_intake_switch_and_clears_stale_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("queue_pid");
+        std::fs::write(&pid, "stale").unwrap();
+        let off = ControlFiles::publish(dir.path(), Config::default().audio.queue_dictations).unwrap();
+        assert!(!pid.exists());
+        drop(off);
+        let on = ControlFiles::publish(dir.path(), true).unwrap();
+        assert_eq!(std::fs::read_to_string(&pid).unwrap(), std::process::id().to_string());
+        drop(on);
+        assert!(!pid.exists());
+    }
+
     fn sample_take(tag: f32) -> Take {
         Take {
+            identity: None,
             sequence: 0,
             model: None,
             options: Overrides::default(),

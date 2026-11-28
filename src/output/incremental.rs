@@ -184,7 +184,7 @@ impl<'a> IncrementalOutput<'a> {
 
     /// Deliver the last piece and anything collected, run the post-output
     /// hook, and return the whole delivered text.
-    pub async fn finish(mut self) -> Result<Delivered, OutputError> {
+    pub async fn finish(mut self, private: bool) -> Result<Delivered, OutputError> {
         self.begin().await;
         if let Some(mut last) = self.held.take() {
             if !self.trim {
@@ -192,7 +192,7 @@ impl<'a> IncrementalOutput<'a> {
             }
             self.deliver(last, true).await;
         }
-        let result = self.deliver_collected().await;
+        let result = self.deliver_collected(private).await;
         if let Some(cmd) = self.options.post_output_command {
             if let Err(e) = run_hook(cmd, "post_output").await {
                 tracing::warn!("{}", e);
@@ -292,7 +292,7 @@ impl<'a> IncrementalOutput<'a> {
         result
     }
 
-    async fn deliver_collected(&mut self) -> Result<(), OutputError> {
+    async fn deliver_collected(&mut self, private: bool) -> Result<(), OutputError> {
         if self.collected.is_empty() {
             return if self.typed_any || self.at_start {
                 Ok(())
@@ -309,6 +309,7 @@ impl<'a> IncrementalOutput<'a> {
         for (i, out) in chain.iter().enumerate() {
             // After a partial typing run, only a method that does not type
             // can take the rest without mixing it into the typed text.
+            if private && !out.inserts_directly() { continue; }
             if (partial || self.skip_keystrokes) && super::is_keystroke_method(out.name()) {
                 continue;
             }
@@ -422,7 +423,7 @@ mod tests {
         for p in pieces {
             out.push(p).await;
         }
-        let delivered = out.finish().await;
+        let delivered = out.finish(false).await;
         let log = log.lock().unwrap().clone();
         (log, delivered)
     }

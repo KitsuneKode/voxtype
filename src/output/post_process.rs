@@ -43,7 +43,9 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 /// Post-processor that runs an external command on transcribed text
+#[derive(Clone)]
 pub struct PostProcessor {
+    take_id: Option<String>,
     command: String,
     timeout: Duration,
     trim: bool,
@@ -202,6 +204,7 @@ impl PostProcessor {
     /// Create a new post-processor from configuration
     pub fn new(config: &PostProcessConfig) -> Self {
         Self {
+            take_id: None,
             command: config.command.clone(),
             timeout: Duration::from_millis(config.timeout_ms),
             trim: config.trim,
@@ -239,6 +242,8 @@ impl PostProcessor {
 
     /// Mark this processor as running a profile's `post_process_command`, so
     /// failure notices point at the profile's settings.
+    pub fn for_take(&self, id: &str) -> Self { let mut processor = self.clone(); processor.take_id = Some(id.to_owned()); processor }
+
     pub fn for_profile(mut self, name: &str) -> Self {
         self.origin = Origin::Profile(name.to_string());
         self
@@ -519,6 +524,8 @@ impl PostProcessor {
             .process_group(0);
 
         // Always clear to prevent inheriting stale context from parent environment
+        cmd.env_remove("VOXTYPE_TAKE_ID");
+        if let Some(id) = &self.take_id { cmd.env("VOXTYPE_TAKE_ID", id); }
         cmd.env_remove("VOXTYPE_CONTEXT");
         cmd.env_remove("VOXTYPE_STREAM_OUTPUT");
         if let Some(ctx) = context {

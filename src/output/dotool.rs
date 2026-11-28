@@ -266,6 +266,7 @@ impl TextOutput for DotoolOutput {
             );
             tokio::time::sleep(Duration::from_millis(self.pre_type_delay_ms as u64)).await;
         }
+        super::take::check_target().await?;
 
         let commands = self.build_commands(text);
         let invocation = self.choose_invocation(Self::daemon_pipe_path());
@@ -367,6 +368,8 @@ impl TextOutput for DotoolOutput {
             .map(|s| s.success())
             .unwrap_or(false)
     }
+
+    fn inserts_directly(&self) -> bool { true }
 
     fn name(&self) -> &'static str {
         "dotool"

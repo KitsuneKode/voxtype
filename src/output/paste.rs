@@ -773,6 +773,7 @@ impl TextOutput for PasteOutput {
         };
 
         // Step 1: Copy to clipboard
+        super::take::check_target().await?;
         self.copy_to_clipboard(&text_to_paste).await?;
 
         // Pre-paste delay to ensure clipboard is set before pasting
@@ -799,6 +800,7 @@ impl TextOutput for PasteOutput {
                 terminal_aware.select(is_terminal)
             }
         };
+        super::take::check_target().await?;
         self.simulate_paste_keystroke(keystroke).await?;
 
         // Send Enter key if configured

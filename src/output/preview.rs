@@ -13,6 +13,68 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// One take's preview, shared with the IME thread. Field transitions, pending
+/// flushes and teardown use the same lock so an old write cannot undo a scrub.
+#[derive(Clone)]
+pub struct TakePreview(std::sync::Arc<std::sync::Mutex<TakePreviewState>>);
+
+struct TakePreviewState {
+    file: Option<PreviewFile>,
+    marker: PathBuf,
+    hidden: bool,
+    suppressed: bool,
+    ended: bool,
+    private_marker: Option<PathBuf>,
+}
+
+impl TakePreview {
+    pub fn new(file: Option<PathBuf>, runtime: &Path, private_marker: Option<PathBuf>, private: bool) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(TakePreviewState {
+            file: file.map(PreviewFile::new), marker: runtime.join("sensitive_field"),
+            hidden: false, suppressed: private, ended: false, private_marker,
+        })))
+    }
+
+    pub fn field_changed(&self, sensitive: bool) {
+        let mut s = self.0.lock().unwrap();
+        if s.ended || sensitive == s.hidden { return; }
+        s.hidden = sensitive;
+        if sensitive {
+            s.suppressed = true;
+            if let Some(file) = &mut s.file { file.clear(); }
+            if let Some(path) = &s.private_marker { let _ = std::fs::write(path, b"1"); }
+            if let Err(e) = std::fs::write(&s.marker, b"1") { tracing::warn!("Cannot publish sensitive field: {e}"); }
+        } else {
+            let _ = std::fs::remove_file(&s.marker);
+        }
+    }
+
+    pub fn suppressed(&self) -> bool { self.0.lock().unwrap().suppressed }
+
+    pub fn update(&self, text: &str) {
+        let mut s = self.0.lock().unwrap();
+        if !s.suppressed && !s.ended {
+            if let Some(file) = &mut s.file { file.update(text); }
+        }
+    }
+
+    pub fn flush_deadline(&self) -> Option<Instant> {
+        self.0.lock().unwrap().file.as_ref()?.flush_deadline()
+    }
+
+    pub fn flush(&self) {
+        if let Some(file) = &mut self.0.lock().unwrap().file { file.flush(); }
+    }
+
+    pub fn clear(&self) {
+        let mut s = self.0.lock().unwrap();
+        if s.ended { return; }
+        s.ended = true;
+        if let Some(mut file) = s.file.take() { file.clear(); }
+        let _ = std::fs::remove_file(&s.marker);
+    }
+}
+
 /// At most ~20 writes per second.
 pub const MIN_WRITE_INTERVAL: Duration = Duration::from_millis(50);
 

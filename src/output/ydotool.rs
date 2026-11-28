@@ -126,6 +126,7 @@ impl TextOutput for YdotoolOutput {
             );
             tokio::time::sleep(Duration::from_millis(self.pre_type_delay_ms as u64)).await;
         }
+        super::take::check_target().await?;
 
         let mut cmd = Command::new("ydotool");
         self.apply_socket_env(&mut cmd);
@@ -271,6 +272,8 @@ impl TextOutput for YdotoolOutput {
             .map(|s| s.success())
             .unwrap_or(false)
     }
+
+    fn inserts_directly(&self) -> bool { true }
 
     fn name(&self) -> &'static str {
         "ydotool"

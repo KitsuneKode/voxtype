@@ -118,6 +118,7 @@ impl EitypeOutput {
             .await;
         }
 
+        super::take::check_target().await?;
         let mut cmd = Command::new("eitype");
         let mut debug_args = vec!["eitype".to_string()];
 
@@ -261,6 +262,8 @@ impl TextOutput for EitypeOutput {
             .map(|s| s.success())
             .unwrap_or(false)
     }
+
+    fn inserts_directly(&self) -> bool { true }
 
     fn name(&self) -> &'static str {
         "eitype"

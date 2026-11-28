@@ -543,6 +543,7 @@ pub(super) async fn run_chain(
         if let Some(context) = history_context {
             context.capture().await;
         }
+        if let Err(e) = super::take::check_target().await { return (report, Err(e)); }
         let attempt = output.output(text).await;
         if let Some(context) = history_context {
             context.capture().await;
@@ -558,6 +559,7 @@ pub(super) async fn run_chain(
                 });
                 break;
             }
+            Err(OutputError::TargetChanged) => return (report, Err(OutputError::TargetChanged)),
             Err(e) => {
                 tracing::warn!("{} failed: {}, trying next", output.name(), e);
                 report.skipped.push(SkippedMethod {
