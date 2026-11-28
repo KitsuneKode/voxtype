@@ -422,6 +422,10 @@ name = "parakeet_eval"
 required-features = ["parakeet"]
 
 [[example]]
+name = "final_pass_bench"
+required-features = ["parakeet"]
+
+[[example]]
 name = "preedit_probe"
 required-features = ["preedit"]
 

@@ -694,6 +694,84 @@ fn discard_stale_cancel(start_at: Option<u128>) {
 /// (0.32s for Parakeet's default) instead of a truncated final chunk.
 const STREAM_TAIL_PAD_SECS: f32 = 0.4;
 
+/// Longest piece a failed final pass is retried in (see
+/// [`crate::transcribe::segment::transcribe_in_pieces`]).
+const FINAL_PASS_RETRY_PIECE_SECS: f32 = 10.0;
+
+/// A final pass that failed is decoded again in short pieces, which need far
+/// less GPU memory than the whole take: a failure is most often the GPU
+/// arena failing to grow for a long take while another process holds the
+/// memory, and the same whole-take decode fails the same way. The streamed
+/// text is the fallback only when the pieces fail too.
+async fn retry_failed_final_pass(
+    first: std::result::Result<String, crate::error::TranscribeError>,
+    transcriber: Arc<dyn Transcriber>,
+    audio: Arc<Vec<f32>>,
+    sample_rate: u32,
+    started: std::time::Instant,
+) -> std::result::Result<String, crate::error::TranscribeError> {
+    let error = match first {
+        Ok(text) => return Ok(text),
+        Err(error) => error,
+    };
+    tracing::warn!(
+        "Final pass failed after {}ms, retrying in pieces of at most {:.0}s: {}",
+        started.elapsed().as_millis(),
+        FINAL_PASS_RETRY_PIECE_SECS,
+        error
+    );
+    tokio::task::spawn_blocking(move || {
+        crate::transcribe::segment::transcribe_in_pieces(
+            transcriber.as_ref(),
+            &audio,
+            sample_rate,
+            FINAL_PASS_RETRY_PIECE_SECS,
+        )
+    })
+    .await
+    .unwrap_or_else(|e| {
+        Err(crate::error::TranscribeError::InferenceFailed(
+            e.to_string(),
+        ))
+    })
+}
+
+/// The final pass's text, and one log line for every outcome with its time,
+/// so a slow take can always be told apart from a failed one.
+fn final_pass_text(
+    result: std::result::Result<String, crate::error::TranscribeError>,
+    secs: f32,
+    started: std::time::Instant,
+    when: &str,
+) -> Option<String> {
+    let ms = started.elapsed().as_millis();
+    match result {
+        Ok(text) if !text.trim().is_empty() => {
+            tracing::info!("Final pass decoded {:.1}s in {}ms{}", secs, ms, when);
+            Some(text.trim().to_string())
+        }
+        Ok(_) => {
+            tracing::info!(
+                "Final pass decoded {:.1}s in {}ms{}: no speech",
+                secs,
+                ms,
+                when
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Final pass failed for {:.1}s after {}ms{}, keeping the streamed text: {}",
+                secs,
+                ms,
+                when,
+                e
+            );
+            None
+        }
+    }
+}
+
 /// Sender into the active streaming session plus how many captured samples
 /// the audio pump has already advanced past.
 struct StreamingFeed {
@@ -3081,7 +3159,8 @@ impl Daemon {
         transcriber: Arc<dyn Transcriber>,
         incremental: Option<crate::transcribe::incremental::IncrementalFinalPass>,
     ) {
-        let secs = captured.len() as f32 / self.config.audio.sample_rate as f32;
+        let sample_rate = self.config.audio.sample_rate;
+        let secs = captured.len() as f32 / sample_rate as f32;
         let captured = Arc::new(captured);
         let transcriber_retry = transcriber.clone();
         self.final_pass_task = Some(tokio::spawn(async move {
@@ -3100,39 +3179,18 @@ impl Daemon {
                         })
                 }
             };
-            // One failure retries the whole recording once. The streamed
-            // text is the fallback only when that retry fails too. An
-            // empty success is silence, not a failure, so it is not retried.
-            let result = match first {
-                Ok(text) => Ok(text),
-                Err(e) => {
-                    tracing::warn!("Final pass failed, retrying the whole take once: {}", e);
-                    let audio = captured.clone();
-                    tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio))
-                        .await
-                        .unwrap_or_else(|err| {
-                            Err(crate::error::TranscribeError::InferenceFailed(
-                                err.to_string(),
-                            ))
-                        })
-                }
-            };
-            let text = match result {
-                Ok(text) if !text.trim().is_empty() => {
-                    tracing::info!(
-                        "Final pass decoded {:.1}s in {}ms after stop",
-                        secs,
-                        started.elapsed().as_millis()
-                    );
-                    Some(text.trim().to_string())
-                }
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!("Final pass retry failed, keeping streamed text: {}", e);
-                    None
-                }
-            };
-            (text, captured)
+            let result = retry_failed_final_pass(
+                first,
+                transcriber_retry,
+                captured.clone(),
+                sample_rate,
+                started,
+            )
+            .await;
+            (
+                final_pass_text(result, secs, started, " after stop"),
+                captured,
+            )
         }));
     }
 
@@ -3650,50 +3708,20 @@ impl Daemon {
         }
         let transcriber = self.transcriber_preloaded.clone()?;
         let started = std::time::Instant::now();
-        let audio_retry = audio.clone();
+        let audio = Arc::new(audio);
         let transcriber_retry = transcriber.clone();
-        let first = tokio::task::spawn_blocking(move || transcriber.transcribe(&audio)).await;
-        let result = match first {
-            Ok(Ok(text)) => Ok(text),
-            Ok(Err(e)) => {
-                tracing::warn!("Final pass failed, retrying the whole take once: {}", e);
-                tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio_retry))
-                    .await
-                    .unwrap_or_else(|err| {
-                        Err(crate::error::TranscribeError::InferenceFailed(
-                            err.to_string(),
-                        ))
-                    })
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "Final pass task failed, retrying the whole take once: {}",
-                    e
-                );
-                tokio::task::spawn_blocking(move || transcriber_retry.transcribe(&audio_retry))
-                    .await
-                    .unwrap_or_else(|err| {
-                        Err(crate::error::TranscribeError::InferenceFailed(
-                            err.to_string(),
-                        ))
-                    })
-            }
-        };
-        match result {
-            Ok(text) if !text.trim().is_empty() => {
-                tracing::info!(
-                    "Final pass decoded {:.1}s in {}ms",
-                    secs,
-                    started.elapsed().as_millis()
-                );
-                Some(text.trim().to_string())
-            }
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!("Final pass retry failed, keeping streamed text: {}", e);
-                None
-            }
-        }
+        let whole = audio.clone();
+        let first = tokio::task::spawn_blocking(move || transcriber.transcribe(&whole))
+            .await
+            .unwrap_or_else(|e| {
+                Err(crate::error::TranscribeError::InferenceFailed(
+                    e.to_string(),
+                ))
+            });
+        let sample_rate = self.config.audio.sample_rate;
+        let result =
+            retry_failed_final_pass(first, transcriber_retry, audio, sample_rate, started).await;
+        final_pass_text(result, secs, started, "")
     }
 
     /// Show `text` as this take's preedit, if it has one.
@@ -11412,6 +11440,93 @@ while True:
         fn transcribe(&self, _samples: &[f32]) -> TranscriptionResult {
             Ok(self.0.to_string())
         }
+    }
+
+    /// Fails above `limit` samples, as a GPU whose memory another process
+    /// holds fails a long take while short ones still fit.
+    struct ArenaLimited {
+        limit: usize,
+        calls: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl Transcriber for ArenaLimited {
+        fn transcribe(&self, samples: &[f32]) -> TranscriptionResult {
+            self.calls.lock().unwrap().push(samples.len());
+            if samples.len() > self.limit {
+                return Err(crate::error::TranscribeError::InferenceFailed(
+                    "Failed to allocate memory for requested buffer".into(),
+                ));
+            }
+            Ok(format!("piece{}", self.calls.lock().unwrap().len()))
+        }
+    }
+
+    /// Speech with a pause every four seconds, `secs` long.
+    fn paused_speech(secs: usize) -> Vec<f32> {
+        (0..secs * 16000)
+            .map(|i| {
+                if (i / 16000) % 4 == 3 && (i % 16000) > 4000 {
+                    0.0
+                } else {
+                    0.3 * (i as f32 * 0.07).sin()
+                }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_final_pass_the_gpu_cannot_fit_is_retried_in_short_pieces() {
+        let fake = Arc::new(ArenaLimited {
+            limit: 12 * 16000,
+            calls: Default::default(),
+        });
+        let audio = Arc::new(paused_speech(36));
+        let first = fake.transcribe(&audio);
+        assert!(first.is_err());
+        let started = std::time::Instant::now();
+        let text = retry_failed_final_pass(first, fake.clone(), audio, 16000, started)
+            .await
+            .unwrap();
+        let calls = fake.calls.lock().unwrap().clone();
+        assert!(
+            calls.len() >= 5,
+            "36 s in pieces of at most 10 s: {calls:?}"
+        );
+        assert!(calls[1..].iter().all(|&n| n <= 10 * 16000), "{calls:?}");
+        assert_eq!(
+            calls[1..].iter().sum::<usize>(),
+            36 * 16000,
+            "every sample once"
+        );
+        assert!(text.starts_with("piece2 piece3"), "{text}");
+        assert_eq!(
+            final_pass_text(Ok(text.clone()), 36.0, started, ""),
+            Some(text)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_final_pass_that_works_is_not_decoded_again() {
+        let fake = Arc::new(ArenaLimited {
+            limit: usize::MAX,
+            calls: Default::default(),
+        });
+        let audio = Arc::new(paused_speech(8));
+        let first = fake.transcribe(&audio);
+        let started = std::time::Instant::now();
+        let text = retry_failed_final_pass(first, fake.clone(), audio, 16000, started).await;
+        assert_eq!(text.unwrap(), "piece1");
+        assert_eq!(fake.calls.lock().unwrap().len(), 1);
+        assert_eq!(final_pass_text(Ok("  ".into()), 8.0, started, ""), None);
+        assert_eq!(
+            final_pass_text(
+                Err(crate::error::TranscribeError::InferenceFailed("x".into())),
+                8.0,
+                started,
+                ""
+            ),
+            None
+        );
     }
 
     /// The event loop is the only reader of a meeting's events, and it runs

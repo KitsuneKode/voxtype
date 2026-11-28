@@ -178,9 +178,12 @@ impl TermSource {
     }
 
     /// Profile vocabulary for the next recordings, added to the files' terms.
+    /// Set at the start of a recording, so the files are read then and not
+    /// after the stop, when the final pass is waited on.
     pub fn set_profile_terms(&self, terms: &[String]) {
         if let Ok(mut cache) = self.cache.lock() {
             cache.profile_terms = terms.to_vec();
+            self.refresh(&mut cache);
         }
     }
 
@@ -190,6 +193,11 @@ impl TermSource {
         let Ok(mut cache) = self.cache.lock() else {
             return Arc::default();
         };
+        self.refresh(&mut cache);
+        cache.terms.clone()
+    }
+
+    fn refresh(&self, cache: &mut Cache) {
         let stamps = (
             modified(&self.vocabulary_file),
             modified(&self.corrections_file),
@@ -205,7 +213,6 @@ impl TermSource {
             cache.terms = Arc::new(terms);
             cache.stamps = Some(stamps);
         }
-        cache.terms.clone()
     }
 }
 

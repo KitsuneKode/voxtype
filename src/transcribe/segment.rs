@@ -11,6 +11,37 @@
 //! a little silence and no word is split. If a window has no quiet frame at
 //! all (continuous speech for `max_secs`), it cuts at the quietest frame.
 
+use super::Transcriber;
+use crate::error::TranscribeError;
+
+/// Decode `audio` in pieces of at most `piece_secs`, cut at pauses (see
+/// [`plan_segments`]), the last one as the end of the recording. A piece
+/// needs a fraction of the GPU memory the whole recording does, so this
+/// still decodes when another process has taken the memory a whole-take
+/// decode needs to grow into, where decoding the whole take again fails the
+/// same way.
+pub fn transcribe_in_pieces(
+    transcriber: &dyn Transcriber,
+    audio: &[f32],
+    sample_rate: u32,
+    piece_secs: f32,
+) -> Result<String, TranscribeError> {
+    let mut parts = Vec::new();
+    for (start, end) in plan_segments(audio, sample_rate, piece_secs) {
+        let piece = &audio[start..end];
+        let text = if end == audio.len() {
+            transcriber.transcribe(piece)?
+        } else {
+            transcriber.transcribe_piece(piece)?
+        };
+        let text = text.trim();
+        if !text.is_empty() {
+            parts.push(text.to_string());
+        }
+    }
+    Ok(parts.join(" "))
+}
+
 /// Analysis frame: 20 ms.
 const FRAME_SECS: f32 = 0.02;
 
@@ -70,7 +101,11 @@ pub fn plan_segments(audio: &[f32], sample_rate: u32, max_secs: f32) -> Vec<(usi
         }
         let cut = best.unwrap_or_else(|| {
             (lo..hi)
-                .min_by(|&a, &b| db[a].partial_cmp(&db[b]).unwrap_or(std::cmp::Ordering::Equal))
+                .min_by(|&a, &b| {
+                    db[a]
+                        .partial_cmp(&db[b])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
                 .unwrap_or(hi)
         });
         cuts.push(cut);

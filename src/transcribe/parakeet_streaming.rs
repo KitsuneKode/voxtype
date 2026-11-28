@@ -325,10 +325,12 @@ impl ParakeetStreamingTranscriber {
             }
             None => decode.tokens.iter().map(|t| t.0).collect(),
         };
-        tracing::debug!(
-            "Parakeet vocabulary rescoring took {}ms",
-            started.elapsed().as_millis()
-        );
+        let ms = started.elapsed().as_millis();
+        if ms >= 100 {
+            tracing::info!("Parakeet vocabulary rescoring took {}ms", ms);
+        } else {
+            tracing::debug!("Parakeet vocabulary rescoring took {}ms", ms);
+        }
         Ok(batch.vocab().decode(&ids))
     }
 }
