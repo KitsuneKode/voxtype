@@ -94,7 +94,7 @@ impl TakeIdentity {
     }
     async fn target_focused(&self) -> bool {
         let Some((expected, pid)) = &self.target else {
-            return false;
+            return true;
         };
         super::active_window::focused_identity()
             .await
@@ -235,10 +235,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_take_without_a_known_window_or_with_a_disposition_is_not_delivered() {
+    async fn a_take_without_a_known_window_is_delivered_as_before() {
         let runtime = tempfile::tempdir().unwrap();
         start(runtime.path(), "4", false);
         fs::write(runtime.path().join("takes/4/target_window"), "{}").unwrap();
+        let take = TakeIdentity::capture(runtime.path()).unwrap();
+        assert!(DELIVERY_TAKE.scope(Some(take), check_target()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_take_with_a_disposition_is_not_delivered() {
+        let runtime = tempfile::tempdir().unwrap();
+        start(runtime.path(), "5", false);
+        fs::write(runtime.path().join("takes/5/target_window"), "{}").unwrap();
+        fs::write(runtime.path().join("takes/5/disposition"), "recovered").unwrap();
         let take = TakeIdentity::capture(runtime.path()).unwrap();
         assert!(matches!(
             DELIVERY_TAKE.scope(Some(take), check_target()).await,
