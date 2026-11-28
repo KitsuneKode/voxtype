@@ -70,6 +70,18 @@ impl TakeIdentity {
             _ => None,
         }
     }
+    /// Characters Shuush committed into the field itself (`shuush-ime`),
+    /// from `ime_committed` in the take's directory: a post-process that
+    /// answers with nothing because it delivered the text, not a take that
+    /// came to nothing.
+    pub fn ime_committed(&self) -> Option<usize> {
+        fs::read_to_string(self.dir.join("ime_committed"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+            .filter(|&chars| chars > 0)
+    }
     pub fn target_lost(&self, text: &str) -> OutcomeKind {
         if let Some(outcome) = self.disposition() {
             return outcome;
@@ -219,6 +231,19 @@ mod tests {
     }
 
     #[test]
+    fn a_take_shuush_committed_itself_reports_its_length() {
+        let runtime = tempfile::tempdir().unwrap();
+        start(runtime.path(), "12", false);
+        let take = TakeIdentity::capture(runtime.path()).unwrap();
+        assert_eq!(take.ime_committed(), None);
+        for (marker, chars) in [("27\n", Some(27)), ("0", None), ("x", None)] {
+            fs::write(take.dir.join("ime_committed"), marker).unwrap();
+            assert_eq!(take.ime_committed(), chars, "{marker:?}");
+        }
+        assert_eq!(take.disposition(), None, "a commit is not a disposition");
+    }
+
+    #[test]
     fn shuush_recovering_a_private_take_still_reads_as_private() {
         let runtime = tempfile::tempdir().unwrap();
         start(runtime.path(), "9", true);
@@ -240,7 +265,10 @@ mod tests {
         start(runtime.path(), "4", false);
         fs::write(runtime.path().join("takes/4/target_window"), "{}").unwrap();
         let take = TakeIdentity::capture(runtime.path()).unwrap();
-        assert!(DELIVERY_TAKE.scope(Some(take), check_target()).await.is_ok());
+        assert!(DELIVERY_TAKE
+            .scope(Some(take), check_target())
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

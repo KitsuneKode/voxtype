@@ -6790,6 +6790,16 @@ impl Daemon {
         self.history_note(|pending| pending.transcribed());
     }
 
+    /// The characters Shuush's own input method committed for this take,
+    /// when the post-process answered with nothing because of that (see
+    /// [`TakeIdentity::ime_committed`]).
+    fn ime_committed_take(&self, final_text: &str) -> Option<usize> {
+        if !final_text.trim().is_empty() {
+            return None;
+        }
+        self.take.as_ref().and_then(TakeIdentity::ime_committed)
+    }
+
     fn publish_empty_outcome(&self) {
         if let Some(path) = self.frozen.as_ref().map_or_else(
             || peek_file_output_path(&self.config),
@@ -7708,10 +7718,21 @@ impl Daemon {
                                         p.entry.auto_submit = auto_submit;
                                     });
                                     let text = delivered.text;
-                                    self.publish_osd_text_outcome(&text);
+                                    match self.ime_committed_take(&text) {
+                                        Some(chars) => {
+                                            self.publish_osd_outcome(
+                                                osd::session::OutcomeKind::Delivered,
+                                                chars,
+                                            );
+                                            write_output_done(chars);
+                                        }
+                                        None => {
+                                            self.publish_osd_text_outcome(&text);
+                                            write_output_done(text.chars().count());
+                                        }
+                                    }
                                     self.last_dictation =
                                         (!private).then(|| (text.clone(), Instant::now()));
-                                    write_output_done(text.chars().count());
                                     self.play_feedback(SoundEvent::TranscriptionComplete);
                                     if self.config.output.notification.on_transcription && !private
                                     {
@@ -7866,6 +7887,16 @@ impl Daemon {
                     if let Some(outcome) = self.take.as_ref().and_then(TakeIdentity::disposition) {
                         self.publish_osd_outcome(outcome, 0);
                         self.publish_empty_outcome();
+                        *state = State::Idle;
+                        self.update_state("idle");
+                        return;
+                    }
+                    if let Some(chars) = self.ime_committed_take(&final_text) {
+                        tracing::info!("Post-processing committed {} chars itself", chars);
+                        self.end_preedit();
+                        write_output_done(chars);
+                        self.publish_osd_outcome(osd::session::OutcomeKind::Delivered, chars);
+                        self.play_feedback(SoundEvent::TranscriptionComplete);
                         *state = State::Idle;
                         self.update_state("idle");
                         return;
