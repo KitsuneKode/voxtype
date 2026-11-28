@@ -11,6 +11,7 @@ pub mod echo_cancel;
 #[cfg(feature = "onnx-common")]
 pub mod enhance;
 pub mod feedback;
+pub mod input_guard;
 pub mod levels;
 pub mod media;
 pub mod resampler;

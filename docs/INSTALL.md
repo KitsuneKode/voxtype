@@ -28,16 +28,19 @@ This guide covers installing Voxtype on Linux and macOS.
 
 - **Linux:** any desktop. Optimized for Wayland, works on X11.
 - **macOS:** Apple Silicon (arm64), macOS 13 Ventura or later.
-- Architectures: x86_64 (with AVX2) and aarch64 on Linux; arm64 on macOS.
+- Architectures: x86_64 (x86-64-v2 or newer) and aarch64 on Linux; arm64 on macOS.
 
 ### CPU (prebuilt Linux binaries)
 
-Prebuilt binaries target the **x86-64-v3 baseline**: AVX2, FMA, BMI1, BMI2, F16C, MOVBE. Supported:
+The minimum for every prebuilt x86_64 binary is **x86-64-v2**: SSE4.2, POPCNT, SSSE3 and CMPXCHG16B. That means Intel Nehalem (2008) or newer, or AMD Bulldozer (2011) or newer. Intel Core 2 and older, and AMD CPUs before Bulldozer, are below this floor and no prebuilt binary runs on them, the OSD and audio bridge included.
 
-- Intel Haswell (2013) and newer
-- AMD Excavator (2015), Ryzen (any generation), EPYC
+| Binaries | Built for | Runs on |
+|----------|-----------|---------|
+| `baseline` daemon, OSD (`voxtype-osd*`), meetings window, audio bridge | x86-64-v2 | Nehalem / Bulldozer and newer |
+| `avx2`, `vulkan`, `onnx-avx2` and the GPU ONNX variants | Haswell (AVX2, FMA, BMI1/2) | Intel Haswell (2013) and newer, AMD Excavator (2015), any Ryzen or EPYC |
+| `avx512`, `onnx-avx512` | AVX-512 | CPUs with AVX-512F |
 
-Older CPUs need to [build from source](#build-from-source) with `-C target-cpu=native`. Voxtype installs a SIGILL handler at startup that prints a helpful message instead of a raw "Illegal instruction" crash when the CPU is too old.
+Packages pick the right daemon variant for your CPU. On a CPU with SSE4.2 but no AVX2 (Ivy Bridge, Sandy Bridge, early Atom), that is the `baseline` build. Below x86-64-v2, [build from source](#build-from-source) with `-C target-cpu=native`. Voxtype installs a SIGILL handler at startup that prints which case you hit instead of a raw "Illegal instruction" crash.
 
 ### glibc (Linux .deb and .rpm)
 
@@ -55,7 +58,7 @@ Older distros (Ubuntu 22.04, Debian Bookworm, Fedora 39) can [build from source]
 | Component | Required? | Purpose |
 |-----------|-----------|---------|
 | PipeWire (with `pipewire-alsa`) or PulseAudio | Yes | Audio capture |
-| `input` group membership | Yes (for evdev hotkeys) | Detecting hotkeys outside the compositor |
+| `input` group membership | No (only for the built-in evdev hotkey) | Lets voxtype read the keyboard itself. It lets every program read every keystroke, so prefer compositor keybindings ([trade-off](USER_MANUAL.md#the-input-group-trade-off)) |
 | `wtype` | Recommended (Wayland) | Best Unicode/CJK typing support |
 | `dotool` | Recommended (KDE/GNOME Wayland) | Typing on compositors that don't speak the virtual-keyboard protocol |
 | `ydotool` | Fallback (X11/TTY) | Requires a daemon |
@@ -85,8 +88,8 @@ For the GTK4 OSD frontend, additionally install `gtk4` + `gtk4-layer-shell`.
 Pick your distro from the list below. The fastest path on each:
 
 - **Arch:** `paru -S voxtype-bin`
-- **Debian/Ubuntu:** `sudo apt install ./voxtype_1.0.1-1_amd64.deb`
-- **Fedora:** `sudo dnf install ./voxtype-1.0.1-1.x86_64.rpm`
+- **Debian/Ubuntu:** `sudo apt install ./voxtype_1.3.1-1_amd64.deb`
+- **Fedora:** `sudo dnf install ./voxtype-1.3.1-1.x86_64.rpm`
 - **macOS:** `brew install --cask peteonrails/voxtype/voxtype`
 - **NixOS:** `nix profile install github:peteonrails/voxtype#vulkan`
 - **AppImage:** not currently published; see [available alternatives](#appimage).
@@ -190,8 +193,8 @@ tuning, and rebuild instructions.
 Requires Ubuntu 24.04+ or Debian Trixie+ (glibc 2.39+). Older versions: [build from source](#build-from-source).
 
 ```bash
-wget https://github.com/peteonrails/voxtype/releases/download/v1.0.1/voxtype_1.0.1-1_amd64.deb
-sudo apt install ./voxtype_1.0.1-1_amd64.deb
+wget https://github.com/peteonrails/voxtype/releases/download/v1.3.1/voxtype_1.3.1-1_amd64.deb
+sudo apt install ./voxtype_1.3.1-1_amd64.deb
 ```
 
 Recommended optional packages:
@@ -207,8 +210,8 @@ The .deb ships every Linux binary variant (baseline for pre-AVX2 CPUs, avx2, avx
 Requires Fedora 40+ (glibc 2.39+).
 
 ```bash
-wget https://github.com/peteonrails/voxtype/releases/download/v1.0.1/voxtype-1.0.1-1.x86_64.rpm
-sudo dnf install ./voxtype-1.0.1-1.x86_64.rpm
+wget https://github.com/peteonrails/voxtype/releases/download/v1.3.1/voxtype-1.3.1-1.x86_64.rpm
+sudo dnf install ./voxtype-1.3.1-1.x86_64.rpm
 ```
 
 Recommended optional packages:
@@ -228,7 +231,7 @@ brew install --cask peteonrails/voxtype/voxtype
 voxtype configure
 ```
 
-Or download `voxtype-1.0.1-macos-universal.dmg` from the [latest release](https://github.com/peteonrails/voxtype/releases/latest). First launch opens a setup wizard that walks you through accessibility permissions, model download, and the FN-key hotkey.
+Or download `voxtype-1.3.1-macos-universal.dmg` from the [latest release](https://github.com/peteonrails/voxtype/releases/latest). First launch opens a setup wizard that walks you through accessibility permissions, model download, and the FN-key hotkey.
 
 ### NixOS
 
@@ -236,14 +239,14 @@ A flake ships every variant:
 
 ```bash
 # Imperative install
-nix profile install github:peteonrails/voxtype/v1.0.1#vulkan
+nix profile install github:peteonrails/voxtype/v1.3.1#vulkan
 
 # Available outputs: default, vulkan, rocm, onnx, onnx-cuda, onnx-migraphx,
 # osd-gtk4, osd-native, meetings-gtk4
-nix build github:peteonrails/voxtype/v1.0.1#osd-gtk4
+nix build github:peteonrails/voxtype/v1.3.1#osd-gtk4
 
 # Or pin in your flake inputs
-inputs.voxtype.url = "github:peteonrails/voxtype/v1.0.1";
+inputs.voxtype.url = "github:peteonrails/voxtype/v1.3.1";
 ```
 
 Each voxtype package includes the GGUF worker, the Quickshell QML tree (the OSD and the Voxtype Meetings view), the Voxtype Configuration and Voxtype Meetings desktop entries, and the `voxtype` icon. The GTK4 meetings window, which `voxtype meeting view` opens on desktops without Quickshell, is its own output, `meetings-gtk4`; install it beside the voxtype package so the daemon finds it on `PATH`. The wrapper puts the typing and clipboard tools on `PATH`, and appends ffmpeg, the PulseAudio client tools (`parec`, `pactl`, `paplay`), xdg-utils and bubblewrap for the meeting features, plus curl for model downloads and `which` for the output driver probes, so the system's own copies take precedence when present.
@@ -255,31 +258,31 @@ Two things the meeting features use are not included:
 
 ### Linux arm64 (aarch64) — manual install
 
-The 0.7.2 release ships two experimental arm64 Linux binaries for
+Each release ships two experimental arm64 Linux binaries for
 Raspberry Pi 4/5, Ampere servers, Snapdragon X laptops, and AWS
 Graviton instances. They are not yet wired into the .deb / .rpm / AUR
 packages, so install is manual:
 
 ```bash
 # Whisper engine, CPU-only
-curl -L https://github.com/peteonrails/voxtype/releases/download/v0.7.2/voxtype-0.7.2-linux-aarch64-cpu \
+curl -L https://github.com/peteonrails/voxtype/releases/download/v1.3.1/voxtype-1.3.1-linux-aarch64-cpu \
   -o /tmp/voxtype
 chmod 755 /tmp/voxtype
 sudo mv /tmp/voxtype /usr/local/bin/voxtype
 voxtype --version
 
 # Or, for the ONNX engines (Parakeet, Moonshine, SenseVoice, Paraformer, etc.)
-curl -L https://github.com/peteonrails/voxtype/releases/download/v0.7.2/voxtype-0.7.2-linux-aarch64-onnx \
+curl -L https://github.com/peteonrails/voxtype/releases/download/v1.3.1/voxtype-1.3.1-linux-aarch64-onnx \
   -o /tmp/voxtype
 chmod 755 /tmp/voxtype
 sudo mv /tmp/voxtype /usr/local/bin/voxtype
 ```
 
 These binaries are CPU-only. No CUDA, MIGraphX, or Vulkan support on
-arm64 in 0.7.2 because the Jetson CUDA toolchain is awkward and there
+arm64 because the Jetson CUDA toolchain is awkward and there
 is no mainstream consumer arm64 hardware with Vulkan GPUs yet.
 
-Once installed, the rest of the setup (input group, models, hotkey)
+Once installed, the rest of the setup (models, keybinding)
 is the same as on x86_64. Skip to [Post-Install Setup](#post-install-setup).
 
 If you run into issues, please file a GitHub issue with your hardware
@@ -357,21 +360,11 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 > Most settings can be configured interactively with `voxtype configure` (or by searching for "Voxtype Configuration" in Walker, fuzzel, rofi, KRunner, or GNOME Activities). The steps below set up the system-level pieces the TUI can't change for you.
 
-### 1. Add yourself to the input group
+### 1. Bind a key to `voxtype record`
 
-For kernel-level hotkey detection via evdev:
+Bind `voxtype record start` and `voxtype record stop` (push-to-talk) or `voxtype record toggle` in your compositor or desktop, and set `[hotkey] enabled = false`. Instructions for each desktop are in the [User Manual](USER_MANUAL.md#compositor-keybindings). This needs no extra permissions.
 
-```bash
-sudo usermod -aG input $USER
-```
-
-Log out and back in for the group change to take effect. Verify:
-
-```bash
-groups | grep input
-```
-
-If you only use compositor keybindings (Hyprland, Sway, River, KDE custom shortcuts) you can skip this step.
+The built-in evdev hotkey is a fallback for desktops where nothing can run `voxtype record`. It needs `input` group membership, which lets every program you run read every keystroke. Don't add it on Hyprland or Omarchy, which removes users from the group on purpose; see [The `input` group trade-off](USER_MANUAL.md#the-input-group-trade-off).
 
 ### 2. Download a Whisper model
 
@@ -502,7 +495,7 @@ voxtype setup
 
 Checks:
 
-- [x] User in `input` group (if evdev hotkey is enabled)
+- [x] Keyboard access for the built-in hotkey (only if it is enabled)
 - [x] Audio source accessible
 - [x] Typing backend present (`wtype` / `dotool` / `ydotool` / clipboard)
 - [x] Whisper model downloaded
@@ -560,11 +553,7 @@ systemctl --user daemon-reload
 
 For the full troubleshooting guide see [TROUBLESHOOTING.md](TROUBLESHOOTING.md). Common quick fixes:
 
-**"Cannot open input device"** — User isn't in `input` group, or hasn't logged out/in since adding:
-
-```bash
-sudo usermod -aG input $USER  # then log out and back in
-```
+**"Cannot open input device"** or "built-in hotkey unavailable": the built-in evdev hotkey can't read the keyboard. Bind `voxtype record start/stop` in your compositor instead and set `[hotkey] enabled = false` ([how](USER_MANUAL.md#compositor-keybindings)). Granting the `input` group fixes the message too, but lets every program read every keystroke; see [the trade-off](USER_MANUAL.md#the-input-group-trade-off).
 
 **Text isn't typing (Wayland)** — Install `wtype` for wlroots compositors, or `dotool` for KDE/GNOME:
 
@@ -584,7 +573,7 @@ sudo apt install pipewire-alsa
 sudo voxtype setup gpu --enable
 ```
 
-**SIGILL ("Illegal instruction") on startup** — Your CPU is older than our Haswell baseline (AVX2 + FMA + BMI1/2). Build from source with `RUSTFLAGS="-C target-cpu=native"` or open an issue with your `lscpu` output.
+**SIGILL ("Illegal instruction") on startup**: the message says which case you hit. If the CPU has no AVX2, switch to the baseline build with `sudo voxtype setup variant --to voxtype-baseline`. If it says the CPU is below x86-64-v2 (no SSE4.2 or POPCNT, such as a Core 2), no prebuilt binary runs on it: build from source with `RUSTFLAGS="-C target-cpu=native"`, or open an issue with your `lscpu` output. See [CPU](#cpu-prebuilt-linux-binaries).
 
 ---
 

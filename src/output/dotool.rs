@@ -42,7 +42,9 @@
 //! ## Requirements
 //!
 //! - dotool installed (https://sr.ht/~geb/dotool/)
-//! - User in 'input' group for uinput access
+//! - Write access to /dev/uinput, preferably through a dedicated `uinput`
+//!   group rather than `input`, which would also expose every keystroke
+//!   (docs/USER_MANUAL.md, "Giving dotool and ydotool access to uinput")
 //! - DOTOOL_XKB_LAYOUT set (on dotoold for the fixed-layout fast path, or in
 //!   voxtype config for direct dotool fallback) for non-US keyboard layouts,
 //!   with the matching desktop layout active
@@ -51,9 +53,12 @@ use super::TextOutput;
 use crate::error::OutputError;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+static SLOW_PATH_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DotoolInvocation {
@@ -108,6 +113,7 @@ impl DotoolOutput {
         if let Some(ref layout) = xkb_layout {
             tracing::debug!("dotool: using keyboard layout '{}'", layout);
         }
+        Self::maybe_warn_slow_path(xkb_layout.as_deref(), xkb_variant.as_deref());
         Self {
             type_delay_ms,
             pre_type_delay_ms,
@@ -146,6 +152,27 @@ impl DotoolOutput {
             .open(&path)
             .ok()?;
         Some(path)
+    }
+
+    /// Emit a visible configuration warning when XKB overrides force the slow direct-dotool path.
+    fn maybe_warn_slow_path(xkb_layout: Option<&str>, xkb_variant: Option<&str>) {
+        if SLOW_PATH_WARNING_EMITTED.get().is_some() {
+            return;
+        }
+
+        if (xkb_layout.is_some() || xkb_variant.is_some()) && Self::daemon_pipe_path().is_some() {
+            let _ = SLOW_PATH_WARNING_EMITTED.get_or_init(|| {
+                if xkb_variant.is_some() {
+                    tracing::warn!(
+                        "dotool configuration warning: XKB variant override detected while dotoold is running; dotoolc cannot receive per-call layout/variant hints, so voxtype will use direct dotool (~750ms vs ~3ms per output). If a fixed layout without variants is enough, configure DOTOOL_XKB_LAYOUT on dotoold and remove voxtype's dotool XKB override; otherwise this slowdown is expected."
+                    );
+                } else {
+                    tracing::warn!(
+                        "dotool configuration warning: XKB layout override detected while dotoold is running; voxtype will use direct dotool (~750ms vs ~3ms per output). For the fast path, move DOTOOL_XKB_LAYOUT to dotoold's service environment and remove voxtype's dotool XKB layout override."
+                    );
+                }
+            });
+        }
     }
 
     fn build_commands(&self, text: &str) -> String {
@@ -310,7 +337,8 @@ impl TextOutput for DotoolOutput {
             // Check for common errors
             if stderr.contains("uinput") || stderr.contains("permission") {
                 return Err(OutputError::InjectionFailed(format!(
-                    "{}: uinput permission denied. Is user in 'input' group?",
+                    "{}: no write access to /dev/uinput. Grant it with a dedicated uinput \
+                     group (docs/USER_MANUAL.md, \"Giving dotool and ydotool access to uinput\").",
                     invocation.binary
                 )));
             }
@@ -498,5 +526,12 @@ mod tests {
     fn daemon_pipe_detection_respects_env_var() {
         let _guard = DotoolPipeEnvGuard::set("/nonexistent/dotool-pipe-test");
         assert!(DotoolOutput::daemon_pipe_path().is_none());
+    }
+
+    #[test]
+    fn maybe_warn_slow_path_does_not_panic() {
+        let _guard = DotoolPipeEnvGuard::set("/nonexistent/dotool-pipe-test");
+        DotoolOutput::maybe_warn_slow_path(None, None);
+        DotoolOutput::maybe_warn_slow_path(Some("us"), None);
     }
 }

@@ -1,9 +1,24 @@
 use super::parse::parse_config_salvaging;
-use super::{
-    Config, LanguageConfig, OpenVinoConfig, OutputMode, SonioxConfig, TranscriptionEngine,
-};
+use super::{Config, OpenVinoConfig, OutputMode, SonioxConfig, TranscriptionEngine};
 use crate::error::VoxtypeError;
 use std::path::{Path, PathBuf};
+
+/// `VOXTYPE_DRIVER_ORDER`, comma-separated like `--driver`.
+fn parse_driver_order_env(value: &str) -> Result<Vec<super::OutputDriver>, String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(str::parse)
+        .collect::<Result<Vec<_>, _>>()
+        .and_then(|order| {
+            if order.is_empty() {
+                Err("no drivers named".to_string())
+            } else {
+                Ok(order)
+            }
+        })
+}
 
 /// Parse a boolean from an environment variable value.
 /// Only "1" and "true" (case-insensitive) are truthy; everything else is falsy.
@@ -131,6 +146,21 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     if let Ok(value) = std::env::var("VOXTYPE_OMARCHY_LINK_SETTINGS_PLUGIN") {
         config.omarchy.link_settings_plugin = parse_bool_env(&value);
     }
+    if let Ok(value) = std::env::var("VOXTYPE_STREAMING_RECOVERY") {
+        config
+            .streaming_recovery
+            .get_or_insert_with(Default::default)
+            .enabled = parse_bool_env(&value);
+    }
+    if let Ok(value) = std::env::var("VOXTYPE_STREAMING_STOP_TIMEOUT_SECS") {
+        if let Ok(timeout_secs) = value.parse::<u64>() {
+            // Same range as --streaming-stop-timeout-secs and `config set`.
+            config
+                .streaming_recovery
+                .get_or_insert_with(Default::default)
+                .stop_timeout_secs = timeout_secs.clamp(1, 120);
+        }
+    }
 
     // Dictation history
     if let Ok(value) = std::env::var("VOXTYPE_HISTORY_ENABLED") {
@@ -183,6 +213,11 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
             Err(_) => tracing::warn!("Unknown VOXTYPE_ENGINE value: {}", engine),
         }
     }
+    // The active engine's language, before the engine-specific variables
+    // below so `VOXTYPE_GGUF_LANGUAGE` still wins for GGUF (#860).
+    if let Ok(lang) = std::env::var("VOXTYPE_LANGUAGE") {
+        config.apply_language_override(&lang, "VOXTYPE_LANGUAGE");
+    }
     if let Ok(model) = std::env::var("VOXTYPE_GGUF_MODEL") {
         config.gguf.get_or_insert_with(Default::default).model = model;
     }
@@ -214,9 +249,6 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     }
     if let Ok(value) = std::env::var("VOXTYPE_GGUF_STREAMING") {
         config.gguf.get_or_insert_with(Default::default).streaming = parse_bool_env(&value);
-    }
-    if let Ok(lang) = std::env::var("VOXTYPE_LANGUAGE") {
-        config.whisper.language = LanguageConfig::from_comma_separated(&lang);
     }
     if let Ok(val) = std::env::var("VOXTYPE_TRANSLATE") {
         config.whisper.translate = parse_bool_env(&val);
@@ -293,6 +325,19 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
             config.audio.duck_media_fade_ms = n;
         }
     }
+    if let Ok(val) = std::env::var("VOXTYPE_DEAD_INPUT_DETECTION") {
+        config.audio.dead_input.enabled = parse_bool_env(&val);
+    }
+    if let Ok(val) = std::env::var("VOXTYPE_DEAD_INPUT_WINDOW_MS") {
+        if let Ok(window_ms) = val.parse::<u32>() {
+            config.audio.dead_input.window_ms = window_ms;
+        }
+    }
+    if let Ok(val) = std::env::var("VOXTYPE_DEAD_INPUT_THRESHOLD_DBFS") {
+        if let Ok(threshold) = val.parse::<f32>() {
+            config.audio.dead_input.threshold_dbfs = threshold;
+        }
+    }
 
     // Output
     if let Ok(mode) = std::env::var("VOXTYPE_OUTPUT_MODE") {
@@ -366,6 +411,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
     if let Ok(val) = std::env::var("VOXTYPE_PUNCTUATION_CASING") {
         config.text.punctuation_casing = parse_bool_env(&val);
     }
+    if let Ok(value) = std::env::var("VOXTYPE_DRIVER_ORDER") {
+        match parse_driver_order_env(&value) {
+            Ok(order) => config.output.driver_order = Some(order),
+            Err(e) => tracing::warn!("VOXTYPE_DRIVER_ORDER is ignored: {}", e),
+        }
+    }
     if let Ok(keys) = std::env::var("VOXTYPE_PASTE_KEYS") {
         config.output.paste_keys = Some(keys);
     }
@@ -399,6 +450,12 @@ pub fn load_config(path: Option<&Path>) -> Result<Config, VoxtypeError> {
             .soniox
             .get_or_insert_with(SonioxConfig::default)
             .api_key = Some(key);
+    }
+    if let Ok(region) = std::env::var("VOXTYPE_SONIOX_REGION") {
+        config
+            .soniox
+            .get_or_insert_with(SonioxConfig::default)
+            .region = region;
     }
     if let Ok(val) = std::env::var("VOXTYPE_RESTORE_CLIPBOARD") {
         config.output.restore_clipboard = parse_bool_env(&val);
@@ -503,6 +560,17 @@ pub fn save_config(config: &Config, path: &Path) -> Result<(), VoxtypeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn driver_order_env_parses_like_the_cli_flag() {
+        use super::super::OutputDriver;
+        assert_eq!(
+            parse_driver_order_env("hyprland, wtype").unwrap(),
+            vec![OutputDriver::Hyprland, OutputDriver::Wtype]
+        );
+        assert!(parse_driver_order_env("hyprland,bogus").is_err());
+        assert!(parse_driver_order_env(" , ").is_err());
+    }
 
     #[test]
     fn top_level_post_process_is_flagged_with_its_real_home() {

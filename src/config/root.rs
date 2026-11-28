@@ -2,7 +2,8 @@ use super::{
     AudioConfig, CohereConfig, DolphinConfig, GgufConfig, HotkeyConfig, MeetingConfig,
     MoonshineConfig, OmnilingualConfig, OpenVinoConfig, OutputConfig, ParaformerConfig,
     ParakeetConfig, ParakeetModelType, Profile, SenseVoiceConfig, SonioxConfig, StatusConfig,
-    StreamingConfig, TextConfig, TranscriptionEngine, VadConfig, WhisperConfig,
+    StreamingConfig, StreamingRecoveryConfig, TextConfig, TranscriptionEngine, VadConfig,
+    WhisperConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -101,6 +102,11 @@ pub struct Config {
     /// `streaming_*` fields — see `StreamingConfig::resolve`.
     #[serde(default)]
     pub streaming: Option<StreamingConfig>,
+
+    /// Recovery settings for every streaming backend. Separate from
+    /// `[streaming]` so changing recovery cannot override legacy tuning.
+    #[serde(default)]
+    pub streaming_recovery: Option<StreamingRecoveryConfig>,
 
     /// Text processing configuration (replacements, spoken punctuation)
     #[serde(default)]
@@ -219,6 +225,7 @@ impl Default for Config {
             openvino: None,
             soniox: None,
             streaming: None,
+            streaming_recovery: None,
             text: TextConfig::default(),
             vad: VadConfig::default(),
             status: StatusConfig::default(),
@@ -432,11 +439,34 @@ impl Config {
 
     /// Get the runtime directory for ephemeral files (state, sockets)
     pub fn runtime_dir() -> PathBuf {
-        // Use XDG_RUNTIME_DIR if available, otherwise fall back to /tmp
-        std::env::var("XDG_RUNTIME_DIR")
+        Self::runtime_dir_from(std::env::var("XDG_RUNTIME_DIR").ok())
+    }
+
+    /// Use XDG_RUNTIME_DIR if available, otherwise fall back to
+    /// [`Self::runtime_dir_fallback`].
+    fn runtime_dir_from(xdg_runtime_dir: Option<String>) -> PathBuf {
+        xdg_runtime_dir
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/tmp"))
+            .unwrap_or_else(Self::runtime_dir_fallback)
             .join("voxtype")
+    }
+
+    /// macOS never sets XDG_RUNTIME_DIR, and a fixed /tmp/voxtype is shared
+    /// by every account on the Mac: /tmp is sticky, so one user's lock files
+    /// block the daemon and menubar of every other user. The per-user
+    /// `$TMPDIR` (what `temp_dir()` returns there) is private to the user.
+    #[cfg(target_os = "macos")]
+    fn runtime_dir_fallback() -> PathBuf {
+        std::env::temp_dir()
+    }
+
+    /// Linux keeps /tmp: the Quickshell OSD, the Omarchy panel and user
+    /// scripts fall back to /tmp/voxtype on their own, so following
+    /// `$TMPDIR` here would split the daemon from them whenever TMPDIR is
+    /// set and XDG_RUNTIME_DIR is not.
+    #[cfg(not(target_os = "macos"))]
+    fn runtime_dir_fallback() -> PathBuf {
+        PathBuf::from("/tmp")
     }
 
     /// Resolve the state file path from config
@@ -677,6 +707,109 @@ impl Config {
             | TranscriptionEngine::Paraformer
             | TranscriptionEngine::Dolphin
             | TranscriptionEngine::Omnilingual => "text.language",
+        }
+    }
+
+    /// Point the active engine's own language setting at `language`, the
+    /// value of `--language`, `VOXTYPE_LANGUAGE` or a per-recording
+    /// `record start --language`. Returns the key it set.
+    ///
+    /// Only Whisper takes a comma-separated set (constrained detection), and
+    /// Soniox reads one as its language hints, with `auto` clearing them.
+    /// Every other engine with a language setting takes one code. Cohere has
+    /// no automatic detection and takes only the codes its checkpoint knows.
+    ///
+    /// `Err` says why nothing changed: an engine with no language setting
+    /// (its model decides), or a value that engine cannot take. Callers warn
+    /// and keep the configured language rather than refuse to start.
+    pub fn set_engine_language(&mut self, language: &str) -> Result<&'static str, String> {
+        let language = language.trim();
+        let key = self.engine_language_key();
+        let engine = self.engine.name();
+        if language.is_empty() {
+            return Err(format!("An empty language leaves {key} unchanged"));
+        }
+        let one_code = || -> Result<String, String> {
+            if language.contains(',') {
+                Err(format!(
+                    "The {engine} engine takes one language, not the set '{language}'; \
+                     {key} is unchanged"
+                ))
+            } else {
+                Ok(language.to_string())
+            }
+        };
+        match self.engine {
+            TranscriptionEngine::Whisper => {
+                self.whisper.language = super::LanguageConfig::from_comma_separated(language);
+            }
+            TranscriptionEngine::Cohere => {
+                let code = one_code()?;
+                if !super::COHERE_LANGUAGES.contains(&code.as_str()) {
+                    return Err(format!(
+                        "Cohere cannot take language '{code}' (it has no automatic detection). \
+                         Supported: {}; {key} is unchanged",
+                        super::COHERE_LANGUAGES.join(", ")
+                    ));
+                }
+                self.cohere.get_or_insert_with(Default::default).language = code;
+            }
+            TranscriptionEngine::Gguf => {
+                self.gguf.get_or_insert_with(Default::default).language = one_code()?;
+            }
+            TranscriptionEngine::SenseVoice => {
+                self.sensevoice
+                    .get_or_insert_with(Default::default)
+                    .language = one_code()?;
+            }
+            TranscriptionEngine::OpenVino => {
+                self.openvino.get_or_insert_with(Default::default).language = one_code()?;
+            }
+            TranscriptionEngine::Soniox => {
+                self.soniox
+                    .get_or_insert_with(Default::default)
+                    .language_hints = if language == "auto" {
+                    Vec::new()
+                } else {
+                    language
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|code| !code.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                };
+            }
+            TranscriptionEngine::Parakeet
+            | TranscriptionEngine::Moonshine
+            | TranscriptionEngine::Paraformer
+            | TranscriptionEngine::Dolphin
+            | TranscriptionEngine::Omnilingual => {
+                return Err(format!(
+                    "The {engine} engine has no language setting (its model decides the \
+                     language), so language '{language}' is ignored. For text cleanup, \
+                     set text.language instead"
+                ));
+            }
+        }
+        Ok(key)
+    }
+
+    /// [`Self::set_engine_language`] for a language given outside the
+    /// config file (`source` names where), warning once per process when
+    /// the active engine cannot take it. Daemons reload their config, and
+    /// one warning in the log is enough.
+    pub fn apply_language_override(&mut self, language: &str, source: &str) {
+        static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+        match self.set_engine_language(language) {
+            Ok(key) => tracing::debug!("{source}: {key} = {language:?}"),
+            Err(why) => {
+                let message = format!("{source}: {why}");
+                let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+                if !warned.contains(&message) {
+                    tracing::warn!("{message}");
+                    warned.push(message);
+                }
+            }
         }
     }
 
@@ -1140,6 +1273,27 @@ mod tests {
         assert_eq!(
             Config::resolve_existing_in(Some(user.clone()), system.clone()),
             Some(user)
+        );
+    }
+
+    #[test]
+    fn runtime_dir_prefers_xdg_and_falls_back_to_per_user_temp_dir() {
+        assert_eq!(
+            Config::runtime_dir_from(Some("/run/user/1000".to_string())),
+            PathBuf::from("/run/user/1000/voxtype")
+        );
+        // On macOS, not a hardcoded /tmp/voxtype: that is shared by every
+        // account on the Mac.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            Config::runtime_dir_from(None),
+            std::env::temp_dir().join("voxtype")
+        );
+        // On Linux, unchanged: the QML frontends fall back to /tmp too.
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            Config::runtime_dir_from(None),
+            PathBuf::from("/tmp/voxtype")
         );
     }
 
@@ -1762,5 +1916,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `--language` and `VOXTYPE_LANGUAGE` reach the active engine's own
+    /// key, the one `active_language` reads, for every engine that has one
+    /// (#860).
+    #[test]
+    fn a_language_override_reaches_every_engine_with_a_language_setting() {
+        for engine in ENGINES {
+            let mut config = Config {
+                engine,
+                ..Config::default()
+            };
+            let result = config.set_engine_language("de");
+            match engine {
+                TranscriptionEngine::Whisper
+                | TranscriptionEngine::Cohere
+                | TranscriptionEngine::Gguf
+                | TranscriptionEngine::SenseVoice
+                | TranscriptionEngine::OpenVino => {
+                    assert_eq!(
+                        result,
+                        Ok(config.engine_language_key()),
+                        "{}",
+                        engine.name()
+                    );
+                    assert_eq!(config.active_language(), Some("de"), "{}", engine.name());
+                }
+                TranscriptionEngine::Soniox => {
+                    assert_eq!(result, Ok("soniox.language_hints"));
+                    assert_eq!(config.soniox.as_ref().unwrap().language_hints, ["de"]);
+                }
+                _ => {
+                    let why = result.unwrap_err();
+                    assert!(why.contains("has no language setting"), "{why}");
+                    assert_eq!(config.active_language(), None, "{}", engine.name());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_language_override_leaves_other_engines_alone() {
+        let mut config = Config {
+            engine: TranscriptionEngine::Cohere,
+            ..Config::default()
+        };
+        config.set_engine_language("fr").unwrap();
+        assert_eq!(config.cohere.as_ref().unwrap().language, "fr");
+        assert_eq!(
+            config.whisper.language,
+            crate::config::LanguageConfig::default()
+        );
+    }
+
+    #[test]
+    fn values_an_engine_cannot_take_keep_the_configured_language() {
+        let mut cohere = Config {
+            engine: TranscriptionEngine::Cohere,
+            ..Config::default()
+        };
+        cohere.set_engine_language("en").unwrap();
+        for value in ["auto", "xx", "en,fr", "", "  "] {
+            assert!(cohere.set_engine_language(value).is_err(), "{value:?}");
+            assert_eq!(cohere.active_language(), Some("en"), "{value:?}");
+        }
+
+        let mut gguf = Config {
+            engine: TranscriptionEngine::Gguf,
+            ..Config::default()
+        };
+        let before = gguf.gguf.clone().unwrap_or_default().language;
+        assert!(gguf.set_engine_language("en,fr").is_err());
+        assert_eq!(gguf.gguf.unwrap_or_default().language, before);
+    }
+
+    #[test]
+    fn whisper_takes_a_set_and_soniox_reads_one_as_hints() {
+        let mut whisper = Config::default();
+        whisper.set_engine_language("en, fr").unwrap();
+        assert_eq!(
+            whisper.whisper.language,
+            crate::config::LanguageConfig::Multiple(vec!["en".into(), "fr".into()])
+        );
+        whisper.set_engine_language("auto").unwrap();
+        assert!(whisper.whisper.language.is_auto());
+
+        let mut soniox = Config {
+            engine: TranscriptionEngine::Soniox,
+            ..Config::default()
+        };
+        soniox.set_engine_language("en,de").unwrap();
+        assert_eq!(soniox.soniox.as_ref().unwrap().language_hints, ["en", "de"]);
+        soniox.set_engine_language("auto").unwrap();
+        assert!(soniox.soniox.as_ref().unwrap().language_hints.is_empty());
     }
 }

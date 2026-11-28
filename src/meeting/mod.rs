@@ -290,19 +290,27 @@ impl MeetingDaemon {
         let model_name = Some(meeting_app_config.model_name().to_string());
         let app_config = meeting_app_config;
 
-        let post_processor = app_config
+        // A model backend would add seconds to every segment of every chunk
+        // and compete with the summary for the same model, so meetings run
+        // only a post-process command.
+        let post_process = app_config
             .output
             .active_post_process()
-            .filter(|_| app_config.output.post_process_enabled)
-            .map(|cfg| {
-                tracing::info!(
-                    "Meeting post-processing enabled: command={:?}, timeout={}ms",
-                    cfg.command,
-                    cfg.timeout_ms
-                );
-                // No desktop notices from meeting chunks: see `without_notices`.
-                PostProcessor::new(cfg).without_notices()
-            });
+            .filter(|_| app_config.output.post_process_enabled);
+        if post_process.is_some_and(|cfg| cfg.llm().is_some()) {
+            tracing::info!(
+                "Meeting transcripts are not cleaned up by the [output.post_process] model backend"
+            );
+        }
+        let post_processor = post_process.filter(|cfg| cfg.llm().is_none()).map(|cfg| {
+            tracing::info!(
+                "Meeting post-processing enabled: command={:?}, timeout={}ms",
+                cfg.command,
+                cfg.timeout_ms
+            );
+            // No desktop notices from meeting chunks: see `without_notices`.
+            PostProcessor::new(cfg).without_notices()
+        });
 
         // Create diarizer if configured
         let mut diarization_notice = None;
@@ -1737,10 +1745,19 @@ mod tests {
         std::fs::write(folder.join("transcript.json"), &first_chunk).unwrap();
         let ext = retained_audio::Encoder::detect().format().extension();
         let mic = folder.join(format!("mic.{ext}"));
+        // The encoder is still flushing after the daemon is gone: wait for
+        // the file to stop growing, or recovery measures a shorter file than
+        // the check after it does.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while try_audio_secs(&mic).unwrap_or(0.0) < 55.0 {
+        let mut last = 0.0;
+        loop {
+            let secs = try_audio_secs(&mic).unwrap_or(0.0);
+            if secs >= 55.0 && secs == last {
+                break;
+            }
+            last = secs;
             assert!(std::time::Instant::now() < deadline, "audio never landed");
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::thread::sleep(std::time::Duration::from_millis(500));
         }
 
         let storage = MeetingStorage::open(h.config.storage.clone()).unwrap();
@@ -1810,9 +1827,11 @@ mod tests {
         assert_eq!(lines[0], id.to_string());
         assert_eq!(lines[1], dir.to_str().unwrap());
         assert_eq!(lines[2], dir.join("meeting.json").to_str().unwrap());
+        // The shell reports its working directory with links resolved
+        // (macOS keeps temporary directories under /private/var).
         assert_eq!(
-            lines[3],
-            dir.to_str().unwrap(),
+            std::fs::canonicalize(lines[3]).unwrap(),
+            std::fs::canonicalize(&dir).unwrap(),
             "runs in the meeting folder"
         );
     }

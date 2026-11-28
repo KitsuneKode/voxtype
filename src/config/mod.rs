@@ -27,12 +27,16 @@ pub(crate) mod text;
 mod vad;
 mod whisper;
 
-pub use audio::{AudioConfig, AudioFeedbackConfig, MAX_PRE_ROLL_MS, MAX_WARM_MIC_SECS};
-pub use default_config::{default_config_content, DEFAULT_CONFIG};
+pub use audio::{
+    AudioConfig, AudioFeedbackConfig, DeadInputConfig, MAX_PRE_ROLL_MS, MAX_WARM_MIC_SECS,
+};
+pub use default_config::{
+    default_config_content, generated_config_content, new_config_content, DEFAULT_CONFIG,
+};
 pub use engines::{
     openvino_driver_packages, CohereConfig, DolphinConfig, GgufConfig, MoonshineConfig,
     OmnilingualConfig, OpenVinoConfig, ParaformerConfig, ParakeetConfig, ParakeetCpuConfig,
-    ParakeetModelType, SenseVoiceConfig, SonioxConfig, TranscriptionEngine,
+    ParakeetModelType, SenseVoiceConfig, SonioxConfig, TranscriptionEngine, SONIOX_REGIONS,
 };
 pub use history::{
     parse_app_list as parse_history_app_list, HistoryConfig, HistoryOverrides,
@@ -58,7 +62,7 @@ pub use profile::{PostProcessConfig, Profile, VocabularyConfig};
 pub(crate) use root::EngineLanguage;
 pub use root::{ActiveGguf, Config, OmarchyConfig, TextLanguageSource, TrayConfig};
 pub use status::{ResolvedIcons, StatusConfig, StatusIconOverrides};
-pub use streaming::StreamingConfig;
+pub use streaming::{StreamingConfig, StreamingRecoveryConfig};
 pub use text::TextConfig;
 pub use vad::{VadBackend, VadConfig};
 pub use whisper::{WhisperConfig, WhisperMode};
